@@ -32,8 +32,6 @@ get_arch()
 
 get_arch
 
-git submodule update --init --force --recursive
-
 ./tools/toolchain/dbuild ./configure.py --mode=$BUILD_MODE
 
 ./tools/toolchain/dbuild ninja
