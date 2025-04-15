@@ -34,16 +34,8 @@ get_arch
 echo "Scylla build completed successfully"
 
 # Define original and renamed binary paths
-original_binary="build/${BUILD_MODE}/scylla"
-renamed_binary="build/${BUILD_MODE}/scylla-${software_arch}"
+tar_name="scylla-${software_arch}.tar.gz"
+tar -cvzf "$tar_name" build/${BUILD_MODE}
 
-# Check that the binary exists
-if [[ -f "$original_binary" ]]; then
-    mv "$original_binary" "$renamed_binary"
-    echo "$renamed_binary" > binary_name.txt
-    echo "Binary renamed to: $renamed_binary"
-    echo "Wrote binary path to binary_name.txt"
-else
-    echo "ERROR: Binary not found at expected path: $original_binary"
-    exit 1
-fi
+echo "$tar_name" > binary_name.txt
+echo "Wrote tarball name to binary_name.txt"
