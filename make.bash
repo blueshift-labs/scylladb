@@ -33,9 +33,19 @@ get_arch
 
 echo "Scylla build completed successfully"
 
-# Define original and renamed binary paths
-tar_name="scylla-${software_arch}.tar.gz"
-tar -cvzf "$tar_name" build/${BUILD_MODE}
+# Define the release folder path and tarball name
+release_dir="build/${BUILD_MODE}/release"
+archive_name="scylla-${software_arch}.tar.gz"
 
-echo "$tar_name" > binary_name.txt
-echo "Wrote tarball name to binary_name.txt"
+# Check if release folder exists
+if [[ -d "$release_dir" ]]; then
+    # Create a tarball containing only the 'release' folder
+    tar -czf "$archive_name" -C "$(dirname "$release_dir")" "$(basename "$release_dir")"
+    echo "$archive_name" > binary_name.txt
+    echo "Created tarball: $archive_name"
+    echo "Wrote binary path to binary_name.txt"
+else
+    echo "ERROR: Release directory not found: $release_dir"
+    exit 1
+fi
+
