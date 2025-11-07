@@ -27,9 +27,6 @@ get_arch() {
 
 get_arch
 
-# See what the container actually sees
-./tools/toolchain/dbuild env | grep -E 'BUILD_MODE|MODE'
-
 # Clean the partial dir that lacks build.ninja
 ./tools/toolchain/dbuild bash -lc '
   MODE=${BUILD_MODE:-release}
