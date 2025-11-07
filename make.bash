@@ -29,7 +29,7 @@ get_arch
 
 # Configure and build using Scylla's dbuild wrapper
 ./tools/toolchain/dbuild ./configure.py --mode="$BUILD_MODE"
-./tools/toolchain/dbuild ninja -C build/release
+./tools/toolchain/dbuild ninja -C build/$BUILD_MODE
 
 echo "Scylla build completed successfully"
 
