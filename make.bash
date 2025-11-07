@@ -27,9 +27,18 @@ get_arch() {
 
 get_arch
 
-# Configure and build using Scylla's dbuild wrapper
-./tools/toolchain/dbuild ./configure.py --mode="$BUILD_MODE"
-./tools/toolchain/dbuild ninja -C build/$BUILD_MODE
+# See what the container actually sees
+./tools/toolchain/dbuild env | grep -E 'BUILD_MODE|MODE'
+
+# Clean the partial dir that lacks build.ninja
+./tools/toolchain/dbuild bash -lc '
+  MODE=${BUILD_MODE:-release}
+  rm -rf build/$MODE
+  ./configure.py --mode=$MODE
+  ninja -C build/$MODE scylla
+  ninja -C build/$MODE scylla-package
+  ls -l build/$MODE/scylla-package/SCYLLA-PACKAGES/*.rpm
+'
 
 echo "Scylla build completed successfully"
 
