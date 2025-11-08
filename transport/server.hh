@@ -11,10 +11,11 @@
 #include "auth/service.hh"
 #include <seastar/core/seastar.hh>
 #include <seastar/core/scheduling.hh>
+#include "cql3/prepared_statements_cache.hh"
 #include "service/endpoint_lifecycle_subscriber.hh"
 #include "service/migration_listener.hh"
 #include "auth/authenticator.hh"
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include "service/qos/qos_configuration_change_subscriber.hh"
 #include "timeout_config.hh"
 #include <seastar/core/semaphore.hh>
@@ -24,6 +25,7 @@
 #include <seastar/net/tls.hh>
 #include <seastar/core/metrics_registration.hh>
 #include "utils/fragmented_temporary_buffer.hh"
+#include "utils/result.hh"
 #include "service_permit.hh"
 #include <seastar/core/sharded.hh>
 #include <seastar/core/execution_stage.hh>
@@ -35,6 +37,7 @@
 #include "transport/messages/result_message.hh"
 #include "utils/chunked_vector.hh"
 #include "exceptions/coordinator_result.hh"
+#include "exceptions/exceptions.hh"
 #include "db/operation_type.hh"
 #include "service/maintenance_mode.hh"
 
@@ -42,10 +45,6 @@ namespace cql3 {
 
 class query_processor;
 
-}
-
-namespace db {
-class config;
 }
 
 namespace scollectd {
@@ -119,6 +118,10 @@ struct cql_server_config {
     std::optional<uint16_t> shard_aware_transport_port_ssl;
     bool allow_shard_aware_drivers = true;
     smp_service_group bounce_request_smp_service_group = default_smp_service_group();
+    utils::updateable_value<uint32_t> max_concurrent_requests;
+    utils::updateable_value<bool> cql_duplicate_bind_variable_names_refer_to_same_variable;
+    utils::updateable_value<uint32_t> uninitialized_connections_semaphore_cpu_concurrency;
+    utils::updateable_value<uint32_t> request_timeout_on_shutdown_in_seconds;
 };
 
 /**
@@ -148,6 +151,36 @@ struct connection_service_level_params {
     sstring scheduling_group_name;
 };
 
+class cql_metadata_id_wrapper {
+private:
+    std::optional<cql3::cql_metadata_id_type> _request_metadata_id;
+    std::optional<cql3::cql_metadata_id_type> _response_metadata_id;
+
+public:
+    cql_metadata_id_wrapper()
+        : _request_metadata_id(std::nullopt)
+        , _response_metadata_id(std::nullopt)
+    { }
+
+    explicit cql_metadata_id_wrapper(cql3::cql_metadata_id_type&& response_metadata_id)
+        : _request_metadata_id(std::nullopt)
+        , _response_metadata_id(std::move(response_metadata_id))
+    { }
+
+    cql_metadata_id_wrapper(cql3::cql_metadata_id_type&& request_metadata_id, cql3::cql_metadata_id_type&& response_metadata_id)
+        : _request_metadata_id(std::move(request_metadata_id))
+        , _response_metadata_id(std::move(response_metadata_id))
+    { }
+
+    bool has_request_metadata_id() const;
+
+    bool has_response_metadata_id() const;
+
+    const cql3::cql_metadata_id_type& get_request_metadata_id() const;
+
+    const cql3::cql_metadata_id_type& get_response_metadata_id() const;
+};
+
 class cql_server : public seastar::peering_sharded_service<cql_server>, public generic_server::server {
 private:
     struct transport_stats {
@@ -166,11 +199,8 @@ private:
 
     static constexpr cql_protocol_version_type current_version = cql_serialization_format::latest_version;
 
-    distributed<cql3::query_processor>& _query_processor;
+    sharded<cql3::query_processor>& _query_processor;
     cql_server_config _config;
-    size_t _max_request_size;
-    utils::updateable_value<uint32_t> _max_concurrent_requests;
-    utils::updateable_value<bool> _cql_duplicate_bind_variable_names_refer_to_same_variable;
     semaphore& _memory_available;
     seastar::metrics::metric_groups _metrics;
     std::unique_ptr<event_notifier> _notifier;
@@ -181,10 +211,9 @@ private:
     gms::gossiper& _gossiper;
     scheduling_group_key _stats_key;
 public:
-    cql_server(distributed<cql3::query_processor>& qp, auth::service&,
+    cql_server(sharded<cql3::query_processor>& qp, auth::service&,
             service::memory_limiter& ml,
             cql_server_config config,
-            const db::config& db_cfg,
             qos::service_level_controller& sl_controller,
             gms::gossiper& g,
             scheduling_group_key stats_key,
@@ -212,7 +241,7 @@ private:
     class fmt_visitor;
     friend class connection;
     friend std::unique_ptr<cql_server::response> make_result(int16_t stream, messages::result_message& msg,
-            const tracing::trace_state_ptr& tr_state, cql_protocol_version_type version, bool skip_metadata);
+            const tracing::trace_state_ptr& tr_state, cql_protocol_version_type version, cql_metadata_id_wrapper&& metadata_id, bool skip_metadata);
 
     class connection : public generic_server::connection {
         cql_server& _server;
@@ -245,11 +274,10 @@ private:
                 service_permit>;
         static thread_local execution_stage_type _process_request_stage;
     public:
-        connection(cql_server& server, socket_address server_addr, connected_socket&& fd, socket_address addr);
+        connection(cql_server& server, socket_address server_addr, connected_socket&& fd, socket_address addr, named_semaphore& sem, semaphore_units<named_semaphore_exception_factory> initial_sem_units);
         virtual ~connection();
         future<> process_request() override;
         void handle_error(future<>&& f) override;
-        void on_connection_close() override;
         client_data make_client_data() const;
         const service::client_state& get_client_state() const { return _client_state; }
         void update_scheduling_group();
@@ -257,10 +285,12 @@ private:
         scheduling_group get_scheduling_group() const { return _current_scheduling_group; }
     private:
         friend class process_request_executor;
+
+        future<foreign_ptr<std::unique_ptr<cql_server::response>>> sleep_until_timeout_passes(const seastar::lowres_clock::time_point& timeout, std::unique_ptr<cql_server::response>&& resp) const;
         future<foreign_ptr<std::unique_ptr<cql_server::response>>> process_request_one(fragmented_temporary_buffer::istream buf, uint8_t op, uint16_t stream, service::client_state& client_state, tracing_request_type tracing_request, service_permit permit);
         unsigned frame_size() const;
         unsigned pick_request_cpu();
-        cql_binary_frame_v3 parse_frame(temporary_buffer<char> buf) const;
+        utils::result_with_exception<cql_binary_frame_v3, exceptions::protocol_exception, class cql_frame_error> parse_frame(temporary_buffer<char> buf) const;
         future<fragmented_temporary_buffer> read_and_decompress_frame(size_t length, uint8_t flags);
         future<std::optional<cql_binary_frame_v3>> read_frame();
         future<std::unique_ptr<cql_server::response>> process_startup(uint16_t stream, request_reader in, service::client_state& client_state, tracing::trace_state_ptr trace_state);
@@ -298,7 +328,7 @@ private:
             requires std::is_invocable_r_v<future<cql_server::process_fn_return_type>,
                                            Process,
                                            service::client_state&,
-                                           distributed<cql3::query_processor>&,
+                                           sharded<cql3::query_processor>&,
                                            request_reader,
                                            uint16_t,
                                            cql_protocol_version_type,
@@ -315,7 +345,7 @@ private:
             requires std::is_invocable_r_v<future<cql_server::process_fn_return_type>,
                                            Process,
                                            service::client_state&,
-                                           distributed<cql3::query_processor>&,
+                                           sharded<cql3::query_processor>&,
                                            request_reader,
                                            uint16_t,
                                            cql_protocol_version_type,
@@ -336,9 +366,13 @@ private:
     friend class type_codec;
 
 private:
-    virtual shared_ptr<generic_server::connection> make_connection(socket_address server_addr, connected_socket&& fd, socket_address addr) override;
-    future<> advertise_new_connection(shared_ptr<generic_server::connection> conn) override;
-    future<> unadvertise_connection(shared_ptr<generic_server::connection> conn) override;
+    virtual shared_ptr<generic_server::connection> make_connection(socket_address server_addr, connected_socket&& fd, socket_address addr, named_semaphore& sem, semaphore_units<named_semaphore_exception_factory> initial_sem_units) override;
+    scheduling_group get_scheduling_group_for_new_connection() const override {
+        if (_sl_controller.has_service_level(qos::service_level_controller::driver_service_level_name)) {
+            return _sl_controller.get_scheduling_group(qos::service_level_controller::driver_service_level_name);
+        }
+        return default_scheduling_group();
+    }
 
     ::timeout_config timeout_config() const { return _config.timeout_config.current_values(); }
 };
@@ -376,7 +410,6 @@ public:
     virtual void on_update_view(const sstring& ks_name, const sstring& view_name, bool columns_changed) override;
     virtual void on_update_function(const sstring& ks_name, const sstring& function_name) override;
     virtual void on_update_aggregate(const sstring& ks_name, const sstring& aggregate_name) override;
-    virtual void on_update_tablet_metadata(const locator::tablet_metadata_change_hint&) override;
 
     virtual void on_drop_keyspace(const sstring& ks_name) override;
     virtual void on_drop_column_family(const sstring& ks_name, const sstring& cf_name) override;

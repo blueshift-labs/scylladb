@@ -33,6 +33,7 @@
 #include "service/topology_state_machine.hh"
 #include "utils/sorting.hh"
 #include <seastar/core/reactor.hh>
+#include "utils/managed_string.hh"
 
 namespace qos {
 static logging::logger sl_logger("service_level_controller");
@@ -41,6 +42,20 @@ sstring service_level_controller::default_service_level_name = "default";
 constexpr const char* scheduling_group_name_pattern = "sl:{}";
 constexpr const char* deleted_scheduling_group_name_pattern = "sl_deleted:{}";
 constexpr const char* temp_scheduling_group_name_pattern = "sl_temp:{}";
+
+service_level_controller::auth_integration::auth_integration(service_level_controller& sl_controller, auth::service& auth_service)
+    : _sl_controller(sl_controller)
+    , _auth_service(auth_service)
+    , _stop_gate("service_level_controller_auth_integration_stop_gate")
+{}
+
+future<> service_level_controller::auth_integration::stop() {
+    co_await _stop_gate.close();
+}
+
+void service_level_controller::auth_integration::clear_cache() {
+    _cache.clear();
+}
 
 service_level_controller::service_level_controller(sharded<auth::service>& auth_service, locator::shared_token_metadata& tm, abort_source& as, service_level_options default_service_level_config, scheduling_group default_scheduling_group, bool destroy_default_sg_on_drain)
         : _sl_data_accessor(nullptr)
@@ -268,7 +283,11 @@ future<> service_level_controller::update_service_levels_cache(qos::query_contex
                 sl_logger.info("service level \"{}\" was updated. New values: (timeout: {}, workload_type: {}, shares: {})",
                         sl.first, sl.second.timeout, sl.second.workload, sl.second.shares);
             }
-            _effective_service_levels_db.clear();
+
+            if (_auth_integration) {
+                _auth_integration->clear_cache();
+            }
+
             for (auto&& sl : service_levels_for_add) {
                 bool make_room = false;
                 std::map<sstring, service_level>::reverse_iterator it;
@@ -300,21 +319,29 @@ future<> service_level_controller::update_service_levels_cache(qos::query_contex
     });
 }
 
-future<> service_level_controller::update_effective_service_levels_cache() {
+future<> service_level_controller::auth_integration::reload_cache(qos::query_context ctx) {
     SCYLLA_ASSERT(this_shard_id() == global_controller);
-    
-    if (!_auth_service.local_is_initialized()) {
-        // Because cache update is triggered in `topology_state_load()`, auth service
-        // might be not initialized yet.
+    const auto _ = _stop_gate.hold();
+
+    if (!_sl_controller._sl_data_accessor || !_sl_controller._sl_data_accessor->can_use_effective_service_level_cache()) {
+        // Don't populate the effective service level cache until auth is migrated to raft.
+        // Otherwise, executing the code that follows would read roles data
+        // from system_auth tables; that would be bad because reading from
+        // those tables is prone to timeouts, and `reload_cache`
+        // is called from the group0 context - a timeout like that would render
+        // group0 non-functional on the node until restart.
+        //
+        // See scylladb/scylladb#24963 for more details.
         co_return;
     }
-    auto units = co_await get_units(_global_controller_db->notifications_serializer, 1);
+    auto units = co_await get_units(_sl_controller._global_controller_db->notifications_serializer, 1);
 
-    auto& role_manager = _auth_service.local().underlying_role_manager();
-    const auto all_roles = co_await role_manager.query_all();
-    const auto hierarchy = co_await role_manager.query_all_directly_granted();
+    auto& qs = qos_query_state(ctx);
+    auto& role_manager = _auth_service.underlying_role_manager();
+    const auto all_roles = co_await role_manager.query_all(qs);
+    const auto hierarchy = co_await role_manager.query_all_directly_granted(qs);
     // includes only roles with attached service level
-    const auto attributes = co_await role_manager.query_attribute_for_all("service_level");
+    const auto attributes = co_await role_manager.query_attribute_for_all("service_level", qs);
 
     std::map<sstring, service_level_options> effective_sl_map;
 
@@ -328,11 +355,11 @@ future<> service_level_controller::update_effective_service_levels_cache() {
         std::optional<service_level_options> sl_options;
 
         if (auto sl_name_it = attributes.find(role); sl_name_it != attributes.end()) {
-            if (auto sl_it = _service_levels_db.find(sl_name_it->second); sl_it != _service_levels_db.end()) { 
+            if (auto sl_it = _sl_controller._service_levels_db.find(sl_name_it->second); sl_it != _sl_controller._service_levels_db.end()) { 
                 sl_options = sl_it->second.slo;
                 sl_options->init_effective_names(sl_name_it->second);
                 sl_options->shares_name = sl_name_it->second;
-            } else if (_effectively_dropped_sls.contains(sl_name_it->second)) {
+            } else if (_sl_controller._effectively_dropped_sls.contains(sl_name_it->second)) {
                 // service level might be effective dropped, then it's not present in `_service_levels_db`
                 sl_logger.warn("Service level {} is effectively dropped and its values are ignored.", sl_name_it->second);
             } else {
@@ -360,8 +387,12 @@ future<> service_level_controller::update_effective_service_levels_cache() {
         co_await coroutine::maybe_yield();
     }
 
-    co_await container().invoke_on_all([effective_sl_map] (service_level_controller& sl_controller) -> future<> {
-        sl_controller._effective_service_levels_db = std::move(effective_sl_map);
+    co_await _sl_controller.container().invoke_on_all([effective_sl_map] (service_level_controller& sl_controller) -> future<> {
+        // We probably cannot predict if `auth_integration` is still in place on another shard,
+        // so let's play it safe here.
+        if (sl_controller._auth_integration) {
+            sl_controller._auth_integration->_cache = std::move(effective_sl_map);
+        }
         co_await sl_controller.notify_effective_service_levels_cache_reloaded();
     });
 }
@@ -371,7 +402,57 @@ future<> service_level_controller::update_cache(update_both_cache_levels update_
     if (update_both_cache_levels) {
         co_await update_service_levels_cache(ctx);
     }
-    co_await update_effective_service_levels_cache();
+
+    if (_auth_integration) {
+        co_await _auth_integration->reload_cache(ctx);
+    }
+}
+
+static service_level_options get_driver_service_level_slo() {
+    service_level_options slo;
+    slo.shares = 200;
+    slo.workload = service_level_options::workload_type::batch;
+    return slo;
+}
+
+future<utils::chunked_vector<mutation>> service_level_controller::get_create_driver_service_level_mutations(db::system_keyspace& sys_ks, api::timestamp_type timestamp) {
+
+    utils::chunked_vector<mutation> mutations;
+
+    auto sl_mutations = co_await raft_service_level_distributed_data_accessor::set_service_level_mutations(sys_ks.query_processor(), service_level_controller::driver_service_level_name, get_driver_service_level_slo(), timestamp);
+    std::move(sl_mutations.begin(), sl_mutations.end(), std::back_inserter(mutations));
+
+    auto sys_ks_mutation = co_await sys_ks.make_service_level_driver_created_mutation(true, timestamp);
+    mutations.push_back(std::move(sys_ks_mutation));
+
+    co_return mutations;
+}
+
+future<std::optional<service::group0_guard>> service_level_controller::migrate_to_driver_service_level(service::group0_guard guard, db::system_keyspace& sys_ks) {
+    // Don't try creating driver service level too often if it already failed.
+    // We don't want to block the topology coordinator.
+    if (_last_unsuccessful_driver_sl_creation_attemp + 5min < seastar::lowres_clock::now()) {
+        sl_logger.info("migrate_to_driver_service_level: starting sl:{} creation", service_level_controller::driver_service_level_name);
+        try {
+            service::group0_batch mc{std::move(guard)};
+
+            constexpr bool if_not_exists = true;
+            co_await add_distributed_service_level(service_level_controller::driver_service_level_name, get_driver_service_level_slo(), if_not_exists, mc);
+
+            auto sys_ks_mutation = co_await sys_ks.make_service_level_driver_created_mutation(true, mc.write_timestamp());
+            mc.add_mutation(std::move(sys_ks_mutation), "set service_level_driver_created=true");
+
+            co_await commit_mutations(std::move(mc));
+            sl_logger.info("create_driver_service_level: sl:{} created", service_level_controller::driver_service_level_name);
+        } catch (service::group0_concurrent_modification&) {
+            throw; // Let caller handle `group0_concurrent_modification`
+        } catch (...) {
+            sl_logger.error("Failed to create service level for driver: {}. Removal of user service levels below the limit is necessary to allow sl:driver creation.", std::current_exception());
+            _last_unsuccessful_driver_sl_creation_attemp = seastar::lowres_clock::now();
+        }
+        co_return std::nullopt;
+    }
+    co_return std::move(guard); // return guard untouched
 }
 
 void service_level_controller::stop_legacy_update_from_distributed_data() {
@@ -383,14 +464,16 @@ void service_level_controller::stop_legacy_update_from_distributed_data() {
     _global_controller_db->dist_data_update_aborter.request_abort();
 }
 
-future<std::optional<service_level_options>> service_level_controller::find_effective_service_level(const sstring& role_name) {
-    if (_sl_data_accessor->is_v2()) {
-        auto effective_sl_it = _effective_service_levels_db.find(role_name);
-        co_return effective_sl_it != _effective_service_levels_db.end() 
+future<std::optional<service_level_options>> service_level_controller::auth_integration::find_effective_service_level(const sstring& role_name) {
+    const auto _ = _stop_gate.hold();
+
+    if (_sl_controller._sl_data_accessor->can_use_effective_service_level_cache()) {
+        auto effective_sl_it = _cache.find(role_name);
+        co_return effective_sl_it != _cache.end() 
             ? std::optional<service_level_options>(effective_sl_it->second)
             : std::nullopt;
     } else {
-        auto& role_manager = _auth_service.local().underlying_role_manager();
+        auto& role_manager = _auth_service.underlying_role_manager();
         auto roles = co_await role_manager.query_granted(role_name, auth::recursive_role_query::yes);
 
         // converts a list of roles into the chosen service level.
@@ -401,8 +484,8 @@ future<std::optional<service_level_options>> service_level_controller::find_effe
                     if (!sl_name) {
                         return std::nullopt;
                     }
-                    auto sl_it = _service_levels_db.find(*sl_name);
-                    if ( sl_it == _service_levels_db.end()) {
+                    auto sl_it = _sl_controller._service_levels_db.find(*sl_name);
+                    if ( sl_it == _sl_controller._service_levels_db.end()) {
                         return std::nullopt;
                     }
 
@@ -427,15 +510,25 @@ future<std::optional<service_level_options>> service_level_controller::find_effe
     }
 }
 
-std::optional<service_level_options> service_level_controller::find_cached_effective_service_level(const sstring& role_name) {
-    if (!_sl_data_accessor->is_v2()) {
+future<std::optional<service_level_options>> service_level_controller::find_effective_service_level(const sstring& role_name) {
+    SCYLLA_ASSERT(_auth_integration != nullptr);
+    return _auth_integration->find_effective_service_level(role_name);
+}
+
+std::optional<service_level_options> service_level_controller::auth_integration::find_cached_effective_service_level(const sstring& role_name) {
+    if (!_sl_controller._sl_data_accessor->is_v2()) {
         return std::nullopt;
     }
 
-    auto effective_sl_it = _effective_service_levels_db.find(role_name);
-    return effective_sl_it != _effective_service_levels_db.end() 
+    auto effective_sl_it = _cache.find(role_name);
+    return effective_sl_it != _cache.end() 
         ? std::optional<service_level_options>(effective_sl_it->second)
         : std::nullopt;
+}
+
+std::optional<service_level_options> service_level_controller::find_cached_effective_service_level(const sstring& role_name) {
+    SCYLLA_ASSERT(_auth_integration != nullptr);
+    return _auth_integration->find_cached_effective_service_level(role_name);
 }
 
 future<>  service_level_controller::notify_service_level_added(sstring name, service_level sl_data) {
@@ -534,15 +627,22 @@ scheduling_group service_level_controller::get_scheduling_group(sstring service_
     }
 }
 
-future<scheduling_group> service_level_controller::get_user_scheduling_group(const std::optional<auth::authenticated_user>& usr) {
+future<scheduling_group> service_level_controller::auth_integration::get_user_scheduling_group(const std::optional<auth::authenticated_user>& usr) {
+    const auto _ = _stop_gate.hold();
+
     if (usr && usr->name) {
         auto sl_opt = co_await find_effective_service_level(*usr->name);
         auto& sl_name = (sl_opt && sl_opt->shares_name) ? *sl_opt->shares_name : default_service_level_name;
-        co_return get_scheduling_group(sl_name);
+        co_return _sl_controller.get_scheduling_group(sl_name);
     }
     else {
-        co_return get_default_scheduling_group();
+        co_return _sl_controller.get_default_scheduling_group();
     }
+}
+
+future<scheduling_group> service_level_controller::get_user_scheduling_group(const std::optional<auth::authenticated_user>& usr) {
+    SCYLLA_ASSERT(_auth_integration != nullptr);
+    return _auth_integration->get_user_scheduling_group(usr);
 }
 
 std::optional<sstring> service_level_controller::get_active_service_level() {
@@ -830,12 +930,12 @@ future<> service_level_controller::migrate_to_v2(size_t nodes_count, db::system_
     
     auto guard = co_await group0_client.start_operation(as);
 
-    std::vector<mutation> migration_muts;
+    utils::chunked_vector<mutation> migration_muts;
     for (const auto& row: *rows) {
         std::vector<data_value_or_unset> values;
         for (const auto& col: schema->all_columns()) {
             if (row.has(col.name_as_text())) {
-                values.push_back(col.type->deserialize(row.get_blob(col.name_as_text())));
+                values.push_back(col.type->deserialize(row.get_blob_unfragmented(col.name_as_text())));
             } else {
                 values.push_back(unset_value{});
             }
@@ -906,7 +1006,27 @@ future<> service_level_controller::unregister_subscriber(qos_configuration_chang
     return _subscribers.remove(subscriber);
 }
 
-static sstring describe_service_level(std::string_view sl_name, const service_level_options& sl_opts) {
+enum class describe_cmd: uint8_t {
+    CREATE,
+    CREATE_IF_NOT_EXISTS,
+    ALTER,
+    DROP_IF_EXISTS,
+};
+
+std::string_view describe_cmd_to_sstring(describe_cmd cmd_enum) {
+    switch (cmd_enum) {
+        case describe_cmd::CREATE:
+            return "CREATE SERVICE LEVEL";
+        case describe_cmd::CREATE_IF_NOT_EXISTS:
+            return "CREATE SERVICE LEVEL IF NOT EXISTS";
+        case describe_cmd::ALTER:
+            return "ALTER SERVICE LEVEL";
+        case describe_cmd::DROP_IF_EXISTS:
+            return "DROP SERVICE LEVEL IF EXISTS";
+    };
+}
+
+static sstring describe_service_level(std::string_view sl_name, const service_level_options& sl_opts, describe_cmd cmd=describe_cmd::CREATE) {
     using slo = service_level_options;
 
     utils::small_vector<sstring, 3> opts{};
@@ -940,12 +1060,44 @@ static sstring describe_service_level(std::string_view sl_name, const service_le
     }
 
     if (opts.size() == 0) {
-        return seastar::format("CREATE SERVICE LEVEL {};", sl_name_formatted);
+        return seastar::format("{} {};", describe_cmd_to_sstring(cmd), sl_name_formatted);
     }
 
-    return seastar::format("CREATE SERVICE LEVEL {} WITH {};", sl_name_formatted, fmt::join(opts, " AND "));
+    return seastar::format("{} {} WITH {};", describe_cmd_to_sstring(cmd), sl_name_formatted, fmt::join(opts, " AND "));
 }
 
+utils::small_vector<cql3::description, 2> describe_driver_service_level(const std::optional<service_level_options>& driver_service_level_slo) {
+    utils::small_vector<cql3::description, 2> result;
+    const auto service_level_type = "service_level";
+    if (driver_service_level_slo.has_value()) {
+        // We need to use CREATE IF EXISTS because `driver` service level can be already created automatically
+        // We also need to ALTER because if driver exists, it can have different shares number
+        const sstring create_statement = describe_service_level(service_level_controller::driver_service_level_name, driver_service_level_slo.value(), describe_cmd::CREATE_IF_NOT_EXISTS);
+        const sstring alter_statement = describe_service_level(service_level_controller::driver_service_level_name, driver_service_level_slo.value(), describe_cmd::ALTER);
+
+        result.push_back(cql3::description {
+            .keyspace = std::nullopt,
+            .type = service_level_type,
+            .name = service_level_controller::driver_service_level_name,
+            .create_statement = managed_string(create_statement)
+        });
+        result.push_back(cql3::description {
+            .keyspace = std::nullopt,
+            .type = service_level_type,
+            .name = service_level_controller::driver_service_level_name,
+            .create_statement = managed_string(alter_statement)
+        });
+    } else {
+        const sstring drop_statement = describe_service_level(service_level_controller::driver_service_level_name, service_level_options{}, describe_cmd::DROP_IF_EXISTS);
+        result.push_back(cql3::description {
+            .keyspace = std::nullopt,
+            .type = service_level_type,
+            .name = service_level_controller::driver_service_level_name,
+            .create_statement = managed_string(drop_statement)
+        });
+    }
+    return result;
+}
 
 future<std::vector<cql3::description>> service_level_controller::describe_created_service_levels() const {
 
@@ -961,29 +1113,44 @@ future<std::vector<cql3::description>> service_level_controller::describe_create
     //
     // If Raft is not used yet, updating the cache will happen every 10 seconds. We deem it
     // good enough if someone does attempt to make a backup in that state.
+
+    std::optional<service_level_options> driver_service_level_slo;
     for (const auto& [sl_name, sl] : _service_levels_db) {
         if (sl.is_static) {
             continue;
         }
+        if (sl_name == driver_service_level_name) {
+            driver_service_level_slo = sl.slo;
+            continue;
+        }
+
+        sstring create_statement = describe_service_level(sl_name, sl.slo);
 
         result.push_back(cql3::description {
             // Service levels do not belong to any keyspace.
             .keyspace = std::nullopt,
             .type = "service_level",
             .name = sl_name,
-            .create_statement = describe_service_level(sl_name, sl.slo)
+            .create_statement = managed_string(create_statement)
         });
 
         co_await coroutine::maybe_yield();
     }
 
     std::ranges::sort(result, std::less<>{}, std::mem_fn(&cql3::description::name));
+    auto driver_sl_description = describe_driver_service_level(driver_service_level_slo);
 
-    co_return result;
+    std::vector<cql3::description> combined;
+    combined.reserve(result.size() + driver_sl_description.size());
+    std::move(driver_sl_description.begin(), driver_sl_description.end(), std::back_inserter(combined));
+    std::move(result.begin(), result.end(), std::back_inserter(combined));
+    co_return combined;
 }
 
-future<std::vector<cql3::description>> service_level_controller::describe_attached_service_levels() {
-    const auto attached_service_levels = co_await _auth_service.local().underlying_role_manager().query_attribute_for_all("service_level");
+future<std::vector<cql3::description>> service_level_controller::auth_integration::describe_attached_service_levels() {
+    const auto _ = _stop_gate.hold();
+
+    const auto attached_service_levels = co_await _auth_service.underlying_role_manager().query_attribute_for_all("service_level");
 
     std::vector<cql3::description> result{};
     result.reserve(attached_service_levels.size());
@@ -992,33 +1159,49 @@ future<std::vector<cql3::description>> service_level_controller::describe_attach
         const auto formatted_role = cql3::util::maybe_quote(role);
         const auto formatted_sl = cql3::util::maybe_quote(service_level);
 
+        sstring create_statement = seastar::format("ATTACH SERVICE LEVEL {} TO {};", formatted_sl, formatted_role);
+
         result.push_back(cql3::description {
             // Attaching a service level doesn't belong to any keyspace.
             .keyspace = std::nullopt,
             .type = "service_level_attachment",
             .name = service_level,
-            .create_statement = seastar::format("ATTACH SERVICE LEVEL {} TO {};", formatted_sl, formatted_role)
+            .create_statement = managed_string(create_statement)
         });
 
         co_await coroutine::maybe_yield();
     }
 
-    std::ranges::sort(result, std::less<>{}, [] (const cql3::description& desc) noexcept {
+    std::ranges::sort(result, std::less<>{}, [] (const cql3::description& desc) {
         return std::make_tuple(std::ref(desc.name), std::ref(*desc.create_statement));
     });
-
 
     co_return result;
 }
 
 future<std::vector<cql3::description>> service_level_controller::describe_service_levels() {
+    SCYLLA_ASSERT(_auth_integration != nullptr);
+
     std::vector<cql3::description> created_service_levels_descs = co_await describe_created_service_levels();
-    std::vector<cql3::description> attached_service_levels_descs = co_await describe_attached_service_levels();
+    std::vector<cql3::description> attached_service_levels_descs = co_await _auth_integration->describe_attached_service_levels();
 
     created_service_levels_descs.insert(created_service_levels_descs.end(),
             std::make_move_iterator(attached_service_levels_descs.begin()), std::make_move_iterator(attached_service_levels_descs.end()));
 
     co_return created_service_levels_descs;
+}
+
+void service_level_controller::register_auth_integration(auth::service& auth_service) {
+    SCYLLA_ASSERT(_auth_integration == nullptr);
+    _auth_integration = std::make_unique<auth_integration>(*this, auth_service);
+}
+
+future<> service_level_controller::unregister_auth_integration() {
+    SCYLLA_ASSERT(_auth_integration != nullptr);
+    // First, prevent new tasks coming to `auth_integration`.
+    auto tmp = std::exchange(_auth_integration, nullptr);
+    // Now we can stop it.
+    co_await tmp->stop();
 }
 
 future<shared_ptr<service_level_controller::service_level_distributed_data_accessor>> 

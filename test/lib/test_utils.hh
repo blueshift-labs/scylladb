@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <filesystem>
+
 #include <seastar/core/future.hh>
 #include <seastar/util/source_location-compat.hh>
 #include <string>
@@ -22,7 +24,13 @@ using namespace seastar;
 // multiple shards, to avoid problems due to the BOOST versions not being thread
 // safe.
 
+namespace replica {
+    class table;
+}
+
 namespace tests {
+
+namespace fs = std::filesystem;
 
 [[nodiscard]] bool do_check(bool condition, seastar::compat::source_location sl, std::string_view msg);
 
@@ -85,17 +93,37 @@ void require_greater(const LHS& lhs, const RHS& rhs, seastar::compat::source_loc
 
 void fail(std::string_view msg, seastar::compat::source_location sl = seastar::compat::source_location::current());
 
-inline std::string getenv_safe(std::string_view name) {
-    auto v = ::getenv(name.data());
-    if (!v) {
-        throw std::logic_error(fmt::format("Environment variable {} not set", name));
-    }
-    return std::string(v);
+std::string getenv_safe(std::string_view name);
+std::string getenv_or_default(std::string_view name, std::string_view def = {});
+std::string getenv_or_default(std::span<const std::string_view> name_alts, std::string_view def = {});
+std::string getenv_or_default(std::initializer_list<const std::string_view> name_alts, std::string_view def = {});
+
+class tmp_set_env {
+    std::string _var, _old;
+    bool _was_set;
+public:
+    tmp_set_env(std::string_view var, std::string_view value);
+    tmp_set_env(tmp_set_env&&);
+    tmp_set_env(const tmp_set_env&) = delete;
+    ~tmp_set_env();
+};
+
+bool check_run_test(std::string_view var, bool defval = false);
+
+inline auto check_run_test_decorator(std::string_view test_var, bool def = false) {
+    return boost::unit_test::precondition(std::bind(&check_run_test, std::string(test_var), def));
 }
 
 extern boost::test_tools::assertion_result has_scylla_test_env(boost::unit_test::test_unit_id);
 future<bool> compare_files(std::string fa, std::string fb);
 future<> touch_file(std::string name);
+
+// Helper to get directory a table keeps its data in.
+// Only suitable for tests, that work with local storage type.
+fs::path table_dir(const replica::table& cf);
+
+// Recursively copy a directory from src_dir to dst_dir.
+void copy_directory(fs::path src_dir, fs::path dst_dir, fs::copy_options opts = fs::copy_options::overwrite_existing);
 
 extern std::mutex boost_logger_mutex;
 

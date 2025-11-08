@@ -8,10 +8,11 @@
 
 #include <seastar/core/on_internal_error.hh>
 #include <map>
+#include "bytes_ostream.hh"
 #include "cql3/description.hh"
 #include "db/tablet_options.hh"
 #include "db/view/view.hh"
-#include "timestamp.hh"
+#include "mutation/timestamp.hh"
 #include "utils/assert.hh"
 #include "utils/UUID_gen.hh"
 #include "cql3/column_identifier.hh"
@@ -37,10 +38,9 @@
 #include "utils/hashing.hh"
 #include "utils/hashers.hh"
 #include "alternator/extract_from_attrs.hh"
+#include "utils/managed_string.hh"
 
 #include <boost/lexical_cast.hpp>
-
-constexpr int32_t schema::NAME_LENGTH;
 
 extern logging::logger dblog;
 
@@ -413,7 +413,7 @@ schema::raw_schema::raw_schema(table_id id)
     , _sharder(::get_sharder(smp::count, default_partitioner_ignore_msb))
 { }
 
-schema::schema(private_tag, const raw_schema& raw, const schema_static_props& props)
+schema::schema(private_tag, const raw_schema& raw, const schema_static_props& props, std::optional<std::variant<schema_ptr, db::view::base_dependent_view_info>> base)
     : _raw(raw)
     , _static_props(props)
     , _offsets([this] {
@@ -497,7 +497,21 @@ schema::schema(private_tag, const raw_schema& raw, const schema_static_props& pr
 
     rebuild();
     if (_raw._view_info) {
-        _view_info = std::make_unique<::view_info>(*this, *_raw._view_info);
+        if (!base) {
+            on_internal_error(dblog, format("Tried to create schema for view {}.{} without schema or base info of {}",
+                                            _raw._ks_name, _raw._cf_name, _raw._view_info->base_name()));
+        }
+        _view_info = std::visit(make_visitor(
+            [&] (const schema_ptr& base_schema) -> std::unique_ptr<::view_info> {
+                return std::make_unique<::view_info>(*this, *_raw._view_info, base_schema);
+            },
+            [&] (const db::view::base_dependent_view_info& base_info) -> std::unique_ptr<::view_info> {
+                return std::make_unique<::view_info>(*this, *_raw._view_info, base_info);
+            }
+        ), *base);
+    } else if (base) {
+        on_internal_error(dblog, format("Tried to create schema for table/view {}.{} with base info but without view info",
+                                        _raw._ks_name, _raw._cf_name));
     }
 }
 
@@ -514,10 +528,7 @@ schema::schema(const schema& o, const std::function<void(schema&)>& transform)
 
     rebuild();
     if (o.is_view()) {
-        _view_info = std::make_unique<::view_info>(*this, o.view_info()->raw());
-        if (o.view_info()->base_info()) {
-            _view_info->set_base_info(o.view_info()->base_info());
-        }
+        _view_info = std::make_unique<::view_info>(*this, o.view_info()->raw(), o.view_info()->base_info());
     }
 }
 
@@ -820,7 +831,7 @@ auto fmt::formatter<schema>::format(const schema& s, fmt::format_context& ctx) c
     out = fmt::format_to(out, "]");
 
     out = fmt::format_to(out, ",compactionStrategyClass=class org.apache.cassandra.db.compaction.{}",
-                         sstables::compaction_strategy::name(s._raw._compaction_strategy));
+                         compaction::compaction_strategy::name(s._raw._compaction_strategy));
 
     out = fmt::format_to(out, ",compactionStrategyOptions={{");
     n = 0;
@@ -902,7 +913,8 @@ auto fmt::formatter<schema>::format(const schema& s, fmt::format_context& ctx) c
     return fmt::format_to(out, "]");
 }
 
-static std::ostream& map_as_cql_param(std::ostream& os, const std::map<sstring, sstring>& map, bool first = true) {
+template <typename Stream>
+static Stream& map_as_cql_param(Stream& os, const std::map<sstring, sstring>& map, bool first = true) {
     for (auto i: map) {
         if (first) {
             first = false;
@@ -930,7 +942,7 @@ std::string schema_extension::options_to_string() const {
     return ss.str();
 }
 
-static std::ostream& column_definition_as_cql_key(std::ostream& os, const column_definition & cd) {
+static fragmented_ostringstream& column_definition_as_cql_key(fragmented_ostringstream& os, const column_definition & cd) {
     os << cd.name_as_cql_string();
     os << " " << cd.type->cql3_type_name();
 
@@ -940,7 +952,7 @@ static std::ostream& column_definition_as_cql_key(std::ostream& os, const column
     return os;
 }
 
-static void describe_index_columns(std::ostream& os, bool is_local, const schema& index_schema, schema_ptr base_schema) {
+static void describe_index_columns(fragmented_ostringstream& os, bool is_local, const schema& index_schema, schema_ptr base_schema) {
     auto index_name = secondary_index::index_name_from_table_name(index_schema.cf_name());
     if (!base_schema->all_indices().contains(index_name)) {
         on_internal_error(dblog, format("Couldn't find index {} on table {}", index_name, base_schema->cf_name()));
@@ -990,23 +1002,33 @@ static void describe_index_columns(std::ostream& os, bool is_local, const schema
     os << ")";
 }
 
-sstring schema::get_create_statement(const schema_describe_helper& helper, bool with_internals) const {
-    std::ostringstream os;
+managed_string schema::get_create_statement(const schema_describe_helper& helper, bool with_internals) const {
+    fragmented_ostringstream os;
 
     os << "CREATE ";
     int n = 0;
 
     if (is_view()) {
-        if (helper.is_index(view_info()->base_id(), *this)) {
-            auto is_local = !helper.is_global_index(view_info()->base_id(), *this);
+        if (helper.type == schema_describe_helper::type::index) {
+            auto is_local = !helper.is_global_index;
+            auto custom_index_class = helper.custom_index_class;
+
+            if (custom_index_class) {
+                os << "CUSTOM ";
+            }
 
             os << "INDEX " << cql3::util::maybe_quote(secondary_index::index_name_from_table_name(cf_name())) << " ON "
                     << cql3::util::maybe_quote(ks_name()) << "." << cql3::util::maybe_quote(view_info()->base_name());
 
-            describe_index_columns(os, is_local, *this, helper.find_schema(view_info()->base_id()));
+            describe_index_columns(os, is_local, *this, helper.base_schema);
+            
+            if (custom_index_class) {
+                os << " USING '" << *custom_index_class << "'";
+            }
+
             os << ";\n";
 
-            return std::move(os).str();
+            return std::move(os).to_managed_string();
         } else {
             os << "MATERIALIZED VIEW " << cql3::util::maybe_quote(ks_name()) << "." << cql3::util::maybe_quote(cf_name()) << " AS\n";
             if (view_info()->include_all_columns()) {
@@ -1076,7 +1098,7 @@ sstring schema::get_create_statement(const schema_describe_helper& helper, bool 
     }
     os << "WITH ";
     if (with_internals) {
-        os << "ID = " << id() << "\nAND ";
+        os << "ID = " << id().to_sstring() << "\nAND ";
     }
     if (!clustering_key_columns().empty()) {
         // Adding clustering key order can be optional, but there's no harm in doing so.
@@ -1104,7 +1126,7 @@ sstring schema::get_create_statement(const schema_describe_helper& helper, bool 
     if (with_internals) {
         for (auto& cdef : dropped_columns()) {
             os << "\nALTER TABLE " << cql3::util::maybe_quote(ks_name()) << "." << cql3::util::maybe_quote(cf_name())
-               << " DROP " << cql3::util::maybe_quote(cdef.first) << " USING TIMESTAMP " << cdef.second.timestamp << ";";
+               << " DROP " << cql3::util::maybe_quote(cdef.first) << " USING TIMESTAMP " << fmt::to_string(cdef.second.timestamp) << ";";
 
             auto column = get_column_definition(to_bytes(cdef.first));
             if (column) {
@@ -1116,17 +1138,19 @@ sstring schema::get_create_statement(const schema_describe_helper& helper, bool 
         }
     }
 
-    return std::move(os).str();
+    return std::move(os).to_managed_string();
 }
 
 cql3::description schema::describe(const schema_describe_helper& helper, cql3::describe_option desc_opt) const {
     const sstring type = std::invoke([&] {
-        if (is_view()) {
-            return helper.is_index(view_info()->base_id(), *this)
-                    ? "index"
-                    : "view";
+        switch (helper.type) {
+        case schema_describe_helper::type::view:
+            return "view";
+        case schema_describe_helper::type::index:
+            return "index";
+        case schema_describe_helper::type::table:
+            return "table";
         }
-        return "table";
     });
 
     return cql3::description {
@@ -1139,24 +1163,24 @@ cql3::description schema::describe(const schema_describe_helper& helper, cql3::d
     };
 }
 
-std::ostream& schema::schema_properties(const schema_describe_helper& helper, std::ostream& os) const {
-    os << "bloom_filter_fp_chance = " << bloom_filter_fp_chance();
+fragmented_ostringstream& schema::schema_properties(const schema_describe_helper& helper, fragmented_ostringstream& os) const {
+    os << "bloom_filter_fp_chance = " << fmt::to_string(bloom_filter_fp_chance());
     os << "\n    AND caching = {";
     map_as_cql_param(os, caching_options().to_map());
     os << "}";
     os << "\n    AND comment = " << cql3::util::single_quote(comment());
-    os << "\n    AND compaction = {'class': '" <<  sstables::compaction_strategy::name(compaction_strategy()) << "'";
+    os << "\n    AND compaction = {'class': '" <<  compaction::compaction_strategy::name(compaction_strategy()) << "'";
     map_as_cql_param(os, compaction_strategy_options(), false) << "}";
     os << "\n    AND compression = {";
     map_as_cql_param(os,  get_compressor_params().get_options());
     os << "}";
 
-    os << "\n    AND crc_check_chance = " << crc_check_chance();
-    os << "\n    AND default_time_to_live = " << default_time_to_live().count();
-    os << "\n    AND gc_grace_seconds = " << gc_grace_seconds().count();
-    os << "\n    AND max_index_interval = " << max_index_interval();
-    os << "\n    AND memtable_flush_period_in_ms = " << memtable_flush_period();
-    os << "\n    AND min_index_interval = " << min_index_interval();
+    os << "\n    AND crc_check_chance = " << fmt::to_string(crc_check_chance());
+    os << "\n    AND default_time_to_live = " << fmt::to_string(default_time_to_live().count());
+    os << "\n    AND gc_grace_seconds = " << fmt::to_string(gc_grace_seconds().count());
+    os << "\n    AND max_index_interval = " << fmt::to_string(max_index_interval());
+    os << "\n    AND memtable_flush_period_in_ms = " << fmt::to_string(memtable_flush_period());
+    os << "\n    AND min_index_interval = " << fmt::to_string(min_index_interval());
     os << "\n    AND speculative_retry = '" << speculative_retry().to_sstring() << "'";
 
     if (has_tablet_options()) {
@@ -1168,7 +1192,7 @@ std::ostream& schema::schema_properties(const schema_describe_helper& helper, st
     for (auto& [type, ext] : extensions()) {
         os << "\n    AND " << type << " = " << ext->options_to_string();
     }
-    if (is_view() && !helper.is_index(view_info()->base_id(), *this)) {
+    if (helper.type == schema_describe_helper::type::view) {
         auto is_sync_update = db::find_tag(*this, db::SYNCHRONOUS_VIEW_UPDATES_TAG_KEY);
         if (is_sync_update.has_value()) {
             os << "\n    AND synchronous_updates = " << *is_sync_update;
@@ -1177,16 +1201,18 @@ std::ostream& schema::schema_properties(const schema_describe_helper& helper, st
     return os;
 }
 
-std::ostream& schema::describe_alter_with_properties(const schema_describe_helper& helper, std::ostream& os) const {
+fragmented_ostringstream& schema::describe_alter_with_properties(const schema_describe_helper& helper, fragmented_ostringstream& os) const {
     os << "ALTER "; 
-    if (is_view()) {
-        if (helper.is_index(view_info()->base_id(), *this)) {
-            on_internal_error(dblog, "ALTER statement is not supported for index");
-        }
-        
+    switch (helper.type) {
+    case schema_describe_helper::type::view:
         os << "MATERIALIZED VIEW ";
-    } else {
+        break;
+    case schema_describe_helper::type::index:
+        on_internal_error(dblog, "ALTER statement is not supported for index");
+        break;
+    case schema_describe_helper::type::table:
         os << "TABLE ";
+        break;
     }
     os << cql3::util::maybe_quote(ks_name()) << "." << cql3::util::maybe_quote(cf_name()) << " WITH ";
     schema_properties(helper, os);
@@ -1273,6 +1299,7 @@ schema_builder::schema_builder(const schema_ptr s)
     : schema_builder(s->_raw)
 {
     if (s->is_view()) {
+        _base_info = s->view_info()->base_info();
         _view_info = s->view_info()->raw();
     }
 }
@@ -1510,7 +1537,14 @@ void schema_builder::prepare_dense_schema(schema::raw_schema& raw) {
     }
 }
 
-schema_builder& schema_builder::with_view_info(table_id base_id, sstring base_name, bool include_all_columns, sstring where_clause) {
+schema_builder& schema_builder::with_view_info(schema_ptr base, bool include_all_columns, sstring where_clause) {
+    _base_schema = std::move(base);
+    _raw._view_info = raw_view_info(_base_schema.value()->id(), _base_schema.value()->cf_name(), include_all_columns, std::move(where_clause));
+    return *this;
+}
+
+schema_builder& schema_builder::with_view_info(table_id base_id, sstring base_name, bool include_all_columns, sstring where_clause, db::view::base_dependent_view_info base) {
+    _base_info = std::move(base);
     _raw._view_info = raw_view_info(std::move(base_id), std::move(base_name), include_all_columns, std::move(where_clause));
     return *this;
 }
@@ -1616,6 +1650,11 @@ schema_ptr schema_builder::build(schema::raw_schema& new_raw) {
         }
     ), _version);
 
+    if (_base_info) {
+        return make_lw_shared<schema>(schema::private_tag{}, new_raw, static_props, _base_info);
+    } else if (_base_schema) {
+        return make_lw_shared<schema>(schema::private_tag{}, new_raw, static_props, _base_schema);
+    }
     return make_lw_shared<schema>(schema::private_tag{}, new_raw, static_props);
 }
 
@@ -2044,14 +2083,11 @@ schema_ptr schema::make_reversed() const {
 }
 
 schema_ptr schema::get_reversed() const {
-    return local_schema_registry().get_or_load(reversed(_raw._version), [this] (table_schema_version) -> base_and_view_schemas {
+    return local_schema_registry().get_or_load(reversed(_raw._version), [this] (table_schema_version) -> view_schema_and_base_info {
         auto s = make_reversed();
 
         if (s->is_view()) {
-            if (!s->view_info()->base_info()) {
-                on_internal_error(dblog, format("Tried to make a reverse schema for view {}.{} with an uninitialized base info", s->ks_name(), s->cf_name()));
-            }
-            return {frozen_schema(s), s->view_info()->base_info()->base_schema()};
+            return {frozen_schema(s), s->view_info()->base_info()};
         }
         return {frozen_schema(s)};
     });

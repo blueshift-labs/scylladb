@@ -11,6 +11,7 @@
 #include "locator/snitch_base.hh"
 #include "locator/abstract_replication_strategy.hh"
 #include "locator/tablets.hh"
+#include "utils/chunked_vector.hh"
 #include "utils/log.hh"
 #include "partition_range_compat.hh"
 #include <unordered_map>
@@ -58,7 +59,7 @@ private:
 
     std::optional<topology_change_info> _topology_change_info;
 
-    std::vector<token> _sorted_tokens;
+    utils::chunked_vector<token> _sorted_tokens;
 
     tablet_metadata _tablets;
 
@@ -97,7 +98,7 @@ public:
     token_metadata_impl(token_metadata::config cfg) noexcept : _topology(std::move(cfg.topo_cfg)) {};
     token_metadata_impl(const token_metadata_impl&) = delete; // it's too huge for direct copy, use clone_async()
     token_metadata_impl(token_metadata_impl&&) noexcept = default;
-    const std::vector<token>& sorted_tokens() const;
+    const utils::chunked_vector<token>& sorted_tokens() const;
     future<> update_normal_tokens(std::unordered_set<token> tokens, host_id endpoint);
     const token& first_token(const token& start) const;
     size_t first_token_index(const token& start) const;
@@ -357,6 +358,7 @@ future<std::unique_ptr<token_metadata_impl>> token_metadata_impl::clone_only_tok
 }
 
 future<> token_metadata_impl::clear_gently() noexcept {
+    _version_tracker = {};
     co_await utils::clear_gently(_token_to_endpoint_map);
     co_await utils::clear_gently(_normal_token_owners);
     co_await utils::clear_gently(_bootstrap_tokens);
@@ -369,7 +371,7 @@ future<> token_metadata_impl::clear_gently() noexcept {
 }
 
 void token_metadata_impl::sort_tokens() {
-    std::vector<token> sorted;
+    utils::chunked_vector<token> sorted;
     sorted.reserve(_token_to_endpoint_map.size());
 
     for (auto&& i : _token_to_endpoint_map) {
@@ -393,7 +395,7 @@ void token_metadata::set_tablets(tablet_metadata tm) {
     _impl->set_tablets(std::move(tm));
 }
 
-const std::vector<token>& token_metadata_impl::sorted_tokens() const {
+const utils::chunked_vector<token>& token_metadata_impl::sorted_tokens() const {
     return _sorted_tokens;
 }
 
@@ -707,14 +709,12 @@ future<> token_metadata_impl::update_topology_change_info(dc_rack_fn& get_dc_rac
 
     // merge tokens from token_to_endpoint and bootstrap_tokens,
     // preserving tokens of leaving endpoints
-    auto all_tokens = std::vector<dht::token>();
+    auto all_tokens = sorted_tokens();
     all_tokens.reserve(sorted_tokens().size() + get_bootstrap_tokens().size());
-    all_tokens.resize(sorted_tokens().size());
-    std::copy(begin(sorted_tokens()), end(sorted_tokens()), begin(all_tokens));
     for (const auto& p: get_bootstrap_tokens()) {
         all_tokens.push_back(p.first);
     }
-    std::sort(begin(all_tokens), end(all_tokens));
+    std::sort(all_tokens.begin(), all_tokens.end());
 
     auto prev_value = std::move(_topology_change_info);
     _topology_change_info.emplace(make_lw_shared<token_metadata>(std::move(target_token_metadata)),
@@ -816,7 +816,7 @@ void token_metadata_impl::del_replacing_endpoint(host_id existing_node) {
 }
 
 topology_change_info::topology_change_info(lw_shared_ptr<token_metadata> target_token_metadata_,
-    std::vector<dht::token> all_tokens_,
+    utils::chunked_vector<dht::token> all_tokens_,
     token_metadata::read_new_t read_new_)
     : target_token_metadata(std::move(target_token_metadata_))
     , all_tokens(std::move(all_tokens_))
@@ -834,18 +834,36 @@ token_metadata::token_metadata(std::unique_ptr<token_metadata_impl> impl)
 {
 }
 
-token_metadata::token_metadata(config cfg)
-        : _impl(std::make_unique<token_metadata_impl>(cfg))
+token_metadata::token_metadata(shared_token_metadata& stm, config cfg)
+        : _shared_token_metadata(&stm)
+        , _impl(std::make_unique<token_metadata_impl>(std::move(cfg)))
 {
 }
 
-token_metadata::~token_metadata() = default;
+token_metadata::~token_metadata() {
+    clear_and_dispose_impl();
+}
 
 token_metadata::token_metadata(token_metadata&&) noexcept = default;
 
-token_metadata& token_metadata::token_metadata::operator=(token_metadata&&) noexcept = default;
+token_metadata& token_metadata::token_metadata::operator=(token_metadata&& o) noexcept {
+    if (this != &o) {
+        clear_and_dispose_impl();
+        _shared_token_metadata = std::exchange(o._shared_token_metadata, nullptr);
+        _impl = std::exchange(o._impl, nullptr);
+    }
+    return *this;
+}
 
-const std::vector<token>&
+void token_metadata::set_shared_token_metadata(shared_token_metadata& stm) {
+    _shared_token_metadata = &stm;
+}
+
+shared_token_metadata& token_metadata::get_shared_token_metadata() {
+    return *_shared_token_metadata;
+}
+
+const utils::chunked_vector<token>&
 token_metadata::sorted_tokens() const {
     return _impl->sorted_tokens();
 }
@@ -933,6 +951,23 @@ public:
 std::unique_ptr<locator::token_range_splitter> make_splitter(token_metadata_ptr tmptr) {
     return std::make_unique<token_metadata_ring_splitter>(std::move(tmptr));
 }
+
+class local_splitter : public locator::token_range_splitter {
+    std::optional<dht::token> _next_token;
+public:
+    local_splitter() : _next_token(dht::minimum_token()) {}
+
+    void reset(dht::ring_position_view pos) override {
+        _next_token = pos.token();
+    }
+
+    std::optional<dht::token> next_token() override {
+        if (auto ret = std::exchange(_next_token, std::nullopt)) {
+            return ret;
+        }
+        return std::nullopt;
+    }
+};
 
 topology&
 token_metadata::get_topology() {
@@ -1025,6 +1060,15 @@ token_metadata::clone_only_token_map() const noexcept {
 future<token_metadata>
 token_metadata::clone_after_all_left() const noexcept {
     co_return token_metadata(co_await _impl->clone_after_all_left());
+}
+
+void token_metadata::clear_and_dispose_impl() noexcept {
+    if (!_shared_token_metadata) {
+        return;
+    }
+    if (auto impl = std::exchange(_impl, nullptr)) {
+        _shared_token_metadata->clear_and_dispose(std::move(impl));
+    }
 }
 
 future<> token_metadata::clear_gently() noexcept {
@@ -1143,6 +1187,17 @@ version_tracker shared_token_metadata::new_tracker(token_metadata::version_t ver
     return tracker;
 }
 
+future<> shared_token_metadata::stop() noexcept {
+    co_await _background_dispose_gate.close();
+}
+
+void shared_token_metadata::clear_and_dispose(std::unique_ptr<token_metadata_impl> impl) noexcept {
+    // Safe to drop the future since the gate is closed in stop()
+    if (auto gh = _background_dispose_gate.try_hold()) {
+        (void)impl->clear_gently().finally([i = std::move(impl), gh = std::move(gh)] {});
+    }
+}
+
 void shared_token_metadata::set(mutable_token_metadata_ptr tmptr) noexcept {
     if (_shared->get_ring_version() >= tmptr->get_ring_version()) {
         on_internal_error(tlogger, format("shared_token_metadata: must not set non-increasing ring_version: {} -> {}", _shared->get_ring_version(), tmptr->get_ring_version()));
@@ -1154,6 +1209,7 @@ void shared_token_metadata::set(mutable_token_metadata_ptr tmptr) noexcept {
         _stale_versions_in_use = _versions_barrier.advance_and_await();
     }
 
+    tmptr->set_shared_token_metadata(*this);
     _shared = std::move(tmptr);
     _shared->set_version_tracker(new_tracker(_shared->get_version()));
 
@@ -1164,29 +1220,6 @@ void shared_token_metadata::set(mutable_token_metadata_ptr tmptr) noexcept {
     }
 
     tlogger.debug("new token_metadata is set, version {}", _shared->get_version());
-}
-
-void shared_token_metadata::update_fence_version(token_metadata::version_t version) {
-    if (const auto current_version = _shared->get_version(); version > current_version) {
-        // The token_metadata::version under no circumstance can go backwards.
-        // Even in case of topology change coordinator moving to another node
-        // this condition must hold, that is why we treat its violation
-        // as an internal error.
-        on_internal_error(tlogger,
-            format("shared_token_metadata: invalid new fence version, can't be greater than the current version, "
-                   "current version {}, new fence version {}", current_version, version));
-    }
-    if (version < _fence_version) {
-        // If topology change coordinator moved to another node,
-        // it can get ahead and increment the fence version
-        // while we are handling raft_topology_cmd::command::fence,
-        // so we just throw an error in this case.
-        throw std::runtime_error(
-            format("shared_token_metadata: can't set decreasing fence version: {} -> {}",
-                _fence_version, version));
-    }
-    _fence_version = version;
-    tlogger.debug("new fence_version is set, version {}", _fence_version);
 }
 
 future<> shared_token_metadata::mutate_token_metadata(seastar::noncopyable_function<future<> (token_metadata&)> func) {
@@ -1216,7 +1249,7 @@ future<> shared_token_metadata::mutate_on_all_shards(sharded<shared_token_metada
 
     std::vector<mutable_token_metadata_ptr> pending_token_metadata_ptr;
     pending_token_metadata_ptr.resize(smp::count);
-    auto tmptr = make_token_metadata_ptr(co_await stm.local().get()->clone_async());
+    auto tmptr = stm.local().make_token_metadata_ptr(co_await stm.local().get()->clone_async());
     auto& tm = *tmptr;
     // bump the token_metadata ring_version
     // to invalidate cached token/replication mappings
@@ -1227,7 +1260,7 @@ future<> shared_token_metadata::mutate_on_all_shards(sharded<shared_token_metada
     // Apply the mutated token_metadata only after successfully cloning it on all shards.
     pending_token_metadata_ptr[base_shard] = tmptr;
     co_await smp::invoke_on_others(base_shard, [&] () -> future<> {
-        pending_token_metadata_ptr[this_shard_id()] = make_token_metadata_ptr(co_await tm.clone_async());
+        pending_token_metadata_ptr[this_shard_id()] = stm.local().make_token_metadata_ptr(co_await tm.clone_async());
     });
 
     co_await stm.invoke_on_all([&] (shared_token_metadata& stm) {
@@ -1284,6 +1317,30 @@ gms::inet_address host_id_or_endpoint::resolve_endpoint(const gms::gossiper& g) 
         throw std::runtime_error(format("Host ID {} not found in the cluster", id()));
     }
     return *endpoint_opt;
+}
+
+future<> pending_token_metadata::assign(locator::mutable_token_metadata_ptr new_token_metadata) {
+    auto& sharded_token_metadata = new_token_metadata->get_shared_token_metadata().container();
+    // clone a local copy of new_token_metadata on all other shards
+    co_await smp::invoke_on_others([this, &new_token_metadata, &sharded_token_metadata] () -> future<> {
+        local() = sharded_token_metadata.local().make_token_metadata_ptr(
+                co_await new_token_metadata->clone_async());
+    });
+    local() = std::move(new_token_metadata);
+}
+
+locator::mutable_token_metadata_ptr& pending_token_metadata::local() {
+    return _shards[this_shard_id()];
+}
+
+locator::token_metadata_ptr pending_token_metadata::local() const {
+    return _shards[this_shard_id()];
+}
+
+future<> pending_token_metadata::destroy() {
+    return smp::invoke_on_all([this] () {
+        _shards[this_shard_id()] = nullptr;
+    });
 }
 
 } // namespace locator

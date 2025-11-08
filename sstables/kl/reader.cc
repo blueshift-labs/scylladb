@@ -12,10 +12,9 @@
 #include "sstables/sstable_mutation_reader.hh"
 #include "sstables/sstables.hh"
 #include "sstables/types.hh"
-#include "clustering_key_filter.hh"
-#include "clustering_ranges_walker.hh"
-#include "concrete_types.hh"
-#include "utils/assert.hh"
+#include "keys/clustering_key_filter.hh"
+#include "keys/clustering_ranges_walker.hh"
+#include "types/concrete_types.hh"
 #include "utils/to_string.hh"
 #include "utils/value_or_reference.hh"
 
@@ -268,7 +267,7 @@ private:
     std::optional<collection_mutation> _pending_collection = {};
 
     collection_mutation& pending_collection(const column_definition *cdef) {
-        SCYLLA_ASSERT(cdef->is_multi_cell() && "frozen set should behave like a cell\n");
+        parse_assert(cdef->is_multi_cell(), _sst->get_filename(), "frozen set should behave like a cell");
         if (!_pending_collection || _pending_collection->is_new_collection(cdef)) {
             flush_pending_collection(*_schema);
             _pending_collection = collection_mutation(cdef);
@@ -436,7 +435,7 @@ public:
         flush_pending_collection(*_schema);
         // If _ready is already set we have a bug: get_mutation_fragment()
         // was not called, and below we will lose one clustering row!
-        SCYLLA_ASSERT(!_ready);
+        parse_assert(!_ready, _sst->get_filename());
         if (!_skip_in_progress) {
             _ready = std::exchange(_in_progress, { });
             return push_ready_fragments_with_ready_set();
@@ -1124,7 +1123,7 @@ public:
             _state = state::ATOM_START;
             break;
         default:
-            SCYLLA_ASSERT(0);
+            on_parse_error(format("Invalid indexable element {}", static_cast<std::underlying_type<indexable_element>::type>(el)), _sst->get_filename());
         }
         _consumer.reset(el);
         _gen = do_process_state();
@@ -1209,14 +1208,14 @@ private:
         }
         return (_index_in_current_partition
                 ? _index_reader->advance_to_next_partition()
-                : get_index_reader().advance_to(dht::ring_position_view::for_after_key(*_current_partition_key))).then([this] {
+                : get_index_reader().advance_past_definitely_present_partition(*_current_partition_key)).then([this] {
             _index_in_current_partition = true;
             auto [start, end] = _index_reader->data_file_positions();
             if (end && start > *end) {
                 _read_enabled = false;
                 return make_ready_future<>();
             }
-            SCYLLA_ASSERT(_index_reader->element_kind() == indexable_element::partition);
+            parse_assert(_index_reader->element_kind() == indexable_element::partition, _sst->get_filename());
             return skip_to(_index_reader->element_kind(), start).then([this] {
                 _sst->get_stats().on_partition_seek();
             });
@@ -1230,7 +1229,7 @@ private:
             return read_from_datafile();
         }
         auto pk = _index_reader->get_partition_key();
-        auto key = dht::decorate_key(*_schema, std::move(pk));
+        auto key = dht::decorate_key(*_schema, std::move(pk.value()));
         _consumer.setup_for_partition(key.key());
         on_next_partition(std::move(key), tombstone(*tomb));
         return make_ready_future<>();
@@ -1296,11 +1295,11 @@ private:
         if (!pos || pos->is_before_all_fragments(*_schema)) {
             return make_ready_future<>();
         }
-        SCYLLA_ASSERT (_current_partition_key);
+        parse_assert(bool(_current_partition_key), _sst->get_filename());
         return [this] {
             if (!_index_in_current_partition) {
                 _index_in_current_partition = true;
-                return get_index_reader().advance_to(*_current_partition_key);
+                return get_index_reader().advance_to_definitely_present_partition(*_current_partition_key);
             }
             return make_ready_future();
         }().then([this, pos] {
@@ -1340,16 +1339,16 @@ private:
         }
 
         auto [begin, end] = _index_reader->data_file_positions();
-        SCYLLA_ASSERT(end);
+        parse_assert(bool(end), _sst->get_filename());
 
         if (_single_partition_read) {
             _read_enabled = (begin != *end);
-            _context = data_consume_single_partition<DataConsumeRowsContext>(*_schema, _sst, _consumer, { begin, *end }, integrity_check::no);
+            _context = co_await data_consume_single_partition<DataConsumeRowsContext>(*_schema, _sst, _consumer, { begin, *end }, integrity_check::no);
         } else {
             sstable::disk_read_range drr{begin, *end};
             auto last_end = _fwd_mr ? _sst->data_size() : drr.end;
             _read_enabled = bool(drr);
-            _context = data_consume_rows<DataConsumeRowsContext>(*_schema, _sst, _consumer, std::move(drr), last_end, integrity_check::no);
+            _context = co_await data_consume_rows<DataConsumeRowsContext>(*_schema, _sst, _consumer, std::move(drr), last_end, integrity_check::no);
         }
 
         _monitor.on_read_started(_context->reader_position());
@@ -1389,11 +1388,11 @@ public:
                 _partition_finished = true;
                 _before_partition = true;
                 _end_of_stream = false;
-                SCYLLA_ASSERT(_index_reader);
+                parse_assert(bool(_index_reader), _sst->get_filename());
                 auto f1 = _index_reader->advance_to(pr);
                 return f1.then([this] {
                     auto [start, end] = _index_reader->data_file_positions();
-                    SCYLLA_ASSERT(end);
+                    parse_assert(bool(end), _sst->get_filename());
                     if (start != *end) {
                         _read_enabled = true;
                         _index_in_current_partition = true;
@@ -1546,6 +1545,7 @@ class sstable_full_scan_reader : public mp_row_consumer_reader_k_l {
     Consumer _consumer;
     std::unique_ptr<DataConsumeRowsContext> _context;
     read_monitor& _monitor;
+    integrity_check _integrity_check;
 public:
     sstable_full_scan_reader(shared_sstable sst, schema_ptr schema,
              reader_permit permit,
@@ -1554,9 +1554,8 @@ public:
              integrity_check integrity)
         : mp_row_consumer_reader_k_l(std::move(schema), permit, std::move(sst))
         , _consumer(this, _schema, std::move(permit), _schema->full_slice(), std::move(trace_state), streamed_mutation::forwarding::no, _sst)
-        , _context(data_consume_rows<DataConsumeRowsContext>(*_schema, _sst, _consumer, integrity))
-        , _monitor(mon) {
-        _monitor.on_read_started(_context->reader_position());
+        , _monitor(mon)
+        , _integrity_check(integrity) {
     }
 public:
     void on_out_of_clustering_range() override {
@@ -1572,14 +1571,18 @@ public:
         on_internal_error(sstlog, "sstable_full_scan_reader: doesn't support next_partition()");
     }
     virtual future<> fill_buffer() override {
+        if (!_context) {
+            _context = co_await data_consume_rows<DataConsumeRowsContext>(*_schema, _sst, _consumer, _integrity_check);
+            _monitor.on_read_started(_context->reader_position());
+        }
         if (_end_of_stream) {
-            return make_ready_future<>();
+            co_return;
         }
         if (_context->eof()) {
             _end_of_stream = true;
-            return make_ready_future<>();
+            co_return;
         }
-        return _context->consume_input();
+        co_return co_await _context->consume_input();
     }
     virtual future<> close() noexcept override {
         if (!_context) {

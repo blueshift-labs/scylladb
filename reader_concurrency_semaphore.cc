@@ -17,7 +17,7 @@
 #include <utility>
 
 #include "reader_concurrency_semaphore.hh"
-#include "query-result.hh"
+#include "query/query-result.hh"
 #include "readers/mutation_reader.hh"
 #include "utils/assert.hh"
 #include "utils/exceptions.hh"
@@ -1043,6 +1043,8 @@ reader_concurrency_semaphore::reader_concurrency_semaphore(
     , _serialize_limit_multiplier(std::move(serialize_limit_multiplier))
     , _kill_limit_multiplier(std::move(kill_limit_multiplier))
     , _cpu_concurrency(cpu_concurrency)
+    , _close_readers_gate(format("[reader_concurrency_semaphore {}] close_readers", _name))
+    , _permit_gate(format("[reader_concurrency_semaphore {}] permit", _name))
 {
     if (metrics == register_metrics::yes) {
         _metrics.emplace();

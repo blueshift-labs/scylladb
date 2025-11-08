@@ -295,7 +295,7 @@ SEASTAR_TEST_CASE(test_commitlog_closed) {
             return log.add_mutation(uuid, tmp.size(), db::commitlog::force_sync::no, [tmp](db::commitlog::output& dst) {
                 dst.write(tmp.data(), tmp.size());
             }).then_wrapped([] (future<db::rp_handle> f) {
-                BOOST_REQUIRE_EXCEPTION(f.get(), gate_closed_exception, exception_predicate::message_equals("gate closed"));
+                BOOST_REQUIRE_EXCEPTION(f.get(), gate_closed_exception, exception_predicate::message_contains("gate closed"));
             });
         });
     });
@@ -364,7 +364,7 @@ SEASTAR_TEST_CASE(test_commitlog_reader){
                 auto&& [buf, rp] = buf_rp;
                 auto linearization_buffer = bytes_ostream();
                 auto in = buf.get_istream();
-                auto str = to_string_view(in.read_bytes_view(buf.size_bytes(), linearization_buffer));
+                auto str = to_string_view(in.read_bytes_view(buf.size_bytes(), linearization_buffer).value());
                 BOOST_CHECK_EQUAL(str, "hej bubba cow");
                 count++;
                 co_return;
@@ -671,8 +671,10 @@ SEASTAR_TEST_CASE(test_commitlog_replay_single_large_mutation){
                     auto in2 = rp_buf.get_istream();
                     for (size_t i = 0; i < size; ++i) {
                         auto c1 = in1.read<char>();
+                        BOOST_REQUIRE(c1);
                         auto c2 = in2.read<char>();
-                        BOOST_CHECK_EQUAL(c1, c2);
+                        BOOST_REQUIRE(c2);
+                        BOOST_CHECK_EQUAL(c1.value(), c2.value());
                     }
                     return make_ready_future<>();
                 });
@@ -740,8 +742,10 @@ SEASTAR_TEST_CASE(test_commitlog_replay_large_mutations){
                     auto in2 = rp_buf.get_istream();
                     for (size_t i = 0; i < size; ++i) {
                         auto c1 = in1.read<char>();
+                        BOOST_REQUIRE(c1);
                         auto c2 = in2.read<char>();
-                        BOOST_CHECK_EQUAL(c1, c2);
+                        BOOST_REQUIRE(c2);
+                        BOOST_CHECK_EQUAL(c1.value(), c2.value());
                     }
                     ++n;
                     return make_ready_future<>();
@@ -962,7 +966,7 @@ SEASTAR_TEST_CASE(test_commitlog_replay_invalid_key){
             readers.reserve(memtables.size());
             auto permit = db.get_reader_concurrency_semaphore().make_tracking_only_permit(s, "test", db::no_timeout, {});
             for (auto mt : memtables) {
-                readers.push_back(mt->make_flat_reader(s, permit));
+                readers.push_back(mt->make_mutation_reader(s, permit));
             }
             auto rd = make_combined_reader(s, permit, std::move(readers));
             auto close_rd = deferred_close(rd);
@@ -986,7 +990,7 @@ SEASTAR_TEST_CASE(test_commitlog_add_entry) {
             constexpr auto n = 10;
             for (auto fs : { force_sync(false), force_sync(true) }) {
                 std::vector<commitlog_entry_writer> writers;
-                std::vector<frozen_mutation> mutations;
+                utils::chunked_vector<frozen_mutation> mutations;
                 std::vector<replay_position> rps;
 
                 writers.reserve(n);
@@ -1048,8 +1052,8 @@ SEASTAR_TEST_CASE(test_commitlog_add_entries) {
 
             constexpr auto n = 10;
             for (auto fs : { force_sync(false), force_sync(true) }) {
-                std::vector<commitlog_entry_writer> writers;
-                std::vector<frozen_mutation> mutations;
+                utils::chunked_vector<commitlog_entry_writer> writers;
+                utils::chunked_vector<frozen_mutation> mutations;
                 std::vector<replay_position> rps;
 
                 writers.reserve(n);
@@ -1849,8 +1853,8 @@ static future<> do_test_oversized_entry(size_t max_size_mb) {
         auto log = co_await commitlog::create_commitlog(cfg);
         auto size = log.max_record_size() * 2;
 
-        std::vector<commitlog_entry_writer> writers;
-        std::vector<frozen_mutation> mutations;
+        utils::chunked_vector<commitlog_entry_writer> writers;
+        utils::chunked_vector<frozen_mutation> mutations;
 
         size_t tot = 0; 
         // generate a bunch of mutation until we have more data than allowed.
@@ -2101,5 +2105,51 @@ SEASTAR_TEST_CASE(test_commitlog_handle_replayed_segments) {
         co_await log.clear();
     }
 }
+
+// #25709 
+// Test that creating large mutation entries (cross more than one 
+// segment) and releasing them the memtable way (ref count, not rp)
+// does not crash.
+// When releasing such a segment, we will get recursion in segment
+// pruning, and need to handle this in both discard_unused_segments
+// as well as (for tests anyway) orphan_all.
+// Note: this test is not perfect. It does not really force a crash
+// in actual discard_unused_segments per se, but the orphan_all call
+// in cl_test will in fact cause a recursion that, without the fix,
+// will do a double free -> boom.
+SEASTAR_TEST_CASE(test_commitlog_release_large_mutation_segments) {
+    commitlog::config cfg;
+
+    constexpr uint64_t max_size_mb = 8;
+
+    cfg.commitlog_segment_size_in_mb = max_size_mb;
+    cfg.commitlog_total_space_in_mb = 8 * 4 * max_size_mb * smp::count;
+    cfg.allow_going_over_size_limit = false;
+    cfg.allow_fragmented_entries = true;
+    cfg.use_o_dsync = false; 
+
+    return cl_test(cfg, [](commitlog& log) -> future<> {
+        auto uuid = make_table_id();
+        {
+            db::rp_set handles;
+            auto size = log.max_record_size() * 2 - log.max_record_size() / 2;
+            auto buf = fragmented_temporary_buffer::allocate_to_fit(size);
+
+            for (size_t i = 0; i < 6; ++i) {
+                auto h = co_await log.add_mutation(uuid, size, db::commitlog::force_sync::no, [&](db::commitlog::output& dst) {
+                    for (auto& tmp : buf) {
+                        dst.write(tmp.get(), tmp.size());
+                    }
+                });
+                handles.put(std::move(h));
+            }
+
+            co_await log.force_new_active_segment();
+            co_await log.sync_all_segments();
+        }
+        // now handles will release
+    });
+}
+
 
 BOOST_AUTO_TEST_SUITE_END()

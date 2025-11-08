@@ -9,7 +9,7 @@
 #include <fmt/ranges.h>
 #include <bit>
 
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/thread.hh>
@@ -27,6 +27,7 @@
 #include "schema/schema_builder.hh"
 #include "service/storage_proxy.hh"
 #include "db/system_keyspace.hh"
+#include "tools/utils.hh"
 
 #include "test/perf/perf.hh"
 #include "test/lib/log.hh"
@@ -37,6 +38,9 @@
 using namespace locator;
 using namespace replica;
 using namespace service;
+using namespace tools::utils;
+
+namespace bpo = boost::program_options;
 
 static seastar::abort_source aborted;
 
@@ -81,7 +85,7 @@ sstring add_keyspace(cql_test_env& e, std::unordered_map<sstring, int> dc_rf, in
 static
 size_t get_tablet_count(const tablet_metadata& tm) {
     size_t count = 0;
-    for (auto& [table, tmap] : tm.all_tables()) {
+    for (const auto& [table, tmap] : tm.all_tables_ungrouped()) {
         count += std::accumulate(tmap->tablets().begin(), tmap->tablets().end(), size_t(0),
                                  [] (size_t accumulator, const locator::tablet_info& info) {
                                      return accumulator + info.replicas.size();
@@ -91,11 +95,12 @@ size_t get_tablet_count(const tablet_metadata& tm) {
 }
 
 static
-void apply_resize_plan(token_metadata& tm, const migration_plan& plan) {
+future<> apply_resize_plan(token_metadata& tm, const migration_plan& plan) {
     for (auto [table_id, resize_decision] : plan.resize_plan().resize) {
-        tm.tablets().mutate_tablet_map(table_id, [&resize_decision] (tablet_map& tmap) {
+        co_await tm.tablets().mutate_tablet_map_async(table_id, [&resize_decision] (tablet_map& tmap) {
             resize_decision.sequence_number = tmap.resize_decision().sequence_number + 1;
             tmap.set_resize_decision(resize_decision);
+            return make_ready_future();
         });
     }
     for (auto table_id : plan.resize_plan().finalize_resize) {
@@ -108,15 +113,16 @@ void apply_resize_plan(token_metadata& tm, const migration_plan& plan) {
 
 // Reflects the plan in a given token metadata as if the migrations were fully executed.
 static
-void apply_plan(token_metadata& tm, const migration_plan& plan) {
+future<> apply_plan(token_metadata& tm, const migration_plan& plan) {
     for (auto&& mig : plan.migrations()) {
-        tm.tablets().mutate_tablet_map(mig.tablet.table, [&mig] (tablet_map& tmap) {
+        co_await tm.tablets().mutate_tablet_map_async(mig.tablet.table, [&mig] (tablet_map& tmap) {
             auto tinfo = tmap.get_tablet_info(mig.tablet.tablet);
             tinfo.replicas = replace_replica(tinfo.replicas, mig.src, mig.dst);
             tmap.set_tablet(mig.tablet.tablet, tinfo);
+            return make_ready_future();
         });
     }
-    apply_resize_plan(tm, plan);
+    co_await apply_resize_plan(tm, plan);
 }
 
 using seconds_double = std::chrono::duration<double>;
@@ -179,13 +185,13 @@ rebalance_stats rebalance_tablets(cql_test_env& e, locator::load_stats_ptr load_
             // as that may violate invariants and cause failures in later operations
             // causing test flakiness.
             save_tablet_metadata(e.local_db(), stm.get()->tablets(), guard.write_timestamp()).get();
-            e.get_storage_service().local().load_tablet_metadata({}).get();
+            e.get_storage_service().local().update_tablet_metadata({}).get();
+
             testlog.info("Rebalance took {:.3f} [s] after {} iteration(s)", stats.elapsed_time.count(), i + 1);
             return stats;
         }
         stm.mutate_token_metadata([&] (token_metadata& tm) {
-            apply_plan(tm, plan);
-            return make_ready_future<>();
+            return apply_plan(tm, plan);
         }).get();
     }
     throw std::runtime_error("rebalance_tablets(): convergence not reached within limit");
@@ -257,39 +263,66 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
     auto cfg = tablet_cql_test_config();
     results global_res;
     co_await do_with_cql_env_thread([&] (auto& e) {
-        const int n_hosts = p.nodes;
+        SCYLLA_ASSERT(p.nodes > 0);
+        SCYLLA_ASSERT(p.rf1 > 0);
+        SCYLLA_ASSERT(p.rf2 > 0);
+
+        const size_t n_hosts = p.nodes;
+        const size_t rf1 = p.rf1;
+        const size_t rf2 = p.rf2;
         const shard_id shard_count = p.shards;
         const int cycles = p.iterations;
 
+        struct host_info {
+            host_id id;
+            endpoint_dc_rack dc_rack;
+        };
+
         topology_builder topo(e);
-        std::vector<host_id> hosts;
+        std::vector<endpoint_dc_rack> racks;
+        std::vector<host_info> hosts;
         locator::load_stats stats;
 
-        auto add_host = [&] {
-            auto host = topo.add_node(service::node_state::normal, shard_count);
-            hosts.push_back(host);
+        auto populate_racks = [&] (const size_t count) {
+            SCYLLA_ASSERT(count > 0);
+            racks.push_back(topo.rack());
+            for (size_t i = 0; i < count - 1; ++i) {
+                racks.push_back(topo.start_new_rack());
+            }
+        };
+
+        const sstring dc1 = topo.dc();
+        populate_racks(rf1);
+
+        const size_t rack_count = racks.size();
+
+        auto add_host = [&] (endpoint_dc_rack dc_rack) {
+            auto host = topo.add_node(service::node_state::normal, shard_count, dc_rack);
+            hosts.emplace_back(host, dc_rack);
             stats.capacity[host] = default_target_tablet_size * shard_count;
-            testlog.info("Added new node: {}", host);
+            testlog.info("Added new node: {} / {}:{}", host, dc_rack.dc, dc_rack.rack);
         };
 
         auto make_stats = [&] {
             return make_lw_shared<locator::load_stats>(stats);
         };
 
-        for (int i = 0; i < n_hosts; ++i) {
-            add_host();
+        for (size_t i = 0; i < n_hosts; ++i) {
+            add_host(racks[i % rack_count]);
         }
 
         auto& stm = e.shared_token_metadata().local();
 
-        auto bootstrap = [&] {
-            add_host();
+        auto bootstrap = [&] (endpoint_dc_rack dc_rack) {
+            add_host(std::move(dc_rack));
             global_res.stats += rebalance_tablets(e, make_stats());
         };
 
         auto decommission = [&] (host_id host) {
-            auto i = std::distance(hosts.begin(), std::find(hosts.begin(), hosts.end(), host));
-            if ((size_t)i == hosts.size()) {
+            const auto it = std::ranges::find_if(hosts, [&] (const host_info& info) {
+                return info.id == host;
+            });
+            if (it == hosts.end()) {
                 throw std::runtime_error(format("No such host: {}", host));
             }
             topo.set_node_state(host, service::node_state::decommissioning);
@@ -299,11 +332,11 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
             }
             topo.set_node_state(host, service::node_state::left);
             testlog.info("Node decommissioned: {}", host);
-            hosts.erase(hosts.begin() + i);
+            hosts.erase(it);
         };
 
-        auto ks1 = add_keyspace(e, {{topo.dc(), p.rf1}}, p.tablets1.value_or(1));
-        auto ks2 = add_keyspace(e, {{topo.dc(), p.rf2}}, p.tablets2.value_or(1));
+        auto ks1 = add_keyspace(e, {{dc1, rf1}}, p.tablets1.value_or(1));
+        auto ks2 = add_keyspace(e, {{dc1, rf2}}, p.tablets2.value_or(1));
         auto id1 = add_table(e, ks1).get();
         auto id2 = add_table(e, ks2).get();
         schema_ptr s1 = e.local_db().find_schema(id1);
@@ -323,7 +356,7 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
                 min_max_tracker<uint64_t> node_load_minmax;
                 uint64_t sum_node_load = 0;
                 uint64_t shard_count = 0;
-                for (auto h: hosts) {
+                for (auto [h, _] : hosts) {
                     auto minmax = load.get_shard_minmax(h);
                     auto node_load = load.get_load(h);
                     auto avg_shard_load = load.get_real_avg_shard_load(h);
@@ -376,14 +409,70 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
         global_res.init = global_res.worst = check_balance();
 
         for (int i = 0; i < cycles; i++) {
-            bootstrap();
+            const auto [id, dc_rack] = hosts[0];
+
+            bootstrap(dc_rack);
             check_balance();
 
-            decommission(hosts[0]);
+            decommission(id);
             global_res.last = check_balance();
         }
     }, cfg);
     co_return global_res;
+}
+
+void test_parallel_scaleout(const bpo::variables_map& opts) {
+    const shard_id shard_count = opts["shards"].as<int>();
+    const int nr_tables = opts["tables"].as<int>();
+    const int tablets_per_table = opts["tablets_per_table"].as<int>();
+    const int nr_racks = opts["racks"].as<int>();
+    const int initial_nodes = nr_racks * opts["nodes-per-rack"].as<int>();
+    const int extra_nodes = nr_racks * opts["extra-nodes-per-rack"].as<int>();
+
+    auto cfg = tablet_cql_test_config();
+    cfg.db_config->rf_rack_valid_keyspaces(true);
+    results global_res;
+    do_with_cql_env_thread([&] (auto& e) {
+        topology_builder topo(e);
+        locator::load_stats stats;
+
+        auto make_stats = [&] {
+            return make_lw_shared<locator::load_stats>(stats);
+        };
+
+        std::vector<endpoint_dc_rack> racks;
+        racks.push_back(topo.rack());
+        for (int i = 1; i < nr_racks; ++i) {
+            racks.push_back(topo.start_new_rack());
+        }
+
+        auto add_host = [&] (endpoint_dc_rack rack) {
+            auto host = topo.add_node(service::node_state::normal, shard_count, rack);
+            stats.capacity[host] = default_target_tablet_size * shard_count;
+            testlog.info("Added new node: {}", host);
+        };
+
+        auto add_hosts = [&] (int n) {
+            for (int i = 0; i < n; ++i) {
+                add_host(racks[i % racks.size()]);
+            }
+        };
+
+        add_hosts(initial_nodes);
+
+        testlog.info("Creating schema");
+        auto ks1 = add_keyspace(e, {{topo.dc(), nr_racks}}, tablets_per_table);
+        seastar::parallel_for_each(std::views::iota(0, nr_tables), [&] (int) -> future<> {
+            return add_table(e, ks1).discard_result();
+        }).get();
+
+        testlog.info("Initial rebalancing");
+        rebalance_tablets(e, make_stats());
+
+        testlog.info("Scaleout");
+        add_hosts(extra_nodes);
+        global_res.stats += rebalance_tablets(e, make_stats());
+    }, cfg).get();
 }
 
 future<> run_simulation(const params& p, const sstring& name = "") {
@@ -424,12 +513,18 @@ future<> run_simulation(const params& p, const sstring& name = "") {
 
 future<> run_simulations(const boost::program_options::variables_map& app_cfg) {
     for (auto i = 0; i < app_cfg["runs"].as<int>(); i++) {
+        constexpr int MIN_RF = 1;
+        constexpr int MAX_RF = 3;
+
         auto shards = 1 << tests::random::get_int(0, 8);
-        auto rf1 = tests::random::get_int(1, 3);
-        auto rf2 = tests::random::get_int(1, 3);
+        auto rf1 = tests::random::get_int(MIN_RF, MAX_RF);
+        // FIXME: Once we allow for RF <= #racks (and not just RF == #racks), we can randomize this RF too.
+        // For now, the values must be equal.
+        auto rf2 = rf1;
         auto scale1 = 1 << tests::random::get_int(0, 5);
         auto scale2 = 1 << tests::random::get_int(0, 5);
-        auto nodes = tests::random::get_int(3, 6);
+        auto nodes = tests::random::get_int(rf1 + rf2, 2 *  MAX_RF);
+
         params p {
             .iterations = app_cfg["iterations"].as<int>(),
             .nodes = nodes,
@@ -449,50 +544,85 @@ future<> run_simulations(const boost::program_options::variables_map& app_cfg) {
 
 namespace perf {
 
+void run_add_dec(const bpo::variables_map& opts) {
+    if (opts.contains("runs")) {
+        run_simulations(opts).get();
+    } else {
+        params p {
+            .iterations = opts["iterations"].as<int>(),
+            .nodes = opts["nodes"].as<int>(),
+            .tablets1 = opts["tablets1"].as<int>(),
+            .tablets2 = opts["tablets2"].as<int>(),
+            .rf1 = opts["rf1"].as<int>(),
+            .rf2 = opts["rf2"].as<int>(),
+            .shards = opts["shards"].as<int>(),
+        };
+        run_simulation(p).get();
+    }
+}
+
+using operation_func = std::function<void(const bpo::variables_map&)>;
+
+const std::vector<operation_option> global_options {};
+const std::vector<operation_option> global_positional_options{};
+
+const std::map<operation, operation_func> operations_with_func{
+    {
+        {{"rolling-add-dec",
+         "Sequence of bootstraps and decommissions with two tables",
+         "",
+         {
+            typed_option<int>("runs", "Number of simulation runs."),
+            typed_option<int>("iterations", 8, "Number of topology-changing cycles in each run."),
+            typed_option<int>("tablets1", 512, "Number of tablets for the first table."),
+            typed_option<int>("tablets2", 128, "Number of tablets for the second table."),
+            typed_option<int>("rf1", 1, "Replication factor for the first table."),
+            typed_option<int>("rf2", 1, "Replication factor for the second table."),
+            typed_option<int>("nodes", 3, "Number of nodes in the cluster."),
+            typed_option<int>("shards", 30, "Number of shards per node.")
+          }
+        }, &run_add_dec},
+
+        {{"parallel-scaleout",
+         "Simulates a single scale-out involving simultaneous addition of multiple nodes per rack",
+         "",
+         {
+            typed_option<int>("tablets_per_table", 256, "Number of tablets per table."),
+            typed_option<int>("tables", 70, "Table count."),
+            typed_option<int>("nodes-per-rack", 5, "Number of initial nodes per rack."),
+            typed_option<int>("extra-nodes-per-rack", 3, "Number of nodes to add per rack."),
+            typed_option<int>("racks", 2, "Number of racks."),
+            typed_option<int>("shards", 88, "Number of shards per node.")
+          }
+        }, &test_parallel_scaleout},
+    }
+};
+
 int scylla_tablet_load_balancing_main(int argc, char** argv) {
-    namespace bpo = boost::program_options;
-    app_template app;
-    app.add_options()
-            ("runs", bpo::value<int>(), "Number of simulation runs.")
-            ("iterations", bpo::value<int>()->default_value(8), "Number of topology-changing cycles in each run.")
-            ("nodes", bpo::value<int>(), "Number of nodes in the cluster.")
-            ("tablets1", bpo::value<int>(), "Number of tablets for the first table.")
-            ("tablets2", bpo::value<int>(), "Number of tablets for the second table.")
-            ("rf1", bpo::value<int>(), "Replication factor for the first table.")
-            ("rf2", bpo::value<int>(), "Replication factor for the second table.")
-            ("shards", bpo::value<int>(), "Number of shards per node.")
-            ("verbose", "Enables standard logging")
-            ;
-    return app.run(argc, argv, [&] {
-        return seastar::async([&] {
-            if (!app.configuration().contains("verbose")) {
-                auto testlog_level = logging::logger_registry().get_logger_level("testlog");
-                logging::logger_registry().set_all_loggers_level(seastar::log_level::warn);
-                logging::logger_registry().set_logger_level("testlog", testlog_level);
-            }
-            auto stop_test = defer([] {
-                aborted.request_abort();
-            });
-            logalloc::prime_segment_pool(memory::stats().total_memory(), memory::min_free_memory()).get();
-            try {
-                if (app.configuration().contains("runs")) {
-                    run_simulations(app.configuration()).get();
-                } else {
-                    params p {
-                        .iterations = app.configuration()["iterations"].as<int>(),
-                        .nodes = app.configuration()["nodes"].as<int>(),
-                        .tablets1 = app.configuration()["tablets1"].as<int>(),
-                        .tablets2 = app.configuration()["tablets2"].as<int>(),
-                        .rf1 = app.configuration()["rf1"].as<int>(),
-                        .rf2 = app.configuration()["rf2"].as<int>(),
-                        .shards = app.configuration()["shards"].as<int>(),
-                    };
-                    run_simulation(p).get();
-                }
-            } catch (seastar::abort_requested_exception&) {
-                // Ignore
-            }
+    const auto operations = operations_with_func | std::views::keys | std::ranges::to<std::vector>();
+    tool_app_template::config app_cfg{
+            .name = "perf-load-balancing",
+            .description = "Tests tablet load balancer in various scenarios",
+            .logger_name = testlog.name(),
+            .lsa_segment_pool_backend_size_mb = 100,
+            .operations = std::move(operations),
+            .global_options = &global_options,
+            .global_positional_options = &global_positional_options,
+            .db_cfg_ext = db_config_and_extensions()
+    };
+    tool_app_template app(std::move(app_cfg));
+
+    return app.run_async(argc, argv, [] (const operation& operation, const bpo::variables_map& app_config) {
+        auto stop_test = defer([] {
+            aborted.request_abort();
         });
+        try {
+            operations_with_func.at(operation)(app_config);
+            return 0;
+        } catch (seastar::abort_requested_exception&) {
+            // Ignore
+        }
+        return 1;
     });
 }
 

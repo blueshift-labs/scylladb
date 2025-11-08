@@ -40,13 +40,14 @@
 #include <variant>
 #include "service/migration_manager.hh"
 #include "service/raft/raft_group0_client.hh"
-#include "timestamp.hh"
+#include "mutation/timestamp.hh"
 #include "utils/assert.hh"
 #include "utils/class_registrator.hh"
 #include "locator/abstract_replication_strategy.hh"
 #include "data_dictionary/keyspace_metadata.hh"
 #include "service/storage_service.hh"
 #include "service_permit.hh"
+#include "utils/managed_string.hh"
 
 using namespace std::chrono_literals;
 
@@ -83,7 +84,6 @@ private:
     void on_update_function(const sstring& ks_name, const sstring& function_name) override {}
     void on_update_aggregate(const sstring& ks_name, const sstring& aggregate_name) override {}
     void on_update_view(const sstring& ks_name, const sstring& view_name, bool columns_changed) override {}
-    void on_update_tablet_metadata(const locator::tablet_metadata_change_hint&) override {}
 
     void on_drop_keyspace(const sstring& ks_name) override {
         if (!legacy_mode(_qp)) {
@@ -187,14 +187,15 @@ service::service(
         ::service::migration_notifier& mn,
         ::service::migration_manager& mm,
         const service_config& sc,
-        maintenance_socket_enabled used_by_maintenance_socket)
+        maintenance_socket_enabled used_by_maintenance_socket,
+        utils::alien_worker& hashing_worker)
             : service(
                       std::move(c),
                       qp,
                       g0,
                       mn,
                       create_object<authorizer>(sc.authorizer_java_name, qp, g0, mm),
-                      create_object<authenticator>(sc.authenticator_java_name, qp, g0, mm),
+                      create_object<authenticator>(sc.authenticator_java_name, qp, g0, mm, hashing_worker),
                       create_object<role_manager>(sc.role_manager_java_name, qp, g0, mm),
                       used_by_maintenance_socket) {
 }
@@ -214,6 +215,7 @@ future<> service::create_legacy_keyspace_if_missing(::service::migration_manager
                     meta::legacy::AUTH_KS,
                     "org.apache.cassandra.locator.SimpleStrategy",
                     opts,
+                    std::nullopt,
                     std::nullopt);
 
             try {
@@ -240,6 +242,13 @@ future<> service::start(::service::migration_manager& mm, db::system_keyspace& s
         });
     }
     co_await _role_manager->start();
+    if (this_shard_id() == 0) {
+        // Role manager and password authenticator have this odd startup
+        // mechanism where they asynchronously create the superuser role
+        // in the background. Correct password creation depends on role
+        // creation therefore we need to wait here.
+        co_await _role_manager->ensure_superuser_is_created();
+    }
     co_await when_all_succeed(_authorizer->start(), _authenticator->start()).discard_result();
     _permissions_cache = std::make_unique<permissions_cache>(_loading_cache_config, *this, log);
     co_await once_among_shards([this] {
@@ -468,12 +477,14 @@ future<std::vector<cql3::description>> service::describe_roles(bool with_hashed_
         const bool can_login = co_await _role_manager->can_login(role);
         const bool is_superuser = co_await _role_manager->is_superuser(role);
 
+        sstring create_statement = produce_create_statement(formatted_role_name, maybe_hashed_password, can_login, is_superuser);
+
         result.push_back(cql3::description {
             // Roles do not belong to any keyspace.
             .keyspace = std::nullopt,
             .type = "role",
             .name = role,
-            .create_statement = produce_create_statement(formatted_role_name, maybe_hashed_password, can_login, is_superuser)
+            .create_statement = managed_string(create_statement)
         });
     }
 
@@ -614,19 +625,21 @@ future<std::vector<cql3::description>> service::describe_permissions() const {
 
     for (const auto& permissions : permission_list) {
         for (const auto& permission : permissions.permissions) {
+            sstring create_statement = describe_resource_kind(permission, permissions.resource, permissions.role_name);
+
             result.push_back(cql3::description {
                 // Permission grants do not belong to any keyspace.
                 .keyspace = std::nullopt,
                 .type = "grant_permission",
                 .name = permissions.role_name,
-                .create_statement = describe_resource_kind(permission, permissions.resource, permissions.role_name)
+                .create_statement = managed_string(create_statement)
             });
         }
 
         co_await coroutine::maybe_yield();
     }
 
-    std::ranges::sort(result, std::less<>{}, [] (const cql3::description& desc) noexcept {
+    std::ranges::sort(result, std::less<>{}, [] (const cql3::description& desc) {
         return std::make_tuple(std::ref(desc.name), std::ref(*desc.create_statement));
     });
 
@@ -885,7 +898,7 @@ future<> migrate_to_auth_v2(db::system_keyspace& sys_ks, ::service::raft_group0_
                 for (const auto& col : schema->all_columns()) {
                     if (row.has(col.name_as_text())) {
                         values.push_back(
-                                col.type->deserialize(row.get_blob(col.name_as_text())));
+                                col.type->deserialize(row.get_blob_unfragmented(col.name_as_text())));
                     } else {
                         values.push_back(unset_value{});
                     }

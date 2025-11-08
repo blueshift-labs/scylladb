@@ -22,6 +22,7 @@
 #include "cql3/query_processor.hh"
 #include "db/config.hh"
 #include "gms/feature_service.hh"
+#include "replica/database.hh"
 
 #include <boost/regex.hpp>
 #include <stdexcept>
@@ -90,12 +91,12 @@ void create_keyspace_statement::validate(query_processor& qp, const service::cli
 #endif
 }
 
-future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>> create_keyspace_statement::prepare_schema_mutations(query_processor& qp, const query_options&, api::timestamp_type ts) const {
+future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, utils::chunked_vector<mutation>, cql3::cql_warnings_vec>> create_keyspace_statement::prepare_schema_mutations(query_processor& qp, const query_options&, api::timestamp_type ts) const {
     using namespace cql_transport;
     const auto tmptr = qp.proxy().get_token_metadata_ptr();
     const auto& feat = qp.proxy().features();
     const auto& cfg = qp.db().get_config();
-    std::vector<mutation> m;
+    utils::chunked_vector<mutation> m;
     std::vector<sstring> warnings;
 
     try {
@@ -109,31 +110,35 @@ future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector
         // remove this check.
         auto rs = locator::abstract_replication_strategy::create_replication_strategy(
             ksm->strategy_name(),
-            locator::replication_strategy_params(ksm->strategy_options(), ksm->initial_tablets()));
-        if (rs->uses_tablets()) {
-            warnings.push_back(
-                "Tables in this keyspace will be replicated using Tablets "
-                "and will not support CDC, LWT and counters features. "
-                "To use CDC, LWT or counters, drop this keyspace and re-create it "
-                "without tablets by adding AND TABLETS = {'enabled': false} "
-                "to the CREATE KEYSPACE statement.");
-            if (ksm->initial_tablets().value()) {
-                warnings.push_back("Keyspace `initial` tablets option is deprecated.  Use per-table tablet options instead.");
-            }
+            locator::replication_strategy_params(ksm->strategy_options(), ksm->initial_tablets(), ksm->consistency_option()),
+            tmptr->get_topology());
+        if (rs->uses_tablets() && ksm->initial_tablets().value()) {
+            warnings.push_back("Keyspace `initial` tablets option is deprecated.  Use per-table tablet options instead.");
         }
 
         // If `rf_rack_valid_keyspaces` is enabled, it's forbidden to create an RF-rack-invalid keyspace.
         // Verify that it's RF-rack-valid.
         // For more context, see: scylladb/scylladb#23071.
-        if (cfg.rf_rack_valid_keyspaces()) {
-            try {
-                // We hold a group0_guard, so it's correct to check this here.
-                // The topology or schema cannot change while we're performing this query.
-                locator::assert_rf_rack_valid_keyspace(_name, tmptr, *rs);
-            } catch (const std::exception& e) {
+        try {
+            // We hold a group0_guard, so it's correct to check this here.
+            // The topology or schema cannot change while we're performing this query.
+            locator::assert_rf_rack_valid_keyspace(_name, tmptr, *rs);
+        } catch (const std::exception& e) {
+            if (cfg.rf_rack_valid_keyspaces()) {
                 // There's no guarantee what the type of the exception will be, so we need to
                 // wrap it manually here in a type that can be passed to the user.
                 throw exceptions::invalid_request_exception(e.what());
+            } else {
+                // Even when the configuration option `rf_rack_valid_keyspaces` is set to false,
+                // we'd like to inform the user that the keyspace they're creating does not
+                // satisfy the restriction--but just as a warning.
+                // For more context, see issue: scylladb/scylladb#23330.
+                warnings.push_back(seastar::format(
+                    "Keyspace '{}' is not RF-rack-valid: the replication factor doesn't match "
+                    "the rack count in at least one datacenter. A rack failure may reduce availability. "
+                    "For more context, see: "
+                    "https://docs.scylladb.com/manual/stable/reference/glossary.html#term-RF-rack-valid-keyspace.",
+                    _name));
             }
         }
     } catch (const exceptions::already_exists_exception& e) {
@@ -155,6 +160,7 @@ future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector
 
 std::unique_ptr<cql3::statements::prepared_statement>
 cql3::statements::create_keyspace_statement::prepare(data_dictionary::database db, cql_stats& stats) {
+    _attrs->set_default_replication_strategy_class_option();
     return std::make_unique<prepared_statement>(audit_info(), make_shared<create_keyspace_statement>(*this));
 }
 
@@ -191,10 +197,11 @@ std::vector<sstring> check_against_restricted_replication_strategies(
 
     std::vector<sstring> warnings;
     locator::replication_strategy_config_options opts;
-    locator::replication_strategy_params params(opts, std::nullopt);
+    locator::replication_strategy_params params(opts, std::nullopt, std::nullopt);
     auto replication_strategy = locator::abstract_replication_strategy::create_replication_strategy(
             locator::abstract_replication_strategy::to_qualified_class_name(
-                    *attrs.get_replication_strategy_class()), params)->get_type();
+                    *attrs.get_replication_strategy_class()), params,
+                    qp.db().real_database().get_token_metadata().get_topology())->get_type();
     auto rs_warn_list = qp.db().get_config().replication_strategy_warn_list();
     auto rs_fail_list = qp.db().get_config().replication_strategy_fail_list();
 
@@ -237,11 +244,13 @@ std::vector<sstring> check_against_restricted_replication_strategies(
     // We ignore errors (non-number, negative number, etc.) here,
     // these are checked and reported elsewhere.
     for (auto opt : attrs.get_replication_options()) {
-        if (opt.first == sstring("initial_tablets")) {
-            continue;
-        }
         try {
-            auto rf = std::stol(opt.second);
+            long rf = 0;
+            try {
+                rf = locator::get_replication_factor(opt.second);
+            } catch (const exceptions::configuration_exception&) {
+            }
+
             if (rf > 0) {
                 if (auto min_fail = qp.proxy().data_dictionary().get_config().minimum_replication_factor_fail_threshold();
                     min_fail >= 0 && rf < min_fail) {

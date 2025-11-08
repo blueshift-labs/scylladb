@@ -12,6 +12,7 @@
 #include <seastar/core/app-template.hh>
 #include <seastar/util/closeable.hh>
 
+#include "init.hh"
 #include "db/config.hh"
 #include "db/system_distributed_keyspace.hh"
 #include "gms/feature_service.hh"
@@ -47,7 +48,7 @@ namespace bpo = boost::program_options;
 // DEBUG [shard 0] gossip - ep=127.0.0.2, eps=HeartBeatState = { generation = 1446454380, version = 27 }, AppStateMap = { LOAD : Value(0.5005,26) }
 
 int main(int ac, char ** av) {
-    distributed<replica::database> db;
+    sharded<replica::database> db;
     app_template app;
     app.add_options()
         ("seed", bpo::value<std::vector<std::string>>(), "IP address of seed node")
@@ -60,7 +61,7 @@ int main(int ac, char ** av) {
 
             sharded<abort_source> abort_sources;
             sharded<locator::shared_token_metadata> token_metadata;
-            sharded<utils::walltime_compressor_tracker> compressor_tracker;
+            sharded<netw::walltime_compressor_tracker> compressor_tracker;
             sharded<gms::feature_service> feature_service;
             sharded<gms::gossip_address_map> gossip_address_map;
             sharded<netw::messaging_service> messaging;
@@ -82,10 +83,11 @@ int main(int ac, char ** av) {
             as.start().get();
             auto stop_as = defer([&as] { as.stop().get(); });
             sl_controller.start(std::ref(auth_service), std::ref(tm), std::ref(as), qos::service_level_options{.shares = 1000}, default_scheduling_group).get();
-            compressor_tracker.start([] { return utils::walltime_compressor_tracker::config{}; }).get();
+            compressor_tracker.start([] { return netw::walltime_compressor_tracker::config{}; }).get();
             auto stop_compressor_tracker = deferred_stop(compressor_tracker);
 
-            auto cfg = gms::feature_config_from_db_config(db::config(), {});
+            gms::feature_config cfg;
+            cfg.disabled_features = get_disabled_features_from_db_config(db::config());
             feature_service.start(cfg).get();
 
             gossip_address_map.start().get();

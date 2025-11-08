@@ -10,7 +10,7 @@
 #pragma once
 
 #include <seastar/core/sstring.hh>
-#include "keys.hh"
+#include "keys/keys.hh"
 #include <memory>
 #include <utility>
 #include "dht/token.hh"
@@ -118,6 +118,10 @@ dht::token first_token(const dht::partition_range&);
 // If so, returns that shard. Otherwise, return std::nullopt.
 // During tablet migration, uses the view on shard ownership for reads.
 std::optional<shard_id> is_single_shard(const dht::sharder&, const schema&, const dht::partition_range&);
+
+// Quantifies how much the other token range overlaps with the base one.
+// Returns 1.0 if other covers all the area of base, and 0.0 if there's no overlap.
+double overlap_ratio(const dht::token_range& base, const dht::token_range& other);
 
 } // dht
 

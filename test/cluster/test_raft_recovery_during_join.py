@@ -10,7 +10,9 @@ import time
 from uuid import UUID
 import pytest
 
+from test.pylib.internal_types import ServerInfo
 from test.pylib.manager_client import ManagerClient
+from test.pylib.rest_client import read_barrier
 from test.pylib.util import wait_for_cql_and_get_hosts
 from test.cluster.conftest import skip_mode
 from test.cluster.util import check_system_topology_and_cdc_generations_v3_consistency, \
@@ -85,8 +87,11 @@ async def test_raft_recovery_during_join(manager: ManagerClient):
     dead_hosts.append(failed_server_host)
 
     logging.info(f'Killing {dead_servers}')
-    for srv in dead_servers:
-        await manager.server_stop(server_id=srv.server_id)
+    await asyncio.gather(*(manager.server_stop(server_id=srv.server_id) for srv in dead_servers))
+
+    logging.info('Checking that group 0 has no majority')
+    with pytest.raises(Exception, match="raft operation \\[read_barrier\\] timed out"):
+        await read_barrier(manager.api, live_servers[0].ip_addr, timeout=2)
 
     logging.info(f'Unblocking the topology coordinator on server {coordinator}')
     await manager.api.message_injection(coordinator.ip_addr, 'delay_node_bootstrap')
@@ -98,17 +103,20 @@ async def test_raft_recovery_during_join(manager: ManagerClient):
     logging.info(f'Restarting {live_servers}')
     await manager.rolling_restart(live_servers)
 
+    await reconnect_driver(manager)
+    cql, _ = await manager.get_ready_cql(live_servers)
+
     logging.info(f'Deleting the persistent discovery state and group 0 ID on {live_servers}')
     for h in hosts:
         await delete_discovery_state_and_group0_id(cql, h)
 
     recovery_leader_id = await manager.get_host_id(live_servers[0].server_id)
-    logging.info(f'Setting recovery leader to {live_servers[0].server_id} on {live_servers}')
-    for srv in live_servers:
+
+    async def set_recovery_leader(srv: ServerInfo):
         await manager.server_update_config(srv.server_id, 'recovery_leader', recovery_leader_id)
 
-    logging.info(f'Restarting {live_servers}')
-    await manager.rolling_restart(live_servers)
+    logging.info(f'Restarting {live_servers} with recovery leader {live_servers[0].server_id}')
+    await manager.rolling_restart(live_servers, with_down=set_recovery_leader)
 
     logging.info(f'Removing {dead_servers}')
     for i, being_removed in enumerate(dead_servers):
@@ -118,7 +126,7 @@ async def test_raft_recovery_during_join(manager: ManagerClient):
 
     logging.info(f'Unsetting the recovery_leader config option on {live_servers}')
     for srv in live_servers:
-        await manager.server_update_config(srv.server_id, 'recovery_leader', '')
+        await manager.server_remove_config_option(srv.server_id, 'recovery_leader')
 
     cql = await reconnect_driver(manager)
     hosts = await wait_for_cql_and_get_hosts(cql, live_servers, time.time() + 60)

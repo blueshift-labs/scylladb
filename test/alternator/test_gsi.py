@@ -14,8 +14,9 @@
 
 import pytest
 import time
+import itertools
 from botocore.exceptions import ClientError
-from .util import create_test_table, random_string, random_bytes, full_scan, full_query, multiset, list_tables, new_test_table, wait_for_gsi
+from .util import create_test_table, random_string, random_bytes, full_scan, full_query, multiset, list_tables, new_test_table, wait_for_gsi, unique_table_name
 
 # GSIs only support eventually consistent reads, so tests that involve
 # writing to a table and then expect to read something from it cannot be
@@ -1152,12 +1153,11 @@ def test_gsi_5_describe_table_schema(test_table_gsi_5):
 
 # Similar DescribeTable schema test for test_table_gsi_2. The peculiarity
 # in that table is that the base table has only a hash key p, and index
-# only hash hash key x; Now, while internally Scylla needs to add "p" as a
+# only has hash key x; Now, while internally Scylla needs to add "p" as a
 # clustering key in the materialized view (in Scylla the view key always
 # contains the base key), when describing the table, "p" shouldn't be
 # returned as a range key, because the user didn't ask for it.
 # This test reproduces issue #5320.
-@pytest.mark.xfail(reason="GSI DescribeTable spurious range key (#5320)")
 def test_gsi_2_describe_table_schema(test_table_gsi_2):
     got = test_table_gsi_2.meta.client.describe_table(TableName=test_table_gsi_2.name)['Table']
     # Copied from test_table_gsi_2 fixture
@@ -1172,6 +1172,84 @@ def test_gsi_2_describe_table_schema(test_table_gsi_2):
     assert gsis[0]['KeySchema'] == expected_gsi_keyschema
     # The list of attribute definitions may be arbitrarily reordered
     assert multiset(got['AttributeDefinitions']) == multiset(expected_all_attribute_definitions)
+
+# This test is a comprehensive regression test for issue #5320, testing that
+# DescribeTable shows the correct user-requested GSI key even when Alternator
+# had to add to the underlying materialized view an "extra" clustering key
+# (because Scylla's MV requires each base key column to also be a key column
+# in the view). See also its LSI version in test_lsi.py.
+# In test_gsi_2_describe_table_schema above we made an educated guess which
+# combination of base-table and GSI keys might cause DescribeTable to return
+# wrong results. In contrast, this tests rigorously checks *all* the possible
+# combinations of what the base key and GSI key might be:
+#     * The base table's key can have one or two components (just a hash key, or
+#       a hash key and a range key).
+#     * The GSI key can also have one or two components, and each of those can
+#       be picked from one of the base's key columns or from a regular column.
+# The test covers a grand total of 15 different cases, creating just two tables
+# (for one or two base key components) - one has 5 GSIs and the second 10 GSIs.
+def test_gsi_describe_table_schema_all(dynamodb):
+    # We have two options for the base table: it can have either have just a
+    # hash key (['a']) or both a hash key and a range key (['a', 'b'])
+    for base_keys in [ ['a'], ['a', 'b'] ]:
+        # The GSI key can have either one component (just hash) or two (hash
+        # and range). We build in gsi_keys_options a list of all the options
+        # for the GSI key - it's a list of vectors, each of length one or two.
+        gsi_keys_options=[]
+        # First add to gsi_keys_options all options for GSI keys with just one
+        # key component. It can be one of the base_keys, or some unrelated
+        # regular column (which we'll take as 'x')
+        for bk in base_keys:
+            gsi_keys_options.append([bk])
+        gsi_keys_options.append(['x'])
+        # Now add to gsi_keys_options GSI keys with two key component. We need
+        # all the ordered pairs of two different items taken from base_keys
+        # or two other regular columns x and y.
+        for pair in itertools.permutations(base_keys + ['x', 'y'], 2):
+            # If the key has just y, not x, it's a redundant option and we
+            # can drop it - the same key with just x represents the same thing.
+            if 'y' in pair and 'x' not in pair:
+                continue
+            # Similarly, the pair y,x is redundant - it's the same as x,y
+            # (note that when the base key columns are involved, the order
+            # does matter! a,x is not the same as x,a and we should try both)
+            if pair == ('y', 'x'):
+                continue
+            gsi_keys_options.append(pair)
+        print(f'{len(gsi_keys_options)} options for {base_keys}: {gsi_keys_options}')
+        # Finally, create a base table with base_keys and a bunch of GSIs with
+        # all the different GSI key options we collected in gsi_keys_options
+        if len(base_keys) == 1:
+            key_schema=[ { 'AttributeName': base_keys[0], 'KeyType': 'HASH' } ]
+        else:
+            key_schema=[ { 'AttributeName': base_keys[0], 'KeyType': 'HASH' },
+                         { 'AttributeName': base_keys[1], 'KeyType': 'RANGE' } ]
+        attribute_definitions = [ {'AttributeName': attr, 'AttributeType': 'S' } for attr in (base_keys + ['x', 'y']) ]
+        gsis = []
+        for i, gsi_keys in enumerate(gsi_keys_options):
+            if len(gsi_keys) == 1:
+                gsi_key_schema=[ { 'AttributeName': gsi_keys[0], 'KeyType': 'HASH' } ]
+            else:
+                gsi_key_schema=[ { 'AttributeName': gsi_keys[0], 'KeyType': 'HASH' },
+                                 { 'AttributeName': gsi_keys[1], 'KeyType': 'RANGE' } ]
+            gsis.append({ 'IndexName': f'index{i}',
+                          'KeySchema': gsi_key_schema,
+                          'Projection': { 'ProjectionType': 'ALL' } })
+        with new_test_table(dynamodb,
+            KeySchema=key_schema,
+            AttributeDefinitions=attribute_definitions,
+            GlobalSecondaryIndexes=gsis) as table:
+            # Check that DescribeTable shows the table and all its GSIs correctly
+            got = table.meta.client.describe_table(TableName=table.name)['Table']
+            assert got['KeySchema'] == key_schema
+            got_gsis = got['GlobalSecondaryIndexes']
+            # We want to compare got_gsis to the original gsis, but got_gsis
+            # may have extra attributes that DescribeTable added beyond what
+            # was present in the origin table creation. So let's leave in
+            # got_gsis only the columns that were present in gsis[0].
+            got_gsis = [ {k: v for k, v in got_gsi.items() if k in gsis[0]} for got_gsi in got_gsis ]
+            # Use multiset to compare ignoring order
+            assert multiset(got_gsis) == multiset(gsis)
 
 # All tests above involved "ProjectionType: ALL". This test checks how
 # "ProjectionType:: KEYS_ONLY" works. We note that it projects both
@@ -1474,12 +1552,25 @@ def test_gsi_non_scylla_name(dynamodb):
     create_gsi(dynamodb, '.alternator_test')
 
 # Index names with 255 characters are allowed in Dynamo. In Scylla, the
-# limit is different - the sum of both table and index length cannot
-# exceed 211 characters. So we test a much shorter limit.
-# (compare test_create_and_delete_table_very_long_name()).
-def test_gsi_very_long_name(dynamodb):
-    #create_gsi(dynamodb, 'n' * 255)   # works on DynamoDB, but not on Scylla
-    create_gsi(dynamodb, 'n' * 190)
+# limit is different - the sum of both table and index length plus an extra 1
+# cannot exceed 222 characters.
+# (compare test_create_and_delete_table_255/222()).
+@pytest.mark.xfail(reason="Alternator limits table name length + GSI name length to 221")
+def test_gsi_very_long_name_255(dynamodb):
+    create_gsi(dynamodb, 'n' * 255)
+def test_gsi_very_long_name_256(dynamodb):
+    with pytest.raises(ClientError, match='ValidationException'):
+        create_gsi(dynamodb, 'n' * 256)
+def test_gsi_very_long_name_222(dynamodb, scylla_only):
+    # If we subtract from 222 the table's name length (we assume that
+    # unique_table_name() always returns the same length) and an extra 1,
+    # this is how long the GSI's name may be:
+    max = 222 - len(unique_table_name()) - 1
+    # This max length should work:
+    create_gsi(dynamodb, 'n' * max)
+    # But a name one byte longer should fail:
+    with pytest.raises(ClientError, match='ValidationException.*total length'):
+        create_gsi(dynamodb, 'n' * (max+1))
 
 # Verify that ListTables does not list materialized views used for indexes.
 # This is hard to test, because we don't really know which table names
@@ -1906,8 +1997,7 @@ def test_17119a(test_table_gsi_2):
     item = {'p': p, 'x': x, 'z': random_string()}
     test_table_gsi_2.put_item(Item=item)
     assert_index_query(test_table_gsi_2, 'hello', [item],
-        KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'},
-                       'x': {'AttributeValueList': [x], 'ComparisonOperator': 'EQ'}})
+        KeyConditions={'x': {'AttributeValueList': [x], 'ComparisonOperator': 'EQ'}})
     # Change the GSI range key x to a different value.
     newx = random_string()
     test_table_gsi_2.update_item(Key={'p':  p}, AttributeUpdates={'x': {'Value': newx, 'Action': 'PUT'}})
@@ -1915,22 +2005,18 @@ def test_17119a(test_table_gsi_2):
     assert item == test_table_gsi_2.get_item(Key={'p': p}, ConsistentRead=True)['Item']
     # The item newx should appear in the GSI, item x should be gone:
     assert_index_query(test_table_gsi_2, 'hello', [item],
-        KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'},
-                       'x': {'AttributeValueList': [newx], 'ComparisonOperator': 'EQ'}})
+        KeyConditions={'x': {'AttributeValueList': [newx], 'ComparisonOperator': 'EQ'}})
     assert_index_query(test_table_gsi_2, 'hello', [],
-        KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'},
-                       'x': {'AttributeValueList': [x], 'ComparisonOperator': 'EQ'}})
+        KeyConditions={'x': {'AttributeValueList': [x], 'ComparisonOperator': 'EQ'}})
     # Change the GSI range key x back to its original value. Item newx
     # should disappear from the GSI, and item x should reappear:
     test_table_gsi_2.update_item(Key={'p':  p}, AttributeUpdates={'x': {'Value': x, 'Action': 'PUT'}})
     item['x'] = x
     assert item == test_table_gsi_2.get_item(Key={'p': p}, ConsistentRead=True)['Item']
     assert_index_query(test_table_gsi_2, 'hello', [],
-        KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'},
-                       'x': {'AttributeValueList': [newx], 'ComparisonOperator': 'EQ'}})
+        KeyConditions={'x': {'AttributeValueList': [newx], 'ComparisonOperator': 'EQ'}})
     assert_index_query(test_table_gsi_2, 'hello', [item],
-        KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'},
-                       'x': {'AttributeValueList': [x], 'ComparisonOperator': 'EQ'}})
+        KeyConditions={'x': {'AttributeValueList': [x], 'ComparisonOperator': 'EQ'}})
 
 # The following test checks what happens when we have an LSI and a GSI using
 # the same base-table attribute. We want to verify that if the implementation
@@ -2018,3 +2104,59 @@ def test_gsi_invalid_key_types(dynamodb):
                     'Projection': { 'ProjectionType': 'ALL' }
                 }]) as table:
                 pass
+
+# In test_table_gsi_2, the base table has just a hash key "p", and the GSI
+# has just the hash key "x". The materialized view that Alternator uses to
+# implement this GSI needs to add "p" as an extra clustering key, but it
+# doesn't mean that "p" should be allowed in a KeyConditions or
+# KeyConditionExpression - it shouldn't because it's not a real range key.
+@pytest.mark.xfail(reason="Issue #26103")
+def test_faux_range_key_in_keyconditions(test_table_gsi_2):
+    p = random_string()
+    x = random_string()
+    item = {'p': p, 'x': x, 'z': random_string()}
+    test_table_gsi_2.put_item(Item=item)
+    # The GSI 'hello' has just "x" as a hash key, so it can be used in a
+    # KeyConditions in Query:
+    assert_index_query(test_table_gsi_2, 'hello', [item],
+        KeyConditions={ 'x': {'AttributeValueList': [x], 'ComparisonOperator': 'EQ'}})
+    # "p" is not a range key of this GSI, so it cannot be used in a
+    # KeyConditions, and should be an error.
+    with pytest.raises(ClientError, match='ValidationException.*key condition'):
+        assert_index_query(test_table_gsi_2, 'hello', [item],
+            KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'},
+                           'x': {'AttributeValueList': [x], 'ComparisonOperator': 'EQ'}})
+    # "z" is not a key of the GSI, so obviously the following command
+    # must not work, but let's also check that the error message mentions
+    # the write thing, not the irrelevant "p". The DynamoDB error message
+    # is just "Query key condition not supported".
+    with pytest.raises(ClientError, match='ValidationException.*key condition'):
+        assert_index_query(test_table_gsi_2, 'hello', [item],
+            KeyConditions={'z': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'},
+                           'x': {'AttributeValueList': [x], 'ComparisonOperator': 'EQ'}})
+
+@pytest.mark.xfail(reason="Issue #26103")
+def test_faux_range_key_in_keyconditionexpression(test_table_gsi_2):
+    p = random_string()
+    x = random_string()
+    item = {'p': p, 'x': x, 'z': random_string()}
+    test_table_gsi_2.put_item(Item=item)
+    # The GSI 'hello' has just "x" as a hash key, so it can be used in a
+    # KeyConditionExpression in Query:
+    assert_index_query(test_table_gsi_2, 'hello', [item],
+        KeyConditionExpression='x=:x',
+        ExpressionAttributeValues={':x': x})
+    # "p" is not a range key of this GSI, so it cannot be used in a
+    # KeyConditionExpression, and should be an error.
+    with pytest.raises(ClientError, match='ValidationException.*key condition'):
+        assert_index_query(test_table_gsi_2, 'hello', [item],
+            KeyConditionExpression='x=:x AND p=:p',
+            ExpressionAttributeValues={':x': x, ':p': p})
+    # "z" is not a key of the GSI, so obviously the following command
+    # must not work, but let's also check that the error message mentions
+    # the write thing, not the irrelevant "p". The DynamoDB error message
+    # is just "Query key condition not supported".
+    with pytest.raises(ClientError, match='ValidationException.*key condition'):
+        assert_index_query(test_table_gsi_2, 'hello', [item],
+            KeyConditionExpression='x=:x AND z=:z',
+            ExpressionAttributeValues={':x': x, ':z': p})

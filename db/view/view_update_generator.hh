@@ -15,6 +15,7 @@
 #include "gc_clock.hh"
 
 #include <seastar/core/sharded.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/core/metrics_registration.hh>
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/condition-variable.hh>
@@ -26,6 +27,7 @@ struct frozen_mutation_and_schema;
 class mutation;
 class reader_permit;
 class mutation_reader;
+class view_ptr;
 using mutation_reader_opt = optimized_optional<mutation_reader>;
 
 namespace dht {
@@ -51,7 +53,6 @@ using allow_hints = bool_class<allow_hints_tag>;
 namespace db::view {
 
 class stats;
-struct view_and_base;
 struct wait_for_all_updates_tag {};
 using wait_for_all_updates = bool_class<wait_for_all_updates_tag>;
 
@@ -81,6 +82,8 @@ public:
     future<> drain();
     future<> stop();
     future<> register_staging_sstable(sstables::shared_sstable sst, lw_shared_ptr<replica::table> table);
+    // Generate view updates from staging sstables instantly and move those sstables to table's base directory
+    future<> process_staging_sstables(lw_shared_ptr<replica::table> table, std::vector<sstables::shared_sstable> sstables);
 
     replica::database& get_db() noexcept { return _db; }
 
@@ -94,17 +97,18 @@ private:
             db::view::stats& stats,
             replica::cf_stats& cf_stats,
             tracing::trace_state_ptr tr_state,
-            db::timeout_semaphore_units pending_view_updates,
+            db::timeout_semaphore_units pending_view_update_memory_units,
             service::allow_hints allow_hints,
             wait_for_all_updates wait_for_all);
 
+    std::pair<stop_iteration, uint64_t> generate_updates_from_staging_sstables(lw_shared_ptr<replica::table> table, std::vector<sstables::shared_sstable>& sstables);
 public:
     ssize_t available_register_units() const { return _registration_sem.available_units(); }
     size_t queued_batches_count() const { return _sstables_with_tables.size(); }
 
     // Reader's schema must be the same as the base schema of each of the views.
     future<> populate_views(const replica::table& base,
-            std::vector<view_and_base>,
+            std::vector<view_ptr>,
             dht::token base_token,
             mutation_reader&&,
             gc_clock::time_point);
@@ -112,7 +116,7 @@ public:
     future<> generate_and_propagate_view_updates(const replica::table& table,
             const schema_ptr& base,
             reader_permit permit,
-            std::vector<view_and_base>&& views,
+            std::vector<view_ptr>&& views,
             mutation&& m,
             mutation_reader_opt existings,
             tracing::trace_state_ptr tr_state,

@@ -36,6 +36,7 @@ public:
         // auth
         std::string aws_access_key_id;
         std::string aws_secret_access_key;
+        std::string aws_session_token;
         std::string aws_region;
         std::string aws_profile;
         std::string aws_assume_role_arn;
@@ -63,6 +64,8 @@ public:
     ~kms_host();
 
     future<> init();
+    future<> stop();
+
     const host_options& options() const;
 
     struct option_override {

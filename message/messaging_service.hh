@@ -15,7 +15,7 @@
 #include "gms/inet_address.hh"
 #include <seastar/rpc/rpc_types.hh>
 #include <unordered_map>
-#include "interval.hh"
+#include "utils/interval.hh"
 #include "schema/schema_fwd.hh"
 #include "streaming/stream_fwd.hh"
 #include "locator/host_id.hh"
@@ -23,7 +23,8 @@
 #include "service/maintenance_mode.hh"
 #include "gms/gossip_address_map.hh"
 #include "tasks/types.hh"
-#include "utils/advanced_rpc_compressor.hh"
+#include "message/advanced_rpc_compressor.hh"
+#include "utils/chunked_vector.hh"
 
 #include <list>
 #include <vector>
@@ -64,7 +65,7 @@ namespace dht {
     class ring_position;
     using partition_range = interval<ring_position>;
     using token_range = interval<token>;
-    using token_range_vector = std::vector<token_range>;
+    using token_range_vector = utils::chunked_vector<token_range>;
 }
 
 namespace query {
@@ -203,7 +204,13 @@ enum class messaging_verb : int32_t {
     TABLET_REPAIR = 75,
     TRUNCATE_WITH_TABLETS = 76,
     TABLE_LOAD_STATS = 77,
-    LAST = 78,
+    ESTIMATE_SSTABLE_VOLUME = 78,
+    SAMPLE_SSTABLES = 79,
+    TABLET_REPAIR_COLOCATED = 80,
+    REPAIR_UPDATE_COMPACTION_CTRL = 81,
+    REPAIR_UPDATE_REPAIRED_AT_FOR_MERGE = 82,
+    WORK_ON_VIEW_BUILDING_TASKS = 83,
+    LAST = 84,
 };
 
 } // namespace netw
@@ -369,9 +376,9 @@ public:
     using clock_type = lowres_clock;
 
     messaging_service(locator::host_id id, gms::inet_address ip, uint16_t port,
-                      gms::feature_service&, gms::gossip_address_map&, gms::generation_type, utils::walltime_compressor_tracker&, qos::service_level_controller&);
+                      gms::feature_service&, gms::gossip_address_map&, gms::generation_type, walltime_compressor_tracker&, qos::service_level_controller&);
     messaging_service(config cfg, scheduling_config scfg, std::shared_ptr<seastar::tls::credentials_builder>,
-                      gms::feature_service&, gms::gossip_address_map&, gms::generation_type, utils::walltime_compressor_tracker&, qos::service_level_controller&);
+                      gms::feature_service&, gms::gossip_address_map&, gms::generation_type, walltime_compressor_tracker&, qos::service_level_controller&);
     ~messaging_service();
 
     future<> start();

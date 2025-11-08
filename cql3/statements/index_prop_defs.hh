@@ -12,6 +12,7 @@
 
 #include "property_definitions.hh"
 #include <seastar/core/sstring.hh>
+#include "schema/schema_fwd.hh"
 
 #include <unordered_map>
 #include <optional>
@@ -28,10 +29,12 @@ public:
 
     bool is_custom = false;
     std::optional<sstring> custom_class;
+    // The only assumption about the value of `index_version` should be that it is different for every index.
+    std::optional<table_schema_version> index_version;
 
-    void validate();
-    index_options_map get_raw_options();
-    index_options_map get_options();
+    void validate() const;
+    index_options_map get_raw_options() const;
+    index_options_map get_options() const;
 };
 
 }

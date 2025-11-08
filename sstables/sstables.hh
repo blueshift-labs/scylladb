@@ -44,6 +44,8 @@
 #include "tracing/trace_state.hh"
 #include "utils/updateable_value.hh"
 #include "dht/decorated_key.hh"
+#include "service/session.hh"
+#include "sstables/trie/bti_index.hh"
 
 #include <seastar/util/optimized_optional.hh>
 
@@ -58,10 +60,12 @@ class in_memory_config_type;
 
 namespace db {
 class large_data_handler;
+class corrupt_data_handler;
 }
 
 namespace sstables {
 
+struct abstract_index_reader;
 class sstable_directory;
 extern thread_local utils::updateable_value<bool> global_cache_index_pages;
 
@@ -199,8 +203,9 @@ public:
             version_types v,
             format_types f,
             db::large_data_handler& large_data_handler,
+            db::corrupt_data_handler& corrupt_data_handler,
             sstables_manager& manager,
-            gc_clock::time_point now,
+            db_clock::time_point now,
             io_error_handler_gen error_handler_gen,
             size_t buffer_size);
     sstable& operator=(const sstable&) = delete;
@@ -238,13 +243,12 @@ public:
     // load sstable using components shared by a shard
     future<> load(foreign_sstable_open_info info) noexcept;
     // Load metadata components from disk
-    future<> load_metadata(sstable_open_config cfg = {}, bool validate = true) noexcept;
+    future<> load_metadata(sstable_open_config cfg = {}) noexcept;
     // load all components from disk
     // this variant will be useful for testing purposes and also when loading
     // a new sstable from scratch for sharing its components.
     future<> load(const dht::sharder& sharder, sstable_open_config cfg = {}) noexcept;
     future<> open_data(sstable_open_config cfg = {}) noexcept;
-    future<> update_info_for_opened_data(sstable_open_config cfg = {});
 
     // Load set of shards that own the SSTable, while reading the minimum
     // from disk to achieve that.
@@ -284,7 +288,9 @@ public:
             streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
             mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes,
             read_monitor& monitor = default_read_monitor(),
-            integrity_check integrity = integrity_check::no);
+            integrity_check integrity = integrity_check::no,
+            const utils::hashed_key* single_partition_read_murmur_hash = nullptr
+        );
 
     // A reader which doesn't use the index at all. It reads everything from the
     // sstable and it doesn't support skipping.
@@ -325,21 +331,16 @@ public:
 
     future<> seal_sstable(bool backup);
 
-    static uint64_t get_estimated_key_count(const uint32_t size_at_full_sampling, const uint32_t min_index_interval) {
-        return ((uint64_t)size_at_full_sampling + 1) * min_index_interval;
-    }
     // Size at full sampling is calculated as if sampling were static, using minimum index as a strict sampling interval.
     static uint64_t get_size_at_full_sampling(const uint64_t key_count, const uint32_t min_index_interval) {
         return std::ceil(float(key_count) / min_index_interval) - 1;
     }
 
     uint64_t get_estimated_key_count() const {
-        return get_estimated_key_count(_components->summary.header.size_at_full_sampling, _components->summary.header.min_index_interval);
+        return get_stats_metadata().estimated_partition_size.count();
     }
 
-    uint64_t estimated_keys_for_range(const dht::token_range& range);
-
-    std::vector<dht::decorated_key> get_key_samples(const schema& s, const dht::token_range& range);
+    future<uint64_t> estimated_keys_for_range(const dht::token_range& range);
 
     // mark_for_deletion() specifies that a sstable isn't relevant to the
     // current shard, and thus can be deleted by the deletion manager, if
@@ -377,6 +378,8 @@ public:
         return _index_file;
     }
     file uncached_index_file();
+    file uncached_partitions_file();
+    file uncached_rows_file();
     // Returns size of bloom filter data.
     uint64_t filter_size() const;
 
@@ -444,6 +447,10 @@ public:
         return _large_data_handler;
     }
 
+    db::corrupt_data_handler& get_corrupt_data_handler() {
+        return _corrupt_data_handler;
+    }
+
     void assert_large_data_handler_is_running();
 
     /**
@@ -451,7 +458,7 @@ public:
      * max_data_age, which is load time. This could maybe
      * be improved upon.
      */
-    gc_clock::time_point max_data_age() const {
+    db_clock::time_point max_data_age() const {
         return _now;
     }
 
@@ -518,7 +525,7 @@ private:
     friend struct component_name;
     friend class sstable_stream_sink_impl;
     friend class filesystem_storage;
-    friend class s3_storage;
+    friend class object_storage_base;
     friend class tiered_storage;
 
     const size_t sstable_buffer_size;
@@ -539,8 +546,15 @@ private:
     file _index_file;
     seastar::shared_ptr<cached_file> _cached_index_file;
     file _data_file;
+    file _partitions_file;
+    seastar::shared_ptr<cached_file> _cached_partitions_file;
+    std::optional<trie::bti_partitions_db_footer> _partitions_db_footer;
+    file _rows_file;
+    seastar::shared_ptr<cached_file> _cached_rows_file;
     uint64_t _data_file_size;
-    uint64_t _index_file_size;
+    uint64_t _index_file_size = 0;
+    uint64_t _partitions_file_size = 0;
+    uint64_t _rows_file_size = 0;
     // on-disk size of components but data and index.
     uint64_t _metadata_size_on_disk = 0;
     db_clock::time_point _data_file_write_time;
@@ -561,6 +575,7 @@ private:
     schema_ptr _schema;
     generation_type _generation{0};
     sstable_state _state;
+    sstable_enabled_features _features = {};
 
     std::unique_ptr<storage> _storage;
 
@@ -577,12 +592,13 @@ private:
     } _marked_for_deletion = mark_for_deletion::none;
     bool _active = true;
 
-    gc_clock::time_point _now;
+    db_clock::time_point _now;
 
     io_error_handler _read_error_handler;
     io_error_handler _write_error_handler;
 
     db::large_data_handler& _large_data_handler;
+    db::corrupt_data_handler& _corrupt_data_handler;
     sstables_manager& _manager;
 
     sstables_stats _stats;
@@ -639,6 +655,8 @@ private:
 
     future<file> new_sstable_component_file(const io_error_handler& error_handler, component_type f, open_flags flags, file_open_options options = {}) const noexcept;
 
+    future<> unlink_component(component_type type) noexcept;
+
     future<file_writer> make_component_file_writer(component_type c, file_output_stream_options options,
             open_flags oflags = open_flags::wo | open_flags::create | open_flags::exclusive) noexcept;
 
@@ -651,7 +669,6 @@ private:
     future<> read_scylla_metadata() noexcept;
 
     void write_scylla_metadata(shard_id shard,
-                               sstable_enabled_features features,
                                run_identifier identifier,
                                std::optional<scylla_metadata::large_data_stats> ld_stats,
                                std::optional<scylla_metadata::ext_timestamp_stats> ts_stats);
@@ -665,6 +682,11 @@ private:
     // This should be called only before an sstable is sealed.
     void maybe_rebuild_filter_from_index(uint64_t num_partitions);
 
+    void build_delayed_filter(uint64_t num_partitions);
+
+    future<> update_info_for_opened_data(sstable_open_config cfg = {});
+
+    future<> read_toc() noexcept;
     future<> read_summary() noexcept;
 
     void write_summary() {
@@ -674,6 +696,8 @@ private:
     // To be called when we try to load an SSTable that lacks a Summary. Could
     // happen if old tools are being used.
     future<> generate_summary();
+
+    future<> read_partitions_db_footer();
 
     future<> read_statistics();
     void write_statistics();
@@ -691,6 +715,7 @@ private:
     void validate_max_local_deletion_time();
     void validate_partitioner();
 
+    // Loads first and last partition keys from appropriate components into `_first` and `_last`.
     void set_first_and_last_keys();
 
     // Create a position range based on the min/max_column_names metadata of this sstable.
@@ -743,7 +768,7 @@ public:
     // integrity-checked stream with no compression. The parameter is ignored
     // if integrity checking is disabled or the SSTable is compressed.
     using raw_stream = bool_class<class raw_stream_tag>;
-    input_stream<char> data_stream(uint64_t pos, size_t len,
+    future<input_stream<char>> data_stream(uint64_t pos, size_t len,
             reader_permit permit, tracing::trace_state_ptr trace_state, lw_shared_ptr<file_input_stream_history> history,
             raw_stream raw = raw_stream::no, integrity_check integrity = integrity_check::no,
             integrity_error_handler error_handler = throwing_integrity_error_handler);
@@ -759,7 +784,6 @@ public:
 private:
     future<summary_entry&> read_summary_entry(size_t i);
 
-    // FIXME: pending on Bloom filter implementation
     bool filter_has_key(const schema& s, const dht::decorated_key& dk) { return filter_has_key(key::from_partition_key(s, dk._key)); }
 
     std::optional<std::pair<uint64_t, uint64_t>> get_sample_indexes_for_range(const dht::token_range& range);
@@ -784,7 +808,6 @@ private:
     // runs in async context (called from storage::open)
     void write_toc(file_writer w);
 public:
-    future<> read_toc() noexcept;
 
     shareable_components& get_shared_components() const {
         return *_components;
@@ -809,22 +832,27 @@ public:
     void validate_originating_host_id() const;
 
     bool has_correct_promoted_index_entries() const {
-        return _schema->is_compound() || !has_scylla_component() || _components->scylla_metadata->has_feature(sstable_feature::NonCompoundPIEntries);
+        return _schema->is_compound() || !has_scylla_component() || has_feature(sstable_feature::NonCompoundPIEntries);
     }
 
     bool has_correct_non_compound_range_tombstones() const {
-        return _schema->is_compound() || !has_scylla_component() || _components->scylla_metadata->has_feature(sstable_feature::NonCompoundRangeTombstones);
+        return _schema->is_compound() || !has_scylla_component() || has_feature(sstable_feature::NonCompoundRangeTombstones);
     }
 
     bool has_shadowable_tombstones() const {
-        return has_scylla_component() && _components->scylla_metadata->has_feature(sstable_feature::ShadowableTombstones);
+        return has_feature(sstable_feature::ShadowableTombstones);
     }
 
     sstable_enabled_features features() const {
-        if (!has_scylla_component()) {
-            return {};
-        }
-        return _components->scylla_metadata->get_features();
+        return _features;
+    }
+
+    void set_features(sstable_enabled_features sef) {
+        _features = sef;
+    }
+
+    bool has_feature(sstable_feature f) const {
+        return features().is_enabled(f);
     }
 
     const scylla_metadata* get_scylla_metadata() const {
@@ -1028,6 +1056,12 @@ public:
         }
     };
 
+    std::unique_ptr<abstract_index_reader> make_index_reader(
+        reader_permit permit,
+        tracing::trace_state_ptr trace_state = {},
+        use_caching caching = use_caching::yes,
+        bool single_partition_read = false);
+
     // Allow the test cases from sstable_test.cc to test private methods. We use
     // a placeholder to avoid cluttering this class too much. The sstable_test class
     // will then re-export as public every method it needs.
@@ -1038,13 +1072,13 @@ public:
     friend class promoted_index;
     friend class sstables_manager;
     template <typename DataConsumeRowsContext>
-    friend std::unique_ptr<DataConsumeRowsContext>
+    friend future<std::unique_ptr<DataConsumeRowsContext>>
     data_consume_rows(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&, disk_read_range, uint64_t, integrity_check);
     template <typename DataConsumeRowsContext>
-    friend std::unique_ptr<DataConsumeRowsContext>
+    friend future<std::unique_ptr<DataConsumeRowsContext>>
     data_consume_single_partition(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&, disk_read_range, integrity_check);
     template <typename DataConsumeRowsContext>
-    friend std::unique_ptr<DataConsumeRowsContext>
+    friend future<std::unique_ptr<DataConsumeRowsContext>>
     data_consume_rows(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&, integrity_check);
     friend void lw_shared_ptr_deleter<sstables::sstable>::dispose(sstable* s);
     gc_clock::time_point get_gc_before_for_drop_estimation(const gc_clock::time_point& compaction_time, const tombstone_gc_state& gc_state, const schema_ptr& s) const;
@@ -1054,6 +1088,13 @@ public:
     future<lw_shared_ptr<checksum>> read_checksum();
 
     friend in_memory_config_type;
+
+    service::session_id being_repaired;
+public:
+    void mark_as_being_repaired(const service::session_id& id);
+    // This function must run inside a seastar thread since it calls
+    // rewrite_statistics which must run inside a seastar thread.
+    int64_t update_repaired_at(int64_t repaired_at);
 };
 
 // Validate checksums
@@ -1113,6 +1154,8 @@ public:
     // output device. Default impl will call wrap_file and generate a wrapper object.
     virtual future<data_sink> wrap_sink(const sstable&, component_type, data_sink);
 
+    virtual future<data_source>
+    wrap_source(const sstable&, component_type, data_source);
     // optionally return a map of attributes for a given sstable,
     // suitable for "describe".
     // This would preferably be interesting info on what/why the extension did

@@ -136,8 +136,9 @@ def unique_table_name():
     return test_table_prefix + str(current_ms)
 unique_table_name.last_ms = 0
 
-def create_test_table(dynamodb, **kwargs):
-    name = unique_table_name()
+def create_test_table(dynamodb, name=None, **kwargs):
+    if name is None:
+        name = unique_table_name()
     BillingMode = 'PAY_PER_REQUEST'
     if 'BillingMode' in kwargs:
         BillingMode = kwargs['BillingMode']
@@ -187,7 +188,11 @@ def list_tables(dynamodb, limit=100):
         else:
             page = dynamodb.meta.client.list_tables(Limit=limit);
         results = page.get('TableNames', None)
-        assert(results)
+        if not results:
+            # DynamoDB may return a last empty page, without TableNames at
+            # all. It seems it doesn't happen on us-east-1, but does happen
+            # on eu-north-1 when limit=1.
+            break;
         ret = ret + results
         newpos = page.get('LastEvaluatedTableName', None)
         if not newpos:
@@ -222,6 +227,16 @@ def client_no_transform(client):
 
 def is_aws(dynamodb):
     return dynamodb.meta.client._endpoint.host.endswith('.amazonaws.com')
+
+# Return the AWS region name, or the Scylla data center name.
+def get_region(dynamodb):
+    if is_aws(dynamodb):
+        dc_name = dynamodb.meta.client.meta.region_name
+        # Make sure we got a non-empty region name.
+        assert len(dc_name) > 0
+        return dc_name
+    system_local = dynamodb.Table('.scylla.alternator.system.local')
+    return system_local.scan(AttributesToGet=['data_center'])['Items'][0]['data_center']
 
 # Tries to inject an error via Scylla REST API. It only works on Scylla,
 # and only in specific build modes (dev, debug, sanitize), so this function
@@ -295,3 +310,54 @@ def wait_for_gsi_gone(table, gsi_name):
                 continue
         return
     raise AssertionError("wait_for_gsi_gone did not complete")
+
+# Read a parameter from Scylla's configuration, stored in the system table
+# which is also visible to Alternator. This function will only work on Scylla,
+# and fail otherwise, so should only be used in Scylla-only tests.
+# If this is Scylla, but the specific parameter name is not present in the
+# configuration, this function returns None. If the parameter is present,
+# it is returned (as a string).
+def scylla_config_read(dynamodb, name):
+    config_table = dynamodb.Table('.scylla.alternator.system.config')
+    # We use query() here instead of the simpler get_item(), because
+    # commit 44a1daf only added support for system tables in Query and
+    # Scan, not in GetItem...
+    r = config_table.query(
+            KeyConditionExpression='#key=:val',
+            ExpressionAttributeNames={'#key': 'name'},
+            ExpressionAttributeValues={':val': name}
+        )
+    if not 'Items' in r or not r['Items']:
+        return None
+    return r['Items'][0]['value']
+
+# Write a parameter in Scylla's configuration, using in the system table
+# which is also visible to Alternator. This function will only work on Scylla,
+# and fail otherwise, so should only be used in Scylla-only tests.
+# Also on Scylla, this function may fail with an exception if the
+# configuration parameter alternator_allow_system_table_write is not turned
+# on, so callers might want to catch such an exception and skip the test.
+def scylla_config_write(dynamodb, name, value):
+    config_table = dynamodb.Table('.scylla.alternator.system.config')
+    config_table.update_item(
+            Key={'name': name},
+            UpdateExpression='SET #val = :val',
+            ExpressionAttributeNames={'#val': 'value'},
+            ExpressionAttributeValues={':val': value}
+        )
+
+# A context manager that can be used in a "with" to temporarily set a
+# configuration parameter to a desired value, and restore its original
+# value when the context ends.
+# The configuration parameter has to be live-updatable.
+# Note that using this mechanism is only a good idea if you're sure that
+# no other workload or test is using the same Alternator cluster in parallel,
+# because the changed configuration will affect the other workload too.
+@contextmanager
+def scylla_config_temporary(dynamodb, name, value):
+    original_value = scylla_config_read(dynamodb, name)
+    scylla_config_write(dynamodb, name, value)
+    try:
+        yield
+    finally:
+        scylla_config_write(dynamodb, name, original_value)

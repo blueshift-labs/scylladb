@@ -305,7 +305,9 @@ RAFT_TEST_CASE(rpc_load_conf_from_log, (test_case{
 // Shrunk later to 2 nodes and then expanded back to 3 nodes.
 // Test that both configuration changes update RPC configuration correspondingly
 // on all nodes.
-RAFT_TEST_CASE(rpc_propose_conf_change, (test_case{
+// TODO: change to RAFT_TEST_CASE once it's stable for handling packet drops
+SEASTAR_THREAD_TEST_CASE(rpc_propose_conf_change) {
+    replication_test<lowres_clock>((test_case{
          .nodes = 3, .total_values = 0,
          .updates = {
             // Remove node C from the cluster configuration.
@@ -320,7 +322,9 @@ RAFT_TEST_CASE(rpc_propose_conf_change, (test_case{
             // also the newly integrated node gets the actual RPC configuration, too.
             check_rpc_config{{node_id{0},node_id{1},node_id{2}},
                              rpc_address_set{node_id{0},node_id{1},node_id{2}}},
-         }}));
+         }})
+    , false, tick_delta);
+}
 
 // 3 node cluster {A, B, C}.
 // Test that leader elections don't change RPC configuration.
@@ -345,7 +349,7 @@ RAFT_TEST_CASE(rpc_voter_non_voter_transision, (test_case{
                              rpc_address_set{node_id{0},node_id{1},node_id{2}}},
             rpc_reset_counters{{node_id{0},node_id{1},node_id{2}}},
             // Make C a non-voting member.
-            set_config{0, 1, set_config_entry(2, false)},
+            set_config{0, 1, set_config_entry(2, raft::is_voter::no)},
             // Check that RPC configuration didn't change.
             check_rpc_added{{node_id{0},node_id{1},node_id{2}},0},
             check_rpc_removed{{node_id{0},node_id{1},node_id{2}},0},

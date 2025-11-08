@@ -64,7 +64,7 @@ extensions = [
 ]
 
 # The suffix(es) of source filenames.
-source_suffix = ['.rst']
+source_suffix = ['.rst', '.md']
 
 # The master toctree document.
 master_doc = "index"
@@ -168,6 +168,7 @@ html_css_files = [
 html_theme_options = {
     "conf_py_path": "docs/",
     'hide_banner': 'true',
+    "hide_ai_chatbot": "false",
     "hide_edit_this_page_button": "false",
     "hide_feedback_buttons": 'false',
     "github_issues_repository": "scylladb/scylladb",
@@ -178,9 +179,9 @@ html_theme_options = {
     'banner_button_text': 'Register for Free',
     'banner_button_url': 'https://lp.scylladb.com/university-live-2023-03-registration?siteplacement=docs',
     'banner_title_text': 'ScyllaDB University LIVE, FREE Virtual Training Event | March 21',
-    "collapse_navigation": 'true',
+    "navigation_depth": 3,
+    "collapse_navigation": 'false',
     "brand": "open-source" if FLAG == 'opensource' else "self-hosted",
-
 }
 
 # Last updated format
@@ -196,7 +197,7 @@ htmlhelp_basename = "ScyllaDocumentationdoc"
 html_baseurl = BASE_URL
 
 # Dictionary of values to pass into the template engine’s context for all pages
-html_context = {"html_baseurl": html_baseurl}
+html_context = {"html_baseurl": html_baseurl, "flag": FLAG}
 
 def setup(app):
     if 'opensource' in app.tags:

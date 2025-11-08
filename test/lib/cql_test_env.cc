@@ -10,7 +10,9 @@
 #include <random>
 #include <seastar/core/thread.hh>
 #include <seastar/util/defer.hh>
+#include <boost/test/unit_test.hpp>
 #include "gms/generation-number.hh"
+#include "db/view/view_building_worker.hh"
 #include "replica/database_fwd.hh"
 #include "test/lib/cql_test_env.hh"
 #include "cdc/generation_service.hh"
@@ -21,7 +23,7 @@
 #include "cql3/statements/modification_statement.hh"
 #include "cql3/cql_config.hh"
 #include <fmt/ranges.h>
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/scheduling.hh>
@@ -43,6 +45,7 @@
 #include "db/config.hh"
 #include "db/batchlog_manager.hh"
 #include "schema/schema_builder.hh"
+#include "db/view/view_building_state.hh"
 #include "test/lib/tmpdir.hh"
 #include "test/lib/log.hh"
 #include "db/view/view_builder.hh"
@@ -56,7 +59,6 @@
 #include "service/qos/service_level_controller.hh"
 #include "db/system_keyspace.hh"
 #include "db/system_distributed_keyspace.hh"
-#include "db/sstables-format-selector.hh"
 #include "repair/row_level.hh"
 #include "utils/assert.hh"
 #include "utils/only_on_shard0.hh"
@@ -68,6 +70,7 @@
 #include "db/virtual_tables.hh"
 #include "service/raft/raft_group0_client.hh"
 #include "service/raft/raft_group0.hh"
+#include "service/paxos/paxos_state.hh"
 #include "sstables/sstables_manager.hh"
 #include "init.hh"
 #include "lang/manager.hh"
@@ -109,6 +112,8 @@ cql_test_config::cql_test_config(shared_ptr<db::config> cfg)
 
     db_config->flush_schema_tables_after_modification.set(false);
     db_config->commitlog_use_o_dsync(false);
+
+    db_config->rf_rack_valid_keyspaces(true);
 }
 
 cql_test_config::cql_test_config(const cql_test_config&) = default;
@@ -128,18 +133,23 @@ public:
     static constexpr std::string_view ks_name = "ks";
     static std::atomic<bool> active;
 private:
+    sharded<default_sstable_compressor_factory> _scf;
     sharded<replica::database> _db;
     sharded<gms::feature_service> _feature_service;
     sharded<sstables::storage_manager> _sstm;
     sharded<service::storage_proxy> _proxy;
+    sharded<service::paxos::paxos_store> _paxos_store;
     sharded<cql3::query_processor> _qp;
     sharded<auth::service> _auth_service;
     sharded<db::view::view_builder> _view_builder;
+    sharded<db::view::view_building_worker> _view_building_worker;
     sharded<db::view::view_update_generator> _view_update_generator;
     sharded<service::migration_notifier> _mnotifier;
     sharded<qos::service_level_controller> _sl_controller;
+    sharded<qos::service_level_controller::auth_integration> _sl_controller_auth_integration;
     sharded<service::topology_state_machine> _topology_state_machine;
-    sharded<utils::walltime_compressor_tracker> _compressor_tracker;
+    sharded<db::view::view_building_state_machine> _view_building_state_machine;
+    sharded<netw::walltime_compressor_tracker> _compressor_tracker;
     sharded<service::migration_manager> _mm;
     sharded<db::batchlog_manager> _batchlog_manager;
     sharded<gms::gossiper> _gossiper;
@@ -148,7 +158,7 @@ private:
     sharded<service::tablet_allocator> _tablet_allocator;
     sharded<db::system_distributed_keyspace> _sys_dist_ks;
     sharded<locator::snitch_ptr> _snitch;
-    sharded<compaction_manager> _cm;
+    sharded<compaction::compaction_manager> _cm;
     sharded<tasks::task_manager> _task_manager;
     sharded<netw::messaging_service> _ms;
     sharded<service::storage_service> _ss;
@@ -167,6 +177,7 @@ private:
     sharded<gms::gossip_address_map> _gossip_address_map;
     sharded<service::direct_fd_pinger> _fd_pinger;
     sharded<cdc::cdc_service> _cdc;
+    sharded<vector_search::vector_store_client> _vector_store_client;
     db::config* _db_config;
 
     service::raft_group0_client* _group0_client;
@@ -185,7 +196,7 @@ private:
             return make_ready_future<>();
         }
     };
-    distributed<core_local_state> _core_local;
+    sharded<core_local_state> _core_local;
 private:
     cql3::dialect test_dialect() {
         return cql3::dialect{
@@ -291,7 +302,7 @@ public:
             });
     }
 
-    virtual future<std::vector<mutation>> get_modification_mutations(const sstring& text) override {
+    virtual future<utils::chunked_vector<mutation>> get_modification_mutations(const sstring& text) override {
         auto qs = make_query_state();
         auto cql_stmt = local_qp().get_statement(text, qs->get_client_state(), test_dialect())->statement;
         auto modif_stmt = dynamic_pointer_cast<cql3::statements::modification_statement>(std::move(cql_stmt));
@@ -335,12 +346,16 @@ public:
         return _db;
     }
 
-    distributed<cql3::query_processor>& qp() override {
+    sharded<cql3::query_processor>& qp() override {
         return _qp;
     }
 
     auth::service& local_auth_service() override {
         return _auth_service.local();
+    }
+
+    virtual sharded<db::view::view_builder>& view_builder() override {
+        return _view_builder;
     }
 
     virtual db::view::view_builder& local_view_builder() override {
@@ -349,6 +364,10 @@ public:
 
     virtual db::view::view_update_generator& local_view_update_generator() override {
         return _view_update_generator.local();
+    }
+
+    virtual sharded<db::view::view_building_worker>& view_building_worker() override {
+        return _view_building_worker;
     }
 
     virtual service::migration_notifier& local_mnotifier() override {
@@ -504,6 +523,8 @@ private:
             if (!cfg->view_update_reader_concurrency_semaphore_kill_limit_multiplier.is_set()) {
                 cfg->view_update_reader_concurrency_semaphore_kill_limit_multiplier.set(std::numeric_limits<uint32_t>::max());
             }
+            cfg->critical_disk_utilization_level.set(1.0f);
+
             tmpdir data_dir;
             auto data_dir_path = data_dir.path().string();
             if (!cfg->data_file_directories.is_set()) {
@@ -547,7 +568,8 @@ private:
 
             auto stop_configurables = defer_verbose_shutdown("configurables", [&] { notify_set.notify_all(configurable::system_state::stopped).get(); });
 
-            gms::feature_config fcfg = gms::feature_config_from_db_config(*cfg, cfg_in.disabled_features);
+            gms::feature_config fcfg;
+            fcfg.disabled_features = get_disabled_features_from_db_config(*cfg, cfg_in.disabled_features);
             _feature_service.start(fcfg).get();
             auto stop_feature_service = defer_verbose_shutdown("feature service", [this] { _feature_service.stop().get(); });
 
@@ -592,7 +614,6 @@ private:
             dbcfg.memtable_scheduling_group = scheduling_groups.memtable_scheduling_group;
             dbcfg.memtable_to_cache_scheduling_group = scheduling_groups.memtable_to_cache_scheduling_group;
             dbcfg.gossip_scheduling_group = scheduling_groups.gossip_scheduling_group;
-            dbcfg.sstables_format = sstables::version_from_string(cfg->sstable_format());
 
             auto get_tm_cfg = sharded_parameter([&] {
                 return tasks::task_manager::config {
@@ -618,9 +639,9 @@ private:
             // get_cm_cfg is called on each shard when starting a sharded<compaction_manager>
             // we need the getter since updateable_value is not shard-safe (#7316)
             auto get_cm_cfg = sharded_parameter([&] {
-                return compaction_manager::config {
-                    .compaction_sched_group = compaction_manager::scheduling_group{dbcfg.compaction_scheduling_group},
-                    .maintenance_sched_group = compaction_manager::scheduling_group{dbcfg.streaming_scheduling_group},
+                return compaction::compaction_manager::config {
+                    .compaction_sched_group = compaction::compaction_manager::scheduling_group{dbcfg.compaction_scheduling_group},
+                    .maintenance_sched_group = compaction::compaction_manager::scheduling_group{dbcfg.streaming_scheduling_group},
                     .available_memory = dbcfg.available_memory,
                     .static_shares = cfg->compaction_static_shares,
                     .throughput_mb_per_sec = cfg->compaction_throughput_mb_per_sec,
@@ -629,6 +650,7 @@ private:
             });
             _cm.start(std::move(get_cm_cfg), std::ref(abort_sources), std::ref(_task_manager)).get();
             auto stop_cm = deferred_stop(_cm);
+            _cm.invoke_on_all(&compaction::compaction_manager::start, std::ref(*cfg), only_on_shard0(&*_disk_space_monitor_shard0)).get();
 
             _sstm.start(std::ref(*cfg), sstables::storage_manager::config{}).get();
             auto stop_sstm = deferred_stop(_sstm);
@@ -656,14 +678,19 @@ private:
             auto stop_lang_manager = defer_verbose_shutdown("lang manager", [this] { _lang_manager.stop().get(); });
             _lang_manager.invoke_on_all(&lang::manager::start).get();
 
+            auto numa_groups = local_engine->smp().shard_to_numa_node_mapping();
+            _scf.start(sharded_parameter(default_sstable_compressor_factory::config::from_db_config, std::cref(*cfg), std::cref(numa_groups))).get();
+            auto stop_scf = defer_verbose_shutdown("sstable_compressor_factory", [this] {
+                _scf.stop().get();
+            });
 
             _db_config = &*cfg;
-            _db.start(std::ref(*cfg), dbcfg, std::ref(_mnotifier), std::ref(_feature_service), std::ref(_token_metadata), std::ref(_cm), std::ref(_sstm), std::ref(_lang_manager), std::ref(_sst_dir_semaphore), std::ref(abort_sources), utils::cross_shard_barrier()).get();
+            _db.start(std::ref(*cfg), dbcfg, std::ref(_mnotifier), std::ref(_feature_service), std::ref(_token_metadata), std::ref(_cm), std::ref(_sstm), std::ref(_lang_manager), std::ref(_sst_dir_semaphore), std::ref(_scf), std::ref(abort_sources), utils::cross_shard_barrier()).get();
             auto stop_db = defer_verbose_shutdown("database", [this] {
                 _db.stop().get();
             });
 
-            _db.invoke_on_all(&replica::database::start, std::ref(_sl_controller)).get();
+            _db.invoke_on_all(&replica::database::start, std::ref(_sl_controller), only_on_shard0(&*_disk_space_monitor_shard0)).get();
 
             smp::invoke_on_all([blocked_reactor_notify_ms] {
                 engine().update_blocked_reactor_notify_ms(blocked_reactor_notify_ms);
@@ -696,7 +723,12 @@ private:
                                                      std::chrono::duration_cast<std::chrono::milliseconds>(cql3::prepared_statements_cache::entry_expiry));
             auth_prep_cache_config.refresh = std::chrono::milliseconds(cfg->permissions_update_interval_in_ms());
 
-            _qp.start(std::ref(_proxy), std::move(local_data_dict), std::ref(_mnotifier), qp_mcfg, std::ref(_cql_config), auth_prep_cache_config, std::ref(_lang_manager)).get();
+            _vector_store_client.start(std::ref(*cfg)).get();
+            auto stop_vector_store_client = defer_verbose_shutdown("vector store client", [this] {
+                _vector_store_client.stop().get();
+            });
+
+            _qp.start(std::ref(_proxy), std::move(local_data_dict), std::ref(_mnotifier), std::ref(_vector_store_client), qp_mcfg, std::ref(_cql_config), auth_prep_cache_config, std::ref(_lang_manager)).get();
             auto stop_qp = defer_verbose_shutdown("query processor", [this] { _qp.stop().get(); });
 
             _elc_notif.start().get();
@@ -722,8 +754,11 @@ private:
                 if (!linfo.host_id) {
                     linfo.host_id = locator::host_id::create_random_id();
                 }
+                const auto location = _snitch.local()->get_location();
+                linfo.dc = location.dc;
+                linfo.rack = location.rack;
                 host_id = linfo.host_id;
-                _sys_ks.local().save_local_info(std::move(linfo), _snitch.local()->get_location(), my_address, my_address).get();
+                _sys_ks.local().save_local_info(std::move(linfo), my_address, my_address).get();
             }
             locator::shared_token_metadata::mutate_on_all_shards(_token_metadata, [hostid = host_id] (locator::token_metadata& tm) {
                 auto& topo = tm.get_topology();
@@ -745,7 +780,7 @@ private:
             }).get();
 
             auto arct_cfg = [&] {
-                return utils::advanced_rpc_compressor::tracker::config{
+                return netw::advanced_rpc_compressor::tracker::config{
                     .zstd_quota_fraction{1.0},
                     .register_metrics = true,
                 };
@@ -854,13 +889,13 @@ private:
                 return fs.enable(fs.supported_feature_set());
             }).get();
 
-            _mapreduce_service.start(std::ref(_ms), std::ref(_proxy), std::ref(_db), std::ref(_token_metadata), std::ref(abort_sources)).get();
+            _mapreduce_service.start(std::ref(_ms), std::ref(_proxy), std::ref(_db), std::ref(abort_sources)).get();
             auto stop_mapreduce_service =  defer_verbose_shutdown("mapreduce service", [this] { _mapreduce_service.stop().get(); });
 
             // gropu0 client exists only on shard 0
             service::raft_group0_client group0_client(_group0_registry.local(), _sys_ks.local(), _token_metadata.local(), maintenance_mode_enabled::no);
 
-            _mm.start(std::ref(_mnotifier), std::ref(_feature_service), std::ref(_ms), std::ref(_proxy), std::ref(_gossiper), std::ref(group0_client), std::ref(_sys_ks)).get();
+            _mm.start(std::ref(_mnotifier), std::ref(_feature_service), std::ref(_ms), std::ref(_proxy), std::ref(_ss), std::ref(_gossiper), std::ref(group0_client), std::ref(_sys_ks)).get();
             auto stop_mm = defer_verbose_shutdown("migration manager", [this] { _mm.stop().get(); });
 
             _tablet_allocator.start(service::tablet_allocator::config{}, std::ref(_mnotifier), std::ref(_db)).get();
@@ -873,11 +908,16 @@ private:
                 _topology_state_machine.stop().get();
             });
 
+            _view_building_state_machine.start().get();
+            auto stop_view_building_state_machine = defer_verbose_shutdown("view building state machine", [this] {
+                _view_building_state_machine.stop().get();
+            });
+
             service::raft_group0 group0_service{
                     abort_sources.local(), _group0_registry.local(), _ms,
                     _gossiper.local(), _feature_service.local(), _sys_ks.local(), group0_client, scheduling_groups.gossip_scheduling_group};
 
-            auto compression_dict_updated_callback = [] { return make_ready_future<>(); };
+            auto compression_dict_updated_callback = [] (std::string_view) { return make_ready_future<>(); };
 
             _sys_dist_ks.start(std::ref(_qp), std::ref(_mm), std::ref(_proxy)).get();
 
@@ -890,6 +930,9 @@ private:
             auto stop_view_builder = defer_verbose_shutdown("view builder", [this] {
                 _view_builder.stop().get();
             });
+
+            _stream_manager.start(std::ref(*cfg), std::ref(_db), std::ref(_view_builder), std::ref(_view_building_worker), std::ref(_ms), std::ref(_mm), std::ref(_gossiper), scheduling_groups.streaming_scheduling_group).get();
+            auto stop_streaming = defer_verbose_shutdown("stream manager", [this] { _stream_manager.stop().get(); });
 
             _ss.start(std::ref(abort_sources), std::ref(_db),
                 std::ref(_gossiper),
@@ -904,10 +947,11 @@ private:
                 std::ref(_snitch),
                 std::ref(_tablet_allocator),
                 std::ref(_cdc_generation_service),
-                std::ref(_view_builder),
+                std::ref(_view_builder), std::ref(_view_building_worker),
                 std::ref(_qp),
                 std::ref(_sl_controller),
                 std::ref(_topology_state_machine),
+                std::ref(_view_building_state_machine),
                 std::ref(_task_manager),
                 std::ref(_gossip_address_map),
                 compression_dict_updated_callback,
@@ -921,7 +965,7 @@ private:
             });
 
             smp::invoke_on_all([&] {
-                return db::initialize_virtual_tables(_db, _ss, _gossiper, _group0_registry, _sys_ks, *cfg);
+                return db::initialize_virtual_tables(_db, _ss, _gossiper, _group0_registry, _sys_ks, _tablet_allocator, _ms, *cfg);
             }).get();
 
             _qp.invoke_on_all([this, &group0_client] (cql3::query_processor& qp) {
@@ -931,19 +975,19 @@ private:
                 _qp.invoke_on_all(&cql3::query_processor::stop_remote).get();
             });
 
-            _cm.invoke_on_all([&](compaction_manager& cm) {
+            _cm.invoke_on_all([&](compaction::compaction_manager& cm) {
                 auto cl = _db.local().commitlog();
                 auto scl = _db.local().schema_commitlog();
                 if (cl && scl) {
-                    cm.get_tombstone_gc_state().set_gc_time_min_source([cl, scl](const table_id& id) {
+                    cm.get_shared_tombstone_gc_state().set_gc_time_min_source([cl, scl](const table_id& id) {
                         return std::min(cl->min_gc_time(id), scl->min_gc_time(id));
                     });
                 } else if (cl) {
-                    cm.get_tombstone_gc_state().set_gc_time_min_source([cl](const table_id& id) {
+                    cm.get_shared_tombstone_gc_state().set_gc_time_min_source([cl](const table_id& id) {
                         return cl->min_gc_time(id);
                     });
                 } else if (scl) {
-                    cm.get_tombstone_gc_state().set_gc_time_min_source([scl](const table_id& id) {
+                    cm.get_shared_tombstone_gc_state().set_gc_time_min_source([scl](const table_id& id) {
                         return scl->min_gc_time(id);
                     });
                 }
@@ -971,27 +1015,22 @@ private:
             auto shutdown_db = defer_verbose_shutdown("database tables", [this] {
                 _db.invoke_on_all(&replica::database::shutdown).get();
             });
-            // XXX: drain_on_shutdown raft before stopping the database and
-            // query processor. Group registry stop raft groups
-            // when stopped, and until then the groups may use
-            // the database and the query processor.
-            auto drain_raft = defer_verbose_shutdown("raft group registry servers", [this] {
-                _group0_registry.invoke_on_all(&service::raft_group_registry::drain_on_shutdown).get();
-            });
 
             _view_update_generator.invoke_on_all(&db::view::view_update_generator::start).get();
 
+            _paxos_store.start(std::ref(_sys_ks), std::ref(_feature_service), std::ref(_db), std::ref(_mm)).get();
+            auto stop_paxos_store = defer_verbose_shutdown("paxos store", [this] {
+                _paxos_store.stop().get();
+            });
+
             if (cfg_in.need_remote_proxy) {
-                _proxy.invoke_on_all(&service::storage_proxy::start_remote, std::ref(_ms), std::ref(_gossiper), std::ref(_mm), std::ref(_sys_ks), std::ref(group0_client), std::ref(_topology_state_machine)).get();
+                _proxy.invoke_on_all(&service::storage_proxy::start_remote, std::ref(_ms), std::ref(_gossiper), std::ref(_mm), std::ref(_sys_ks), std::ref(_paxos_store), std::ref(group0_client), std::ref(_topology_state_machine), std::ref(_view_building_state_machine)).get();
             }
             auto stop_proxy_remote = defer_verbose_shutdown("storage proxy RPC verbs", [this, need = cfg_in.need_remote_proxy] {
                 if (need) {
                     _proxy.invoke_on_all(&service::storage_proxy::stop_remote).get();
                 }
             });
-
-            _stream_manager.start(std::ref(*cfg), std::ref(_db), std::ref(_view_builder), std::ref(_ms), std::ref(_mm), std::ref(_gossiper), scheduling_groups.streaming_scheduling_group).get();
-            auto stop_streaming = defer_verbose_shutdown("stream manager", [this] { _stream_manager.stop().get(); });
 
             _sl_controller.invoke_on_all([this, &group0_client] (qos::service_level_controller& service) {
                 qos::service_level_controller::service_level_distributed_data_accessor_ptr service_level_data_accessor =
@@ -1022,7 +1061,8 @@ private:
 
             group0_service.start().get();
             auto stop_group0_service = defer_verbose_shutdown("group 0 service", [&group0_service] {
-                group0_service.abort().get();
+                group0_service.abort_and_drain().get();
+                group0_service.destroy();
             });
 
             _ss.local().set_group0(group0_service);
@@ -1039,6 +1079,11 @@ private:
 
             group0_service.setup_group0_if_exist(_sys_ks.local(), _ss.local(), _qp.local(), _mm.local()).get();
 
+            _view_building_worker.start(std::ref(_db), std::ref(_sys_ks), std::ref(_mnotifier), std::ref(group0_client), std::ref(_view_update_generator), std::ref(_ms), std::ref(_view_building_state_machine)).get();
+            auto stop_view_building_worker = defer_verbose_shutdown("view building worker", [this] {
+                _view_building_worker.stop().get();
+            });
+
             const auto generation_number = gms::generation_type(_sys_ks.local().increment_and_get_generation().get());
 
             try {
@@ -1050,11 +1095,13 @@ private:
                 throw;
             }
 
-            if (cfg->rf_rack_valid_keyspaces()) {
-                startlog.info("Verifying that all of the keyspaces are RF-rack-valid");
-                _db.local().check_rf_rack_validity(_token_metadata.local().get());
-                startlog.info("All keyspaces are RF-rack-valid");
-            }
+            startlog.info("Verifying that all of the keyspaces are RF-rack-valid");
+            _db.local().check_rf_rack_validity(cfg->rf_rack_valid_keyspaces(), _token_metadata.local().get());
+
+            // Materialized views and secondary indexes are still restricted and require specific configuration
+            // options to work. Make sure that if there are existing views or indexes, they don't violate
+            // the requirements imposed on them.
+            _db.local().validate_tablet_views_indexes();
 
             utils::loading_cache_config perm_cache_config;
             perm_cache_config.max_size = cfg->permissions_cache_max_entries();
@@ -1070,7 +1117,11 @@ private:
             auth_config.authenticator_java_name = qualified_authenticator_name;
             auth_config.role_manager_java_name = qualified_role_manager_name;
 
-            _auth_service.start(perm_cache_config, std::ref(_qp), std::ref(group0_client), std::ref(_mnotifier), std::ref(_mm), auth_config, maintenance_socket_enabled::no).get();
+
+
+            const uint64_t niceness = 19;
+            auto hashing_worker = utils::alien_worker(startlog, niceness, "pwd-hash");
+            _auth_service.start(perm_cache_config, std::ref(_qp), std::ref(group0_client), std::ref(_mnotifier), std::ref(_mm), auth_config, maintenance_socket_enabled::no, std::ref(hashing_worker)).get();
             _auth_service.invoke_on_all([this] (auth::service& auth) {
                 return auth.start(_mm.local(), _sys_ks.local());
             }).get();
@@ -1082,6 +1133,17 @@ private:
                 // double execution of the shutdown method, which causes waiting for 
                 // an invalid future if we're unlucky.
                 _auth_service.stop().get();
+            });
+
+            // Precondition: we can only call this after `auth::service` has been initialized and started on all shards.
+            _sl_controller.invoke_on_all([&auth_service = _auth_service] (qos::service_level_controller& controller) {
+                controller.register_auth_integration(auth_service.local());
+            }).get();
+
+            auto unregister_sl_controller_integration = defer([this] {
+                _sl_controller.invoke_on_all([] (qos::service_level_controller& controller) {
+                    return controller.unregister_auth_integration();
+                }).get();
             });
 
             db::batchlog_manager_config bmcfg;
@@ -1131,9 +1193,17 @@ private:
                 create_keyspace(cfg_in, ks_name).get();
             }
 
-            with_scheduling_group(dbcfg.statement_scheduling_group, [&func, this] {
-                return func(*this);
-            }).get();
+            try {
+                with_scheduling_group(dbcfg.statement_scheduling_group, [&func, this] {
+                    return func(*this);
+                }).get();
+            } catch (...) {
+                namespace utf = boost::unit_test::framework;
+                testlog.error("{}cql env callback failed, error: {}",
+                    utf::test_in_progress() ? utf::current_test_unit().p_name.get() + ": " : "",
+                    std::current_exception());
+                throw;
+            }
     }
 
 public:

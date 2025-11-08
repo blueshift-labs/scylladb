@@ -11,7 +11,7 @@ import tempfile
 import requests
 
 # run_with_temporary_dir() is a utility function for running a process, such
-# as Scylla, Cassandra or Redis, inside its own new temporary directory,
+# as Scylla and Cassandra, inside its own new temporary directory,
 # and ensure that on exit for any reason - success, failure, signal or
 # exception - the subprocess is killed and its temporary directory is deleted.
 #
@@ -156,7 +156,8 @@ def abort_run_with_dir(pid, tmpdir):
 def abort_run_with_temporary_dir(pid):
     return abort_run_with_dir(pid, pid_to_dir(pid))
 
-omit_scylla_output = "--omit-scylla-output" in sys.argv
+if omit_scylla_output := "--omit-scylla-output" in sys.argv:
+    sys.argv.remove("--omit-scylla-output")  # don't pass this option to pytest
 summary=''
 run_pytest_pids = set()
 
@@ -199,7 +200,7 @@ for sig in [signal.SIGTERM, signal.SIGHUP]:
 
 ##############################
 
-# When we run a server - e.g., Scylla, Cassandra, or Redis - we want to
+# When we run a server - e.g., Scylla or Cassandra - we want to
 # have it listen on a unique IP address so it doesn't collide with other
 # servers run by other concurrent tests. Luckily, Linux allows us to use any
 # IP address in the range 127/8 (i.e., 127.*.*.*). If we pick an IP address
@@ -306,6 +307,7 @@ def run_scylla_cmd(pid, dir):
         '--write-request-timeout-in-ms', '300000',
         '--request-timeout-in-ms', '300000',
         '--user-defined-function-time-limit-ms', '1000',
+        '--group0-raft-op-timeout-in-ms=300000',
         # Allow testing experimental features. Following issue #9467, we need
         # to add here specific experimental features as they are introduced.
         # Note that Alternator-specific experimental features are listed in
@@ -385,7 +387,7 @@ def run_precompiled_scylla_cmd(exe, pid, dir):
         cmd.remove('--kernel-page-cache=1')
         cmd.remove('--flush-schema-tables-after-modification=false')
         cmd.remove('--strict-allow-filtering=true')
-    if major <= [6,2] or (enterprise and major <= [2025,1]):
+    if major <= [6,2] or (enterprise and major < [2025,1]):
         cmd.remove('--experimental-features=views-with-tablets')
     if major <= [4,5]:
         cmd.remove('--max-networking-io-control-blocks=1000')
@@ -393,6 +395,8 @@ def run_precompiled_scylla_cmd(exe, pid, dir):
         cmd.append('--force-schema-commit-log=true')
     if major < [2025,1]:
         cmd.remove('--tablets-initial-scale-factor=1')
+    if major < [2025,2]:
+        cmd.remove('--group0-raft-op-timeout-in-ms=300000')
     return (cmd, env)
 
 # Get a Cluster object to connect to CQL at the given IP address (and with
@@ -499,6 +503,7 @@ def run_pytest(pytest_dir, additional_parameters):
         # child:
         run_with_temporary_dir_pids = set() # no children to clean up on child
         run_pytest_pids = set()
+        os.environ.setdefault('SCYLLA_TEST_RUNNER', 'runpy')
         os.chdir(pytest_dir)
         os.setsid()
         os.execvp('pytest', ['pytest',

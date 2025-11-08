@@ -10,7 +10,8 @@
 
 #include "dht/ring_position.hh"
 #include "dht/token-sharding.hh"
-#include "interval.hh"
+#include "utils/interval.hh"
+#include "utils/chunked_vector.hh"
 
 #include <vector>
 
@@ -89,7 +90,7 @@ struct ring_position_range_and_shard_and_element : ring_position_range_and_shard
 //
 // During migration uses a view on shard routing for reads.
 class ring_position_range_vector_sharder {
-    using vec_type = dht::partition_range_vector;
+    using vec_type = utils::chunked_vector<dht::partition_range>;
     vec_type _ranges;
     const sharder& _sharder;
     vec_type::iterator _current_range;
@@ -104,7 +105,7 @@ public:
     // Initializes the `ring_position_range_vector_sharder` with the ranges to be processesd.
     // Input ranges should be non-overlapping (although nothing bad will happen if they do
     // overlap).
-    ring_position_range_vector_sharder(const sharder& sharder, dht::partition_range_vector ranges);
+    ring_position_range_vector_sharder(const sharder& sharder, utils::chunked_vector<dht::partition_range> ranges);
     // Fetches the next range-shard mapping. When the input range is exhausted, std::nullopt is
     // returned. Within an input range, results are contiguous and non-overlapping (but since input
     // ranges usually are discontiguous, overall the results are not contiguous). Together, the results
@@ -137,7 +138,7 @@ public:
             , _next_shard(_shard + 1 == _sharder.shard_count() ? 0 : _shard + 1)
             , _start_token(_range.start() ? _range.start()->value() : minimum_token())
             , _start_boundary(_sharder.shard_for_reads(_start_token) == shard ?
-                _range.start() : interval_bound<dht::token>(_sharder.token_for_next_shard_for_reads(_start_token, shard))) {
+                _range.start_copy() : interval_bound<dht::token>(_sharder.token_for_next_shard_for_reads(_start_token, shard))) {
     }
     // Returns the next token_range that is both wholly contained within the input range and also
     // wholly owned by the input shard_id. When the input range is exhausted, std::nullopt is returned.

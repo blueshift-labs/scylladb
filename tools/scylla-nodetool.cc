@@ -15,6 +15,7 @@
 #include <limits>
 #include <iterator>
 #include <numeric>
+#include <fstream>
 #include <boost/algorithm/string/case_conv.hpp>
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
@@ -25,9 +26,11 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/when_all.hh>
+#include <seastar/core/fstream.hh>
 #include <seastar/http/exception.hh>
 #include <seastar/http/request.hh>
 #include <seastar/util/short_streams.hh>
+#include <seastar/util/closeable.hh>
 #include <seastar/core/units.hh>
 #include <seastar/net/dns.hh>
 #include <seastar/net/inet_address.hh>
@@ -39,6 +42,7 @@
 #include "api/scrub_status.hh"
 #include "gms/application_state.hh"
 #include "db/config.hh"
+#include "db/compaction_history_entry.hh"
 #include "db_clock.hh"
 #include "utils/log.hh"
 #include "release.hh"
@@ -67,13 +71,13 @@ static std::ostream& operator<<(std::ostream& os, const std::vector<sstring>& v)
 
 // mimic the behavior of FileUtils::stringifyFileSize
 struct file_size_printer {
-    uint64_t value;
+    int64_t value;
     bool human_readable;
     bool use_correct_units;
     // Cassandra nodetool uses base_2 and base_10 units interchangeably, some
     // commands use this, some that. Let's accomodate this for now, and maybe
     // fix this mess at one point in the future, after the rewrite is done.
-    file_size_printer(uint64_t value, bool human_readable = true, bool use_correct_units = false)
+    file_size_printer(int64_t value, bool human_readable = true, bool use_correct_units = false)
         : value{value}
         , human_readable{human_readable}
         , use_correct_units{use_correct_units}
@@ -87,15 +91,15 @@ struct fmt::formatter<file_size_printer> : fmt::formatter<string_view> {
             return fmt::format_to(ctx.out(), "{}", size.value);
         }
 
-        using unit_t = std::tuple<uint64_t, std::string_view, std::string_view>;
+        using unit_t = std::tuple<int64_t, std::string_view, std::string_view>;
         const unit_t units[] = {
-            {1UL << 40, "TiB", "TB"},
-            {1UL << 30, "GiB", "GB"},
-            {1UL << 20, "MiB", "MB"},
-            {1UL << 10, "KiB", "KB"},
+            {1LL << 40, "TiB", "TB"},
+            {1LL << 30, "GiB", "GB"},
+            {1LL << 20, "MiB", "MB"},
+            {1LL << 10, "KiB", "KB"},
         };
         for (auto [n, base_2, base_10] : units) {
-            if (size.value > n) {
+            if ((size.value > n) || (size.value < -n)) {
                 auto d = static_cast<float>(size.value) / n;
                 auto postfix = size.use_correct_units ? base_2 : base_10;
                 return fmt::format_to(ctx.out(), "{:.2f} {}", d, postfix);
@@ -105,11 +109,21 @@ struct fmt::formatter<file_size_printer> : fmt::formatter<string_view> {
     }
 };
 
+template <>
+struct fmt::formatter<sstables::basic_info> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const sstables::basic_info& sstable, FormatContext& ctx) const {
+        return fmt::format_to(ctx.out(), "{{generation: {}, origin: {}, size: {}}}", data_value(sstable.generation), sstable.origin, sstable.size);
+    }
+};
+
 namespace {
 
 const auto app_name = "nodetool";
 
 logging::logger nlog(format("scylla-{}", app_name));
+
+using history_entry = db::compaction_history_entry;
 
 struct operation_failed_on_scylladb : public std::runtime_error {
     using std::runtime_error::runtime_error;
@@ -147,9 +161,20 @@ class scylla_rest_client {
     rjson::value do_request(sstring type, sstring path,
                             std::unordered_map<sstring, sstring> params,
                             std::optional<request_body> body = {}) {
+        http::request::query_parameters_type req_params;
+        for (auto& [key, value] : params) {
+            req_params[std::move(key)].push_back(std::move(value));
+        }
+        return do_request(type, path, std::move(req_params), std::move(body));
+    }
+
+    rjson::value do_request(sstring type, sstring path,
+                            http::request::query_parameters_type params,
+                            std::optional<request_body> body = {}) {
         auto req = http::request::make(type, _host_name, path);
         auto url = req.get_url();
-        req.query_parameters = params;
+
+        req.set_query_params(params);
         if (body) {
             req.write_body(body->content_type, body->content);
         }
@@ -200,12 +225,25 @@ public:
         return do_request("POST", std::move(path), std::move(params), std::move(body));
     }
 
+    rjson::value post(sstring path, http::request::query_parameters_type params, std::optional<request_body> body = {}) {
+        return do_request("POST", std::move(path), std::move(params), std::move(body));
+    }
+
     rjson::value get(sstring path, std::unordered_map<sstring, sstring> params = {}) {
+        return do_request("GET", std::move(path), std::move(params));
+    }
+
+    rjson::value get(sstring path, http::request::query_parameters_type params) {
         return do_request("GET", std::move(path), std::move(params));
     }
 
     // delete is a reserved keyword, using del instead
     rjson::value del(sstring path, std::unordered_map<sstring, sstring> params = {}) {
+        return do_request("DELETE", std::move(path), std::move(params));
+    }
+
+    // delete is a reserved keyword, using del instead
+    rjson::value del(sstring path, http::request::query_parameters_type params) {
         return do_request("DELETE", std::move(path), std::move(params));
     }
 };
@@ -262,10 +300,13 @@ public:
     }
 };
 
-std::vector<sstring> get_keyspaces(scylla_rest_client& client, std::optional<sstring> type = {}) {
+std::vector<sstring> get_keyspaces(scylla_rest_client& client, std::optional<sstring> type = {}, std::optional<sstring> replication = {}) {
     std::unordered_map<sstring, sstring> params;
     if (type) {
         params["type"] = *type;
+    }
+    if (replication) {
+        params["replication"] = *replication;
     }
     auto keyspaces_json = client.get("/storage_service/keyspaces", std::move(params));
     std::vector<sstring> keyspaces;
@@ -406,6 +447,7 @@ void backup_operation(scylla_rest_client& client, const bpo::variables_map& vm) 
     if (vm.contains("snapshot")) {
         params["snapshot"] = vm["snapshot"].as<sstring>();
     }
+    params["move_files"] = vm.contains("move-files") ? "true" : "false";
     const auto backup_res = client.post("/storage_service/backup", std::move(params));
     const auto task_id = rjson::to_string_view(backup_res);
     if (vm.contains("nowait")) {
@@ -479,6 +521,125 @@ void clearsnapshot_operation(scylla_rest_client& client, const bpo::variables_ma
     client.del("/storage_service/snapshots", std::move(params));
 }
 
+static bool keyspace_uses_tablets(scylla_rest_client& client, const sstring& keyspace) {
+    const std::unordered_map<sstring, sstring> params = {{"replication", "tablets"}};
+    const auto res = client.get("/storage_service/keyspaces", params);
+
+    const auto& ks_array = res.GetArray();
+    const auto is_same_ks = [&] (const auto& json_ks) { return rjson::to_string_view(json_ks) == keyspace; };
+    return std::find_if(ks_array.begin(), ks_array.end(), is_same_ks) != ks_array.end();
+}
+
+std::optional<sstring> maybe_get_dcs(scylla_rest_client& client, const bpo::variables_map& vm) {
+    if (vm.contains("in-local-dc")) {
+        const auto res = client.get("/snitch/datacenter");
+        return sstring(rjson::to_string_view(res));
+    } else if (vm.contains("in-dc")) {
+        const auto dcs = vm["in-dc"].as<std::vector<sstring>>();
+        return fmt::to_string(fmt::join(dcs.begin(), dcs.end(), ","));
+    }
+    return std::nullopt;
+}
+
+std::optional<sstring> maybe_get_hosts(const bpo::variables_map& vm) {
+    if (vm.contains("in-hosts")) {
+        const auto hosts = vm["in-hosts"].as<std::vector<sstring>>();
+        return fmt::to_string(fmt::join(hosts.begin(), hosts.end(), ","));
+    }
+    return std::nullopt;
+}
+
+void cluster_repair_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    std::vector<sstring> keyspaces, tables;
+    if (vm.contains("keyspace")) {
+        auto res = parse_keyspace_and_tables(client, vm, true);
+        auto uses_tablets = keyspace_uses_tablets(client, res.keyspace);
+        if (!uses_tablets) {
+            throw std::invalid_argument("nodetool cluster repair repairs only tablet keyspaces. To repair vnode keyspaces use nodetool repair.");
+        }
+        keyspaces.push_back(std::move(res.keyspace));
+        tables = std::move(res.tables);
+    } else {
+        keyspaces = get_keyspaces(client, "non_local_strategy", "tablets");
+        if (!get_keyspaces(client, "non_local_strategy", "vnodes").empty()) {
+            fmt::print("Warning: only tablet keyspaces will be repaired. To repair vnode keyspaces use nodetool repair.");
+        }
+    }
+
+    std::unordered_map<sstring, sstring> repair_params{{"tokens", "all"}};
+
+    if (vm.contains("tablet-tokens")) {
+        const auto tokens = vm["tablet-tokens"].as<std::vector<sstring>>();
+        repair_params["tokens"] = fmt::to_string(fmt::join(tokens.begin(), tokens.end(), ","));
+    }
+
+    if (auto hosts = maybe_get_hosts(vm); hosts.has_value()) {
+        repair_params["hosts_filter"] = std::move(hosts.value());
+    }
+
+    if (auto dcs = maybe_get_dcs(client, vm); dcs.has_value()) {
+        repair_params["dcs_filter"] = std::move(dcs.value());
+    }
+
+    if (vm.contains("incremental-mode")) {
+        auto mode = vm["incremental-mode"].as<sstring>();
+        const std::unordered_set<sstring> supported_mode{"disabled", "incremental", "full"};
+        if (!supported_mode.contains(mode)) {
+            throw std::invalid_argument("nodetool cluster repair --incremental-mode only supports: disabled, incremental, full");
+        }
+        repair_params["incremental_mode"] = mode;
+    }
+
+    auto log = [&]<typename... Args> (fmt::format_string<Args...> fmt, Args&&... param) {
+        const auto msg = fmt::format(fmt, param...);
+        using clock = std::chrono::system_clock;
+        const auto n = clock::now();
+        const auto t = clock::to_time_t(n);
+        const auto ms = (n - clock::from_time_t(t)) / 1ms;
+        fmt::print("[{:%F %T},{:03d}] {}\n", fmt::localtime(t), ms, msg);
+    };
+
+    int exit_code = EXIT_SUCCESS;
+    if (!keyspaces.empty()) {
+        auto ks_to_cfs = tables.empty() ? get_ks_to_cfs(client) : std::map<sstring, std::vector<sstring>>{};
+        for (const auto& keyspace : keyspaces) {
+            repair_params["ks"] = keyspace;
+            for (const auto& table : tables.empty() ? ks_to_cfs[keyspace] : tables) {
+                repair_params["table"] = table;
+                try {
+                    sstring task_id = client.post("/storage_service/tablets/repair", repair_params).GetObject()["tablet_task_id"].GetString();
+
+                    log("Starting repair with task_id={} keyspace={} table={}", task_id, keyspace, table);
+
+                    const auto wait_url = format("/task_manager/wait_task/{}", task_id);
+                    const auto res = client.get(wait_url);
+                    const auto status = res.GetObject();
+
+                    if (status["state"] == "failed") {
+                        exit_code = EXIT_FAILURE;
+                        log("ERROR: Repair with task_id={} failed", task_id);
+                    } else {
+                        log("Repair with task_id={} finished", task_id);
+                    }
+                } catch (const api_request_failed& ex) {
+                    if (std::string(ex.what()).contains("because it is colocated") && tables.empty()) {
+                        // ignore the error about not being able to request repair for colocated tables if the repair
+                        // was requested for all tables and not for a specific colocated table.
+                        // if repair is requested for all tables then in particular it repairs all base tables, which
+                        // will repair also their colocated tables.
+                        continue;
+                    }
+                    log("ERROR: Repair request for keyspace={} table={} failed with {}", keyspace, table, ex);
+                    exit_code = EXIT_FAILURE;
+                }
+            }
+        }
+    }
+    if (exit_code != EXIT_SUCCESS) {
+        throw operation_failed_with_status{exit_code};
+    }
+}
+
 void compact_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     if (vm.contains("user-defined")) {
         throw std::invalid_argument("--user-defined flag is unsupported");
@@ -518,17 +679,47 @@ void print_compactionhistory(const std::vector<Entry>& history) {
     for (const auto& e : history) {
         auto output = seq->add_map();
         output->add_item("id", fmt::to_string(e.id));
-        output->add_item("columnfamily_name", e.table);
-        output->add_item("keyspace_name", e.keyspace);
+        output->add_item("shard_id", e.shard_id);
+        output->add_item("columnfamily_name", e.cf);
+        output->add_item("keyspace_name", e.ks);
+        output->add_item("compaction_type", e.compaction_type);
+        output->add_item("started_at", format_compacted_at(e.started_at));
         output->add_item("compacted_at", format_compacted_at(e.compacted_at));
         output->add_item("bytes_in", e.bytes_in);
         output->add_item("bytes_out", e.bytes_out);
-        auto seq = output->add_seq("rows_merged");
-        for (const auto& [key, value] : e.rows_merged) {
-            auto output = seq->add_map();
-            output->add_item("key", key);
-            output->add_item("value", value);
+        {
+            auto seq = output->add_seq("rows_merged");
+            for (const auto& [key, value] : std::map<int32_t, int64_t>(e.rows_merged.begin(), e.rows_merged.end())) {
+                auto output = seq->add_map();
+                output->add_item("key", key);
+                output->add_item("value", value);
+            }
         }
+        {
+            auto seq = output->add_seq("sstables_in");
+            for (const auto& sstable : e.sstables_in) {
+                auto output = seq->add_map();
+                output->add_item("generation", fmt::to_string(data_value(sstable.generation)));
+                output->add_item("origin", sstable.origin);
+                output->add_item("size", sstable.size);
+            }
+        }
+        {
+            auto seq = output->add_seq("sstables_out");
+            for (const auto& sstable : e.sstables_out) {
+                auto output = seq->add_map();
+                output->add_item("generation", fmt::to_string(data_value(sstable.generation)));
+                output->add_item("origin", sstable.origin);
+                output->add_item("size", sstable.size);
+            }
+        }
+        output->add_item("total_tombstone_purge_attempt", e.total_tombstone_purge_attempt);
+        output->add_item(
+                "total_tombstone_purge_failure_due_to_overlapping_with_memtable",
+                e.total_tombstone_purge_failure_due_to_overlapping_with_memtable);
+        output->add_item(
+                "total_tombstone_purge_failure_due_to_overlapping_with_uncompacting_sstable",
+                e.total_tombstone_purge_failure_due_to_overlapping_with_uncompacting_sstable);
     }
 }
 
@@ -541,66 +732,107 @@ void compactionhistory_operation(scylla_rest_client& client, const bpo::variable
     }
 
     const auto history_json = client.get("/compaction_manager/compaction_history");
-
-    struct history_entry {
-        utils::UUID id;
-        std::string table;
-        std::string keyspace;
-        int64_t compacted_at;
-        int64_t bytes_in;
-        int64_t bytes_out;
-        std::map<int32_t, int64_t> rows_merged;
-    };
     std::vector<history_entry> history;
 
     for (const auto& history_entry_json : history_json.GetArray()) {
         const auto& history_entry_json_object = history_entry_json.GetObject();
 
-        std::map<int32_t, int64_t> rows_merged;
-        for (const auto& rows_merged_json : history_entry_json_object["rows_merged"].GetArray()) {
-            const auto& rows_merged_json_object = rows_merged_json.GetObject();
-            rows_merged.emplace(rows_merged_json_object["key"].GetInt64(), rows_merged_json_object["value"].GetInt64());
+        std::unordered_map<int32_t, int64_t> rows_merged;
+        if (history_entry_json_object.HasMember("rows_merged")) {
+            for (const auto& rows_merged_json : history_entry_json_object["rows_merged"].GetArray()) {
+                const auto& rows_merged_json_object = rows_merged_json.GetObject();
+                rows_merged.emplace(rows_merged_json_object["key"].GetInt(), rows_merged_json_object["value"].GetInt64());
+            }
+        }
+
+        std::vector<sstables::basic_info> sstables_in;
+        if (history_entry_json_object.HasMember("sstables_in")) {
+            sstables_in.reserve(history_entry_json_object["sstables_in"].GetArray().Size());
+            for (const auto& sstables_in_json : history_entry_json_object["sstables_in"].GetArray()) {
+                const auto& sstables_in_json_object = sstables_in_json.GetObject();
+                sstables_in.emplace_back(sstables::generation_type::from_string(std::string(rjson::to_string_view(sstables_in_json_object["generation"]))),
+                        sstring(rjson::to_string_view(sstables_in_json_object["origin"])),  sstables_in_json_object["size"].GetInt64());
+            }
+        }
+
+        std::vector<sstables::basic_info> sstables_out;
+        if (history_entry_json_object.HasMember("sstables_out")) {
+            sstables_out.reserve(history_entry_json_object["sstables_out"].GetArray().Size());
+            for (const auto& sstables_in_json : history_entry_json_object["sstables_out"].GetArray()) {
+                const auto& sstables_in_json_object = sstables_in_json.GetObject();
+                sstables_out.emplace_back(sstables::generation_type::from_string(std::string(rjson::to_string_view(sstables_in_json_object["generation"]))),
+                        sstring(rjson::to_string_view(sstables_in_json_object["origin"])),  sstables_in_json_object["size"].GetInt64());
+            }
         }
 
         history.emplace_back(history_entry{
                 .id = utils::UUID(rjson::to_string_view(history_entry_json_object["id"])),
-                .table = std::string(rjson::to_string_view(history_entry_json_object["cf"])),
-                .keyspace = std::string(rjson::to_string_view(history_entry_json_object["ks"])),
+                .shard_id = history_entry_json_object["shard_id"].GetInt(),
+                .ks = sstring(rjson::to_string_view(history_entry_json_object["ks"])),
+                .cf = sstring(rjson::to_string_view(history_entry_json_object["cf"])),
+                .compaction_type = sstring(rjson::to_string_view(history_entry_json_object["compaction_type"])),
+                .started_at = history_entry_json_object["started_at"].GetInt64(),
                 .compacted_at = history_entry_json_object["compacted_at"].GetInt64(),
                 .bytes_in = history_entry_json_object["bytes_in"].GetInt64(),
                 .bytes_out = history_entry_json_object["bytes_out"].GetInt64(),
-                .rows_merged = std::move(rows_merged)});
+                .rows_merged = std::move(rows_merged),
+                .sstables_in = std::move(sstables_in),
+                .sstables_out = std::move(sstables_out),
+                .total_tombstone_purge_attempt = history_entry_json_object["total_tombstone_purge_attempt"].GetInt64(),
+                .total_tombstone_purge_failure_due_to_overlapping_with_memtable =
+                        history_entry_json_object["total_tombstone_purge_failure_due_to_overlapping_with_memtable"].GetInt64(),
+                .total_tombstone_purge_failure_due_to_overlapping_with_uncompacting_sstable =
+                        history_entry_json_object["total_tombstone_purge_failure_due_to_overlapping_with_uncompacting_sstable"].GetInt64()});
     }
 
     std::ranges::sort(history, [] (const history_entry& a, const history_entry& b) { return a.compacted_at > b.compacted_at; });
 
     if (format == "text") {
-        std::array<std::string, 7> header_row{"id", "keyspace_name", "columnfamily_name", "compacted_at", "bytes_in", "bytes_out", "rows_merged"};
-        std::array<size_t, 7> max_column_length{};
+        static constexpr std::array header_row{"id", "shard_id", "keyspace_name", "columnfamily_name", "compaction_type", "started_at", "compacted_at",
+                        "bytes_in", "bytes_out", "rows_merged", "sstables_in", "sstables_out", "total_tombstone_purge_attempt",
+                        "total_tombstone_purge_failure_due_to_overlapping_with_memtable",
+                        "total_tombstone_purge_failure_due_to_overlapping_with_uncompacting_sstable"};
+        static constexpr size_t column_count = header_row.size();
+
+        std::array<size_t, column_count> max_column_length{};
         for (size_t c = 0; c < header_row.size(); ++c) {
-            max_column_length[c] = header_row[c].size();
+            max_column_length[c] = strlen(header_row[c]);
         }
 
-        std::vector<std::array<std::string, 7>> rows;
+        std::vector<std::array<std::string, column_count>> rows;
         rows.reserve(history.size());
         for (const auto& e : history) {
-            rows.push_back({fmt::to_string(e.id), e.keyspace, e.table, format_compacted_at(e.compacted_at), fmt::to_string(e.bytes_in),
-                    fmt::to_string(e.bytes_out), fmt::to_string(e.rows_merged)});
+            rows.push_back({fmt::to_string(e.id), fmt::to_string(e.shard_id), e.ks, e.cf, e.compaction_type, format_compacted_at(e.started_at),
+                    format_compacted_at(e.compacted_at), fmt::to_string(e.bytes_in), fmt::to_string(e.bytes_out),
+                    fmt::to_string(std::map<int32_t, int64_t>(e.rows_merged.begin(), e.rows_merged.end())), fmt::to_string(e.sstables_in),
+                    fmt::to_string(e.sstables_out), fmt::to_string(e.total_tombstone_purge_attempt),
+                    fmt::to_string(e.total_tombstone_purge_failure_due_to_overlapping_with_memtable),
+                    fmt::to_string(e.total_tombstone_purge_failure_due_to_overlapping_with_uncompacting_sstable)});
             for (size_t c = 0; c < rows.back().size(); ++c) {
                 max_column_length[c] = std::max(max_column_length[c], rows.back()[c].size());
             }
         }
 
-        const auto header_row_format = fmt::format("{{:<{}}} {{:<{}}} {{:<{}}} {{:<{}}} {{:<{}}} {{:<{}}} {{:<{}}}\n", max_column_length[0],
-                max_column_length[1], max_column_length[2], max_column_length[3], max_column_length[4], max_column_length[5], max_column_length[6]);
-        const auto regular_row_format = fmt::format("{{:<{}}} {{:<{}}} {{:<{}}} {{:<{}}} {{:>{}}} {{:>{}}} {{:<{}}}\n", max_column_length[0],
-                max_column_length[1], max_column_length[2], max_column_length[3], max_column_length[4], max_column_length[5], max_column_length[6]);
+        const auto header_row_format =
+                fmt::format("{} \n", fmt::join(max_column_length | std::views::transform([](size_t value) { return fmt::format("{{:<{}}}", value); }), " "));
+
+        static auto regular_row_formatter = [] <typename... Args> (Args&&... args) {
+            return fmt::format("{{:<{}}} {{:>{}}} {{:<{}}} {{:<{}}} {{:<{}}} {{:<{}}} {{:<{}}} {{:>{}}} {{:>{}}} {{:<{}}} {{:<{}}} {{:<{}}} {{:<{}}} {{:<{}}} {{:<{}}} \n",
+                               std::forward<Args>(args)...);
+        };
+        const auto regular_row_format = std::apply(regular_row_formatter, max_column_length);
 
         fmt::print(std::cout, "Compaction History:\n");
-        fmt::print(std::cout, fmt::runtime(header_row_format.c_str()), header_row[0], header_row[1], header_row[2], header_row[3], header_row[4],
-                header_row[5], header_row[6]);
+        auto header_row_printer = [format=header_row_format.c_str()] <typename... Args> (Args&&... args) {
+            fmt::print(std::cout, fmt::runtime(format), std::forward<Args>(args)...);
+        };
+        std::apply(header_row_printer, header_row);
+
+        auto regular_row_printer = [format=regular_row_format.c_str()] <typename... Args> (Args&&... args) {
+            fmt::print(std::cout, fmt::runtime(format), std::forward<Args>(args)...);
+        };
         for (const auto& r : rows) {
-            fmt::print(std::cout, fmt::runtime(regular_row_format.c_str()), r[0], r[1], r[2], r[3], r[4], r[5], r[6]);
+            std::apply(regular_row_printer, r);
         }
     } else if (format == "json") {
         print_compactionhistory<json_writer>(history);
@@ -895,13 +1127,28 @@ void flush_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
 }
 
 void getendpoints_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
-    if (!vm.contains("keyspace") || !vm.contains("table") || !vm.contains("key")) {
+    bool contains_key = vm.contains("key");
+    bool contains_key_components = vm.contains("key-components");
+
+    if (!vm.contains("keyspace") || !vm.contains("table") || !(contains_key || contains_key_components)) {
         throw std::invalid_argument("getendpoint requires keyspace, table and partition key arguments");
     }
-    auto res = client.get(seastar::format("/storage_service/natural_endpoints/{}",
-                                          vm["keyspace"].as<sstring>()),
-                          {{"cf", vm["table"].as<sstring>()},
-                           {"key", vm["key"].as<sstring>()}});
+
+    if (contains_key && contains_key_components) {
+        throw std::invalid_argument("Provide either --key or --key-components, not both");
+    }
+
+    sstring endpoint;
+    http::request::query_parameters_type params = {{"cf", {vm["table"].as<sstring>()}} };
+    if (contains_key) {
+        params["key"] = {vm["key"].as<sstring>()};
+        endpoint = seastar::format("/storage_service/natural_endpoints/{}", vm["keyspace"].as<sstring>());
+    } else {
+        params["key_component"] = vm["key-components"].as<std::vector<sstring>>();
+        endpoint = seastar::format("/storage_service/natural_endpoints/v2/{}", vm["keyspace"].as<sstring>());
+    }
+
+    auto res = client.get(endpoint, params);
     for (auto& inet_address : res.GetArray()) {
         fmt::print("{}\n", rjson::to_string_view(inet_address));
     }
@@ -1383,6 +1630,32 @@ void refresh_operation(scylla_rest_client& client, const bpo::variables_map& vm)
         }
         params["primary_replica_only"] = "true";
     }
+    if (vm.contains("skip-cleanup")) {
+        if (vm.contains("load-and-stream")) {
+            throw std::invalid_argument("--skip-cleanup takes no effect with --load-and-stream|-las");
+        }
+        params["skip_cleanup"] = "true";
+    }
+    if (vm.contains("skip-reshape")) {
+        if (vm.contains("load-and-stream")) {
+            throw std::invalid_argument("--skip-reshape takes no effect with --load-and-stream|-las");
+        }
+        params["skip_reshape"] = "true";
+    }
+    if (vm.contains("scope")) {
+        if (vm.contains("primary-replica-only")) {
+            throw std::invalid_argument("Scoped streaming of primary replica only is not supported yet");
+        }
+        if (!vm.contains("load-and-stream")) {
+            throw std::invalid_argument("--scope takes no effect without --load-and-stream|-las");
+        }
+        std::unordered_set<sstring> allowed_scopes = {"all", "dc", "rack", "node"};
+        if (!allowed_scopes.contains(vm["scope"].as<sstring>())) {
+            throw std::invalid_argument("Invalid scope parameter value");
+        }
+
+        params["scope"] = vm["scope"].as<sstring>();
+    }
     client.post(format("/storage_service/sstables/{}", vm["keyspace"].as<sstring>()), std::move(params));
 }
 
@@ -1414,14 +1687,36 @@ void removenode_operation(scylla_rest_client& client, const bpo::variables_map& 
     }
 }
 
+void excludenode_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    if (!vm.contains("exclude-operation")) {
+        throw std::invalid_argument("Host ID list is required.");
+    }
+
+    const auto hosts = vm["exclude-operation"].as<std::vector<sstring>>();
+    if (hosts.empty()) {
+        throw std::invalid_argument("Host ID list is required.");
+    }
+
+    std::unordered_map<sstring, sstring> params;
+    params["hosts"] = fmt::to_string(fmt::join(hosts, ","));
+    client.post("/storage_service/exclude_node", std::move(params));
+}
+
 void repair_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     std::vector<sstring> keyspaces, tables;
     if (vm.contains("keyspace")) {
         auto res = parse_keyspace_and_tables(client, vm, true);
+        auto uses_tablets = keyspace_uses_tablets(client, res.keyspace);
+        if (uses_tablets) {
+            throw std::invalid_argument("nodetool repair repairs only vnode keyspaces! To repair tablet keyspaces use nodetool cluster repair.");
+        }
         keyspaces.push_back(std::move(res.keyspace));
         tables = std::move(res.tables);
     } else {
-        keyspaces = get_keyspaces(client, "non_local_strategy");
+        keyspaces = get_keyspaces(client, "non_local_strategy", "vnodes");
+        if (!get_keyspaces(client, "non_local_strategy", "tablets").empty()) {
+            fmt::print("WARNING: Do not use nodetool repair for tablet keyspaces! To repair tablet keyspaces use nodetool cluster repair.");
+        }
     }
 
     if (vm.contains("partitioner-range") && (vm.contains("in-dc") || vm.contains("in-hosts"))) {
@@ -1456,9 +1751,8 @@ void repair_operation(scylla_rest_client& client, const bpo::variables_map& vm) 
         repair_params["ignoreUnreplicatedKeyspaces"] = "true";
     }
 
-    if (vm.contains("in-hosts")) {
-        const auto hosts = vm["in-hosts"].as<std::vector<sstring>>();
-        repair_params["hosts"] = fmt::to_string(fmt::join(hosts.begin(), hosts.end(), ","));
+    if (auto hosts = maybe_get_hosts(vm); hosts.has_value()) {
+        repair_params["hosts"] = std::move(hosts.value());
     }
 
     if (vm.contains("sequential")) {
@@ -1467,12 +1761,8 @@ void repair_operation(scylla_rest_client& client, const bpo::variables_map& vm) 
         repair_params["parallelism"] = "dc_parallel";
     }
 
-    if (vm.contains("in-local-dc")) {
-        const auto res = client.get("/snitch/datacenter");
-        repair_params["dataCenters"] = sstring(rjson::to_string_view(res));
-    } else if (vm.contains("in-dc")) {
-        const auto dcs = vm["in-dc"].as<std::vector<sstring>>();
-        repair_params["dataCenters"] = fmt::to_string(fmt::join(dcs.begin(), dcs.end(), ","));
+    if (auto dcs = maybe_get_dcs(client, vm); dcs.has_value()) {
+        repair_params["dataCenters"] = std::move(dcs.value());
     }
 
     if (vm.contains("pull")) {
@@ -1534,22 +1824,40 @@ void restore_operation(scylla_rest_client& client, const bpo::variables_map& vm)
         }
         params[required_param] = vm[required_param].as<sstring>();
     }
-    if (!vm.contains("sstables")) {
-      throw std::invalid_argument("missing required possitional argument: sstables");
+    bool sstables_as_params = vm.contains("sstables");
+    bool sstables_as_file_list = vm.contains("sstables-file-list");
+    if (not sstables_as_params and not sstables_as_file_list) {
+      throw std::invalid_argument("missing both argument: sstables and --sstables-file-list (at least one is required)");
     }
     if (vm.contains("scope")) {
         params["scope"] = vm["scope"].as<sstring>();
     }
-    sstring sstables_body = std::invoke([&vm] {
-        std::stringstream output;
-        rjson::streaming_writer writer(output);
-        writer.StartArray();
-        for (auto& toc_fn : vm["sstables"].as<std::vector<sstring>>()) {
-            writer.String(toc_fn);
+    
+    std::stringstream output;
+    rjson::streaming_writer writer(output);
+    writer.StartArray();
+    
+    // add the list given by the file param
+    if (sstables_as_file_list) {
+        sstring sstables_list_file = vm["sstables-file-list"].as<sstring>();
+        auto file = open_file_dma(sstables_list_file, open_flags::ro).get();
+        auto file_close = seastar::deferred_close(file);
+        auto is = seastar::make_file_input_stream(file);
+        auto is_close = seastar::deferred_close(is);
+        auto sstables_list = seastar::util::read_entire_stream_contiguous(is).get();
+        for (const auto& toc : std::views::split(sstables_list, '\n')) {
+            writer.String(std::string_view(toc));
         }
-        writer.EndArray();
-        return make_sstring(output.view());
-    });
+    }
+    // add the list provided by the command line
+    if (sstables_as_params) {
+        for (auto& toc : vm["sstables"].as<std::vector<sstring>>()) {
+            writer.String(toc);
+        }
+    }
+    writer.EndArray();
+    sstring sstables_body = make_sstring(output.view());
+    
     const auto restore_res = client.post("/storage_service/restore", std::move(params),
                                          request_body{"application/json", std::move(sstables_body)});
     const auto task_id = rjson::to_string_view(restore_res);
@@ -1802,15 +2110,6 @@ static std::map<sstring, float> get_effective_ownership(scylla_rest_client& clie
     return rjson_to_map<float>(client.get(request_str, params));
 }
 
-static bool keyspace_uses_tablets(scylla_rest_client& client, const sstring& keyspace) {
-    const std::unordered_map<sstring, sstring> params = {{"replication", "tablets"}};
-    const auto res = client.get("/storage_service/keyspaces", params);
-
-    const auto& ks_array = res.GetArray();
-    const auto is_same_ks = [&] (const auto& json_ks) { return rjson::to_string_view(json_ks) == keyspace; };
-    return std::find_if(ks_array.begin(), ks_array.end(), is_same_ks) != ks_array.end();
-}
-
 void ring_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     const bool resolve_ip = vm.contains("resolve-ip");
 
@@ -1874,8 +2173,19 @@ void scrub_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     } else {
         keyspaces.push_back(std::move(keyspace));
     }
-    if (vm.contains("skip-corrupted") && vm.contains("mode")) {
+
+    const bool has_skip_corrupted = vm.contains("skip-corrupted");
+    const bool has_mode = vm.contains("mode");
+    const bool has_drop_unfixable = vm.contains("drop-unfixable-sstables");
+
+    const sstring mode = has_mode ? vm["mode"].as<sstring>() : "";
+
+    if (has_skip_corrupted && has_mode) {
         throw std::invalid_argument("cannot use --skip-corrupted when --mode is used");
+    }
+
+    if (has_drop_unfixable && (!has_mode || mode != "SEGREGATE")) {
+        throw std::invalid_argument("--drop-unfixable-sstables is only valid with --mode=SEGREGATE");
     }
 
     std::unordered_map<sstring, sstring> params;
@@ -1884,9 +2194,9 @@ void scrub_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
         params["cf"] = fmt::to_string(fmt::join(tables.begin(), tables.end(), ","));
     }
 
-    if (vm.contains("mode")) {
-        params["scrub_mode"] = vm["mode"].as<sstring>();
-    } else if (vm.contains("skip-corrupted")) {
+    if (has_mode) {
+        params["scrub_mode"] = mode;
+    } else if (has_skip_corrupted) {
         params["scrub_mode"] = "SKIP";
     }
 
@@ -1896,6 +2206,10 @@ void scrub_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
 
     if (vm.contains("no-snapshot")) {
         params["disable_snapshot"] = "true";
+    }
+
+    if (has_drop_unfixable) {
+        params["drop_unfixable_sstables"] = "true";
     }
 
     std::vector<api::scrub_status> statuses;
@@ -2098,7 +2412,8 @@ void status_operation(scylla_rest_client& client, const bpo::variables_map& vm) 
     const auto joining = get_nodes_of_state(client, "joining");
     const auto leaving = get_nodes_of_state(client, "leaving");
     const auto moving = get_nodes_of_state(client, "moving");
-    const auto endpoint_load = rjson_to_map<size_t>(client.get("/storage_service/load_map"));
+    const auto excluded = get_nodes_of_state(client, "excluded");
+    const auto endpoint_load = rjson_to_map<ssize_t>(client.get("/storage_service/load_map"));
 
     const auto tablets_keyspace = keyspace && keyspace_uses_tablets(client, *keyspace);
 
@@ -2142,7 +2457,7 @@ void status_operation(scylla_rest_client& client, const bpo::variables_map& vm) 
         const auto dc_header = fmt::format("Datacenter: {}", dc);
         fmt::print("{}\n", dc_header);
         fmt::print("{}\n", std::string(dc_header.size(), '='));
-        fmt::print("Status=Up/Down\n");
+        fmt::print("Status=Up/Down/eXcluded\n");
         fmt::print("|/ State=Normal/Leaving/Joining/Moving\n");
         Tabulate table;
         if (keyspace) {
@@ -2151,13 +2466,19 @@ void status_operation(scylla_rest_client& client, const bpo::variables_map& vm) 
             table.add("--", "Address", "Load", "Tokens", "Owns", "Host ID", "Rack");
         }
         for (const auto& ep : endpoints) {
-            char status, state;
-            if (live.contains(ep)) {
-                status = 'U';
+            char state;
+            sstring status;
+            if (endpoint_host_id.contains(ep) && excluded.contains(endpoint_host_id.at(ep))) {
+                status = "X";
+                if (live.contains(ep)) {
+                    status = "XU"; // Should not happen, but when it does, we better know.
+                }
+            } else if (live.contains(ep)) {
+                status = "U";
             } else if (down.contains(ep)) {
-                status = 'D';
+                status = "D";
             } else {
-                status = '?';
+                status = "?";
             }
             if (joining.contains(ep)) {
                 state = 'J';
@@ -3311,6 +3632,20 @@ void setstreamthroughput_operation(scylla_rest_client& client, const bpo::variab
     client.post("/storage_service/stream_throughput", std::move(params));
 }
 
+void dropquarantinedsstables_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    std::unordered_map<sstring, sstring> params;
+
+    if (vm.contains("keyspace")) {
+        const auto [keyspace, tables] = parse_keyspace_and_tables(client, vm);
+        params["keyspace"] = keyspace;
+        if (!tables.empty()) {
+            params["tables"] = fmt::to_string(fmt::join(tables.begin(), tables.end(), ","));
+        }
+    }
+
+    client.post("/storage_service/drop_quarantined_sstables", std::move(params));
+}
+
 const std::vector<operation_option> global_options{
     typed_option<sstring>("host,h", "localhost", "the hostname or ip address of the ScyllaDB node"),
     typed_option<uint16_t>("port,p", 10000, "the port of the REST API of the ScyllaDB node"),
@@ -3361,7 +3696,7 @@ const std::map<operation, operation_action>& get_operations_with_func() {
                 "backup",
                 "copy SSTables from a specified keyspace's snapshot to a designated bucket in object storage",
 fmt::format(R"(
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/backup.html")),
                 {
                     typed_option<sstring>("keyspace", "Name of a keyspace to copy SSTables from"),
@@ -3370,6 +3705,7 @@ For more information, see: {}"
                     typed_option<sstring>("endpoint", "ID of the configured object storage endpoint to copy SSTables to"),
                     typed_option<sstring>("bucket", "Name of the bucket to backup SSTables to"),
                     typed_option<sstring>("prefix", "The prefix to backup SSTables under"),
+                    typed_option<>("move-files", "Move the SSTable files instead of copying them"),
                     typed_option<>("nowait", "Don't wait on the backup process"),
                 },
             },
@@ -3433,6 +3769,53 @@ For more information, see: {}
             },
             {
                 clearsnapshot_operation
+            }
+        },
+        {
+            {
+                "cluster",
+                "Runs operations that affect the entire cluster",
+                "",
+                { },
+                {
+                    typed_option<sstring>("command", "The name of the subcommand", 1),
+                },
+                {
+                    {
+                        "repair",
+                        "Synchronize data between nodes in the background",
+fmt::format(R"(
+When running nodetool cluster repair on a single node, all tablets of
+the specified keyspace(s) are repaired, even if they have no replica on
+this node.
+
+To repair all of the data in the cluster, it is enough to run
+nodetool cluster repair on one node only.
+
+Note that nodetool cluster repair repairs only tablet keyspaces.
+To repair vnode keyspaces use nodetool repair.
+
+For more information, see: {}
+)", doc_link("operating-scylla/nodetool-commands/cluster/repair.html")),
+                        {
+                            typed_option<std::vector<sstring>>("in-dc", "Constrain repair to specific datacenter(s)"),
+                            typed_option<std::vector<sstring>>("in-hosts", "Constrain repair to the specific host(s)"),
+                            typed_option<std::vector<sstring>>("tablet-tokens", "Tokens owned by the tablets to repair."),
+                            typed_option<sstring>("incremental-mode", "Specify the incremental repair mode: disabled, incremental, full"),
+                        },
+                        {
+                            typed_option<sstring>("keyspace", "The keyspace to repair, if missing all keyspaces are repaired", 1),
+                            typed_option<std::vector<sstring>>("table", "The table(s) to repair, if missing all tables are repaired", -1),
+                        },
+                    },
+                }
+            },
+            {
+                {
+                    {
+                        "repair", { cluster_repair_operation }
+                    },
+                }
             }
         },
         {
@@ -3576,7 +3959,7 @@ For more information, see: {}
                 "disablebinary",
                 "Disable the CQL native protocol",
 fmt::format(R"(
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/disablebinary.html")),
             },
             {
@@ -3588,7 +3971,7 @@ For more information, see: {}"
                 "disablegossip",
                 "Disable the gossip protocol",
 fmt::format(R"(
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/disablegossip.html")),
             },
             {
@@ -3607,7 +3990,7 @@ before upgrading a node to a new version or before any maintenance action is
 performed. When you want to simply flush memtables to disk, use the nodetool
 flush command.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/drain.html")),
             },
             {
@@ -3619,7 +4002,7 @@ For more information, see: {}"
                 "enableautocompaction",
                 "Enables automatic compaction for the given keyspace and table(s)",
 fmt::format(R"(
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/enableautocompaction.html")),
                 { },
                 {
@@ -3636,7 +4019,7 @@ For more information, see: {}"
                 "enablebackup",
                 "Enables incremental backup",
 fmt::format(R"(
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/enablebackup.html")),
             },
             {
@@ -3650,7 +4033,7 @@ For more information, see: {}"
 fmt::format(R"(
 The native protocol is enabled by default.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/enablebinary.html")),
             },
             {
@@ -3664,7 +4047,7 @@ For more information, see: {}"
 fmt::format(R"(
 The gossip protocol is enabled by default.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/enablegossip.html")),
             },
             {
@@ -3680,7 +4063,7 @@ Flush memtables to on-disk SSTables in the specified keyspace and table(s).
 If no keyspace is specified, all keyspaces are flushed.
 If no table(s) are specified, all tables in the specified keyspace are flushed.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/flush.html")),
                 { },
                 {
@@ -3697,13 +4080,14 @@ For more information, see: {}"
                 "getendpoints",
                 "Print the end points that owns the key",
 fmt::format(R"(
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/getendpoints.html")),
                 { },
                 {
                     typed_option<sstring>("keyspace", "The keyspace to query", 1),
                     typed_option<sstring>("table", "The table to query", 1),
                     typed_option<sstring>("key", "The partition key for which we need to find the endpoint", 1),
+                    typed_option<std::vector<sstring>>("key-components", "List of components of the key for which we need to find the endpoint", -1),
                 },
             },
             {
@@ -3727,7 +4111,7 @@ Prints a table with the name and current logging level for each logger in Scylla
                 "getsstables",
                 "Get the sstables that contain the given key",
 fmt::format(R"(
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/getsstables.html")),
                 {
                     typed_option<>("hex-format", "The key is given in hex dump format"),
@@ -3749,7 +4133,7 @@ For more information, see: {}"
 fmt::format(R"(
 This value is the probability for tracing a request. To change this value see settraceprobability.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/gettraceprobability.html")),
             },
             {
@@ -3761,7 +4145,7 @@ For more information, see: {}"
                 "gossipinfo",
                 "Shows the gossip information for the cluster",
 fmt::format(R"(
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/gossipinfo.html")),
             },
             {
@@ -3787,7 +4171,7 @@ For more information, see: {}"
                 "info",
                 "Print node information (uptime, load, ...)",
 fmt::format(R"(
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/info.html")),
                 {
                     typed_option<>("tokens,T", "Display all tokens"),
@@ -3804,7 +4188,7 @@ For more information, see: {}"
 fmt::format(R"(
 Dropped tables (column family) will not be part of the listsnapshots.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/listsnapshots.html")),
                 { },
                 { },
@@ -3834,7 +4218,7 @@ This operation is not supported.
                 "netstats",
                 "Print network information on provided host (connecting node by default)",
 fmt::format(R"(
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/netstats.html")),
                 {
                     typed_option<>("human-readable,H", "Display bytes in human readable form, i.e. KiB, MiB, GiB, TiB"),
@@ -3853,7 +4237,7 @@ fmt::format(R"(
 Provide the latency request that is recorded by the coordinator.
 This command is helpful if you encounter slow node operations.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/proxyhistograms.html")),
                 { },
                 {
@@ -3875,7 +4259,7 @@ Scylla first figures out which ranges the local node (the one we want to rebuild
 is responsible for. Then which node in the cluster contains the same ranges.
 Finally, Scylla streams the data to the local node.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/rebuild.html")),
                 {
                     typed_option<>("force", "Enforce the source_dc option, even if it unsafe to use for rebuild"),
@@ -3899,11 +4283,14 @@ Materialized Views (MV) and Secondary Indexes (SI) of the upload table, and if
 they exist, they are automatically updated. Uploading MV or SI SSTables is not
 required and will fail.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/refresh.html")),
                 {
                     typed_option<>("load-and-stream", "Allows loading sstables that do not belong to this node, in which case they are automatically streamed to the owning nodes"),
                     typed_option<>("primary-replica-only", "Load the sstables and stream to primary replica node that owns the data. Repair is needed after the load and stream process"),
+                    typed_option<>("skip-cleanup", "Do not perform keys cleanup when loading sstables."),
+                    typed_option<>("skip-reshape", "Do not perform sstable reshape when loading sstables."),
+                    typed_option<sstring>("scope", "Load-and-stream scope (node, rack or dc)"),
                 },
                 {
                     typed_option<sstring>("keyspace", "The keyspace to load sstable(s) into", 1),
@@ -3924,7 +4311,7 @@ Provide the Host ID of the node to specify which node you want to remove.
 Important: use this command *only* on nodes that are not reachable by other nodes
 by any means!
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/removenode.html")),
                 {
                     typed_option<sstring>("ignore-dead-nodes", "Comma-separated list of dead node host IDs to ignore during removenode"),
@@ -3936,6 +4323,37 @@ For more information, see: {}"
             {
                 removenode_operation
             }
+        },
+        {
+                {
+                    "excludenode",
+                    "Mark nodes as permanently down (excluded).",
+    fmt::format(R"(
+The cluster will no longer attempt to contact excluded nodes.
+This can be used to unblock topology operations, tablet load balancing, replication changes, etc.
+
+Data ownership is not changed, and the nodes are still cluster members,
+so should be eventually removed or replaced.
+
+After nodes are excluded, there is no need to pass them in the list of ignored
+nodes to removnenode, replace, or repair.
+
+Important: use this command *only* on nodes that are not reachable by other nodes
+by any means, and they are not going to become reachable again.
+
+Excluded nodes will be banned from connecting to any of the nodes in the cluster,
+not only to current members but also to any node added later.
+
+For more information, see: {}
+)", doc_link("operating-scylla/nodetool-commands/excludenode.html")),
+                    {},
+                    {
+                        typed_option<std::vector<sstring>>("exclude-operation", "List of host IDs to exclude", -1),
+                    },
+                },
+                {
+                    excludenode_operation
+                }
         },
         {
             {
@@ -3951,7 +4369,10 @@ replicas until the master data subset is in-sync.
 To repair all of the data in the cluster, you need to run a repair on
 all of the nodes in the cluster, or let ScyllaDB Manager do it for you.
 
-For more information, see: {}"
+Note that nodetool repair repairs only vnode keyspaces. To repair tablet
+keyspaces use nodetool cluster repair.
+
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/repair.html")),
                 {
                     typed_option<>("dc-parallel", "Repair datacenters in parallel"),
@@ -3996,7 +4417,7 @@ For more information, see: https://opensource.docs.scylladb.com/stable/operating
                 "restore",
                 "Copy SSTables from a designated bucket in object store to a specified keyspace or table",
 fmt::format(R"(
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/restore.html")),
                 {
                     typed_option<sstring>("endpoint", "ID of the configured object storage endpoint to copy SSTables from"),
@@ -4006,6 +4427,7 @@ For more information, see: {}"
                     typed_option<sstring>("table", "Name of a table to copy SSTables to"),
                     typed_option<>("nowait", "Don't wait on the restore process"),
                     typed_option<sstring>("scope", "Load-and-stream scope (node, rack or dc)"),
+                    typed_option<sstring>("sstables-file-list", "A file containing the list of sstables to restore (optional)"),
                 },
                 {
                     typed_option<std::vector<sstring>>("sstables", "The object keys of the TOC component of the SSTables to be restored", -1),
@@ -4018,7 +4440,7 @@ For more information, see: {}"
                 "ring",
                 "Print information about the token ring",
 fmt::format(R"(
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/ring.html")),
                 {
                     typed_option<>("resolve-ip,r", "Show node domain names instead of IPs")
@@ -4037,7 +4459,7 @@ For more information, see: {}"
                 "scrub",
                 "Scrub the SSTable files in the specified keyspace or table(s)",
 fmt::format(R"(
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/scrub.html")),
                 {
                     typed_option<>("no-snapshot", "Do not take a snapshot of scrubbed tables before starting scrub (default false)"),
@@ -4047,6 +4469,7 @@ For more information, see: {}"
                     typed_option<>("no-validate,n", "Do not validate columns using column validator (unused)"),
                     typed_option<>("reinsert-overflowed-ttl,r", "Rewrites rows with overflowed expiration date (unused)"),
                     typed_option<int64_t>("jobs,j", "The number of sstables to be scrubbed concurrently (unused)"),
+                    typed_option<>("drop-unfixable-sstables", "Drop unfixed sstables instead of aborting the entire scrub (only with --mode=SEGREGATE)"),
                 },
                 {
                     typed_option<sstring>("keyspace", "The keyspace to scrub", 1),
@@ -4064,7 +4487,7 @@ For more information, see: {}"
 fmt::format(R"(
 Resetting the log level of one or all loggers is not supported yet.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/setlogginglevel.html")),
                 { },
                 {
@@ -4085,7 +4508,7 @@ Value is trace probability between 0 and 1. 0 the trace will never happen and 1
 the trace will always happen. Anything in between is a percentage of the time,
 converted into a decimal. For example, 60% would be 0.6.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/settraceprobability.html")),
                 { },
                 {
@@ -4101,7 +4524,7 @@ For more information, see: {}"
                 "snapshot",
                 "Take a snapshot of specified keyspaces or a snapshot of the specified table",
 fmt::format(R"(
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/snapshot.html")),
                 {
                     typed_option<sstring>("table", "The table(s) to snapshot, multiple ones can be joined with ','"),
@@ -4122,7 +4545,7 @@ For more information, see: {}"
                 "sstableinfo",
                 "Information about sstables per keyspace/table",
 fmt::format(R"(
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/sstableinfo.html")),
                 { },
                 {
@@ -4139,7 +4562,7 @@ For more information, see: {}"
                 "status",
                 "Displays cluster information for a table in a keyspace, a single keyspace or all keyspaces",
 fmt::format(R"(
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/status.html")),
                 {
                     typed_option<>("resolve-ip,r", "Show node domain names instead of IPs"),
@@ -4162,7 +4585,7 @@ Results can be one of the following: `running` or `not running`.
 
 By default, the incremental backup status is `not running`.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/statusbackup.html")),
             },
             {
@@ -4181,7 +4604,7 @@ Results can be one of the following: `running` or `not running`.
 
 By default, the native transport is `running`.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/statusbinary.html")),
             },
             {
@@ -4198,7 +4621,7 @@ Results can be one of the following: `running` or `not running`.
 
 By default, the gossip protocol is `running`.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/statusgossip.html")),
             },
             {
@@ -4212,7 +4635,7 @@ For more information, see: {}"
 fmt::format(R"(
 This command is usually used to stop compaction that has a negative impact on the performance of a node.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/stop.html")),
                 {
                     typed_option<int>("id", "The id of the compaction operation to stop (not implemented)"),
@@ -4237,7 +4660,7 @@ since the last time you ran the nodetool cfhistograms command.
 
 Also invokable as "cfhistograms".
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/cfhistograms.html")),
                 { },
                 {
@@ -4254,7 +4677,7 @@ For more information, see: {}"
                 {"cfstats"},
                 "Print statistics on tables",
 fmt::format(R"(
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/tablestats.html")),
                 {
                     typed_option<bool>("ignore,i", false, "Ignore the list of tables and display the remaining tables"),
@@ -4286,7 +4709,7 @@ fmt::format(R"(
 Aborts a task with given id. If the task is not abortable, appropriate message
 will be printed, depending on why the abort failed.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/tasks/abort.html")),
                             { },
                             {
@@ -4300,7 +4723,7 @@ fmt::format(R"(
 Unregisters all finished local tasks from the specified module. If a module is not specified,
 all modules are drained.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/tasks/drain.html")),
                             {
                                 typed_option<sstring>("module", "The module name; if specified, only the tasks from this module are unregistered"),
@@ -4314,7 +4737,7 @@ fmt::format(R"(
 Gets or sets the time in seconds for which tasks started by user will be kept in task manager after
 they are finished.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/tasks/user-ttl.html")),
                             {
                                 typed_option<uint32_t>("set", "New user_task_ttl value", -1),
@@ -4330,7 +4753,7 @@ keyspace, table, entity, shard, start_time, and end_time) of tasks in a specifie
 
 Allows to monitor tasks for extended time.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/tasks/list.html")),
                             {
                                 typed_option<>("internal", "Show internal tasks"),
@@ -4347,7 +4770,7 @@ For more information, see: {}"
                             "modules",
                             "Gets a list of modules supported by task manager",
 fmt::format(R"(
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/tasks/modules.html")),
                             { },
                             { },
@@ -4356,7 +4779,7 @@ For more information, see: {}"
                             "status",
                             "Gets a status of the task",
 fmt::format(R"(
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/tasks/status.html")),
                             { },
                             {
@@ -4370,7 +4793,7 @@ fmt::format(R"(
 Lists statuses of a specified task and all its descendants in BFS order.
 If id param isn't specified, trees of all non-internal tasks are listed.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/tasks/tree.html")),
                             { },
                             {
@@ -4384,7 +4807,7 @@ fmt::format(R"(
 Gets or sets the time in seconds for which tasks will be kept in task manager after
 they are finished.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/tasks/ttl.html")),
                             {
                                 typed_option<uint32_t>("set", "New task_ttl value", -1),
@@ -4404,7 +4827,7 @@ If quiet flag is set, nothing is printed. Instead the right exit code is returne
 - 124, if the operation timed out;
 - 125, if there was an error.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/tasks/wait.html")),
                             {
                                 typed_option<>("quiet,q", "If set, status isn't printed"),
@@ -4453,7 +4876,7 @@ For more information, see: {}"
                 "toppartitions",
                 "Sample and print the most active partitions for a given column family",
 fmt::format(R"(
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/toppartitions.html")),
                 {
                     typed_option<int>("duration,d", 5000, "Duration in milliseconds"),
@@ -4484,7 +4907,7 @@ Can also be used to upgrade all sstables to the latest sstable version.
 Note that this command is not needed for changes described above to take effect. They take effect gradually as new sstables are written and old ones are compacted.
 This command should be used when it is desired that such changes take effect right away.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/upgradesstables.html")),
                 {
                     typed_option<>("include-all-sstables,a", "Include all sstables, even those already on the current version"),
@@ -4504,7 +4927,7 @@ For more information, see: {}"
                 "viewbuildstatus",
                 "Show progress of a materialized view build",
 fmt::format(R"(
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/viewbuildstatus.html")),
                 {},
                 {
@@ -4524,7 +4947,7 @@ Displays the Apache Cassandra version which your version of Scylla is most
 compatible with, not your current Scylla version. To display the Scylla version,
 run `scylla --version`.
 
-For more information, see: {}"
+For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/version.html")),
             },
             {
@@ -4591,6 +5014,24 @@ Set the MiB/s throughput for streaming, or 0 to disable throttling
                 setstreamthroughput_operation
             }
         },
+        {
+            {
+                "dropquarantinedsstables",
+            "Drop quarantined SSTables",
+R"(
+Drop quarantined SSTables from the specified keyspace and table(s), or from all
+keyspaces if no keyspace is specified.
+)",
+            {},
+            {
+                typed_option<sstring>("keyspace", "The keyspace to drop quarantined SSTables from, if missing, all keyspaces will be affected", 1),
+                typed_option<std::vector<sstring>>("table", "The table(s) to drop quarantined SSTables from, if missing, all tables will be affected", -1),
+            }
+            },
+            {
+                dropquarantinedsstables_operation
+            }
+        }
     };
 
     return operations_with_func;
@@ -4693,6 +5134,20 @@ with a logger called {}.
 
 Supported Nodetool operations:
 {}
+
+The tool can exit with a few different exit codes:
+* 0 - operation completed successfully;
+* 1 - failed to parse command-line arguments -- the arguments, their
+      values or the specific combination is invalid;
+* 2 - unspecified error which doesn't fall into any of the other
+      categories;
+* 3 - operation failed or was aborted in the ScyllaDB node/cluster;
+* 4 - a REST API request sent to ScyllaDB failed, most common cause is a
+      problem with the request path/parameters or some generic internal
+      error;
+
+Some operations have specific exit codes of their own, consult the help
+of individual operations to find out more about it.
 
 For more information, see: {})";
 

@@ -20,7 +20,7 @@ from test.pylib.util import wait_for_cql_and_get_hosts, wait_for
 from test.cluster.util import reconnect_driver
 
 logger = logging.getLogger(__name__)
-pytestmark = pytest.mark.prepare_3_nodes_cluster
+pytestmark = pytest.mark.prepare_3_racks_cluster
 
 
 
@@ -117,6 +117,9 @@ async def test_change_two(manager, random_tables, build_mode):
         # IP-s before they are send back to servers[1] and servers[2],
         # and the mentioned above code is not exercised by this test.
         await manager.api.enable_injection(servers[0].ip_addr, 'ip-change-raft-sync-delay', one_shot=False)
+        # sleep_before_start_gossiping injections are needed to reproduce #22777
+        await manager.server_update_config(servers[1].server_id, "error_injections_at_startup", ['sleep_before_start_gossiping'])
+        await manager.server_update_config(servers[2].server_id, "error_injections_at_startup", ['sleep_before_start_gossiping'])
     await manager.server_start(servers[1].server_id)
     servers[1] = ServerInfo(servers[1].server_id, s1_new_ip, s1_new_ip, servers[1].datacenter, servers[1].rack)
     if build_mode != 'release':

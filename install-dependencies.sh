@@ -39,6 +39,10 @@ debian_base_packages=(
     python3-pyparsing
     python3-colorama
     python3-tabulate
+    python3-pytest
+    python3-pytest-asyncio
+    python3-pytest-timeout
+    python3-pytest-sugar
     libsnappy-dev
     libjsoncpp-dev
     rapidjson-dev
@@ -54,6 +58,12 @@ debian_base_packages=(
     slapd
     ldap-utils
     libcpp-jwt-dev
+    elfutils
+    curl
+    jq
+    git-lfs
+    e2fsprogs
+    fuse3
 )
 
 fedora_packages=(
@@ -86,7 +96,8 @@ fedora_packages=(
     python3-boto3
     python3-pytest
     python3-pytest-asyncio
-    python3-redis
+    python3-pytest-timeout
+    python3-pytest-sugar
     python3-unidiff
     python3-humanfriendly
     python3-jinja2
@@ -120,8 +131,10 @@ fedora_packages=(
     wabt
     binaryen
     lcov
-    java-11-openjdk-devel # for tools/java
+    e2fsprogs
+    fuse3
 
+    lld
     llvm-bolt
     moreutils
     iproute
@@ -132,13 +145,14 @@ fedora_packages=(
     cyrus-sasl
     fipscheck
     cpp-jwt-devel
-)
 
-# lld is not available on s390x, see
-# https://src.fedoraproject.org/rpms/lld/c/aa6e69df60747496f8f22121ae8cc605c9d3498a?branch=rawhide
-if [ "$(uname -m)" != "s390x" ]; then
-    fedora_packages+=(lld)
-fi
+    podman
+    buildah
+
+    https://github.com/scylladb/cassandra-stress/releases/download/v3.18.1/cassandra-stress-java21-3.18.1-1.noarch.rpm
+    elfutils
+    jq
+)
 
 fedora_python3_packages=(
     python3-pyyaml
@@ -155,8 +169,8 @@ fedora_python3_packages=(
 
 # an associative array from packages to constrains
 declare -A pip_packages=(
-    [scylla-driver]="==3.28.2"  # lock-step with tools/cqlsh
-    [geomet]="<0.3,>=0.1"
+    [scylla-driver]="==$(cat tools/cqlsh/requirements.txt | grep scylla-driver | cut -d= -f3)"
+    [geomet]=""
     [traceback-with-variables]=""
     [scylla-api-client]=""
     [treelib]=""
@@ -165,6 +179,7 @@ declare -A pip_packages=(
     [pykmip]=""
     [universalasync]=""
     [boto3-stubs[dynamodb]]=""
+    [setuptools_scm]=""
 )
 
 pip_symlinks=(
@@ -214,7 +229,6 @@ go_arch() {
     local -A GO_ARCH=(
         ["x86_64"]=amd64
         ["aarch64"]=arm64
-        ["s390x"]=s390x
     )
     echo ${GO_ARCH["$(arch)"]}
 }
@@ -223,7 +237,6 @@ NODE_EXPORTER_VERSION=1.9.0
 declare -A NODE_EXPORTER_CHECKSUM=(
     ["x86_64"]=e7b65ea30eec77180487d518081d3dcb121b975f6d95f1866dfb9156c5b24075
     ["aarch64"]=5314fae1efff19abf807cfc8bd7dadbd47a35565c1043c236ffb0689dc15ef4f
-    ["s390x"]=089d2c2f87b4d716dd5ff006b89ab4424e7917f67830a8dd580d528f1d99ca58
 )
 NODE_EXPORTER_DIR=/opt/scylladb/dependencies
 
@@ -329,7 +342,6 @@ fi
 umask 0022
 
 ./seastar/install-dependencies.sh
-./tools/java/install-dependencies.sh
 
 if [ "$ID" = "ubuntu" ] || [ "$ID" = "debian" ]; then
     apt-get -y install "${debian_base_packages[@]}"
@@ -360,7 +372,7 @@ elif [ "$ID" = "fedora" ]; then
     do
         pip_constrained_packages="${pip_constrained_packages} ${package}${pip_packages[$package]}"
     done
-    pip3 install --upgrade "$PIP_DEFAULT_ARGS" $pip_constrained_packages
+    pip3 install --upgrade --no-cache-dir "$PIP_DEFAULT_ARGS" $pip_constrained_packages
 
     if [ -f "$(node_exporter_fullpath)" ] && node_exporter_checksum; then
         echo "$(node_exporter_filename) already exists, skipping download"

@@ -8,16 +8,18 @@
 
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/coroutine/switch_to.hh>
+#include <unordered_map>
 #include "utils/log.hh"
 #include "sstables/sstables_manager.hh"
 #include "sstables/sstables_registry.hh"
 #include "sstables/partition_index_cache.hh"
 #include "sstables/sstables.hh"
+#include "object_storage_client.hh"
 #include "db/config.hh"
+#include "db/object_storage_endpoint_param.hh"
 #include "gms/feature.hh"
 #include "gms/feature_service.hh"
 #include "utils/assert.hh"
-#include "utils/s3/client.hh"
 #include "exceptions/exceptions.hh"
 
 namespace sstables {
@@ -25,11 +27,13 @@ namespace sstables {
 logging::logger smlogger("sstables_manager");
 
 sstables_manager::sstables_manager(
-    sstring name, db::large_data_handler& large_data_handler, const db::config& dbcfg, gms::feature_service& feat, cache_tracker& ct, size_t available_memory, directory_semaphore& dir_sem,
-    noncopyable_function<locator::host_id()>&& resolve_host_id, const abort_source& abort, scheduling_group maintenance_sg, storage_manager* shared)
+    sstring name, db::large_data_handler& large_data_handler, db::corrupt_data_handler& corrupt_data_handler, const db::config& dbcfg, gms::feature_service& feat, cache_tracker& ct, size_t available_memory, directory_semaphore& dir_sem,
+    noncopyable_function<locator::host_id()>&& resolve_host_id, sstable_compressor_factory& compressor_factory, const abort_source& abort, scheduling_group maintenance_sg, storage_manager* shared)
     : _storage(shared)
     , _available_memory(available_memory)
-    , _large_data_handler(large_data_handler), _db_config(dbcfg), _features(feat), _cache_tracker(ct)
+    , _large_data_handler(large_data_handler)
+    , _corrupt_data_handler(corrupt_data_handler)
+    , _db_config(dbcfg), _features(feat), _cache_tracker(ct)
     , _sstable_metadata_concurrency_sem(
         max_count_sstable_metadata_concurrent_reads,
         max_memory_sstable_metadata_concurrent_reads(available_memory),
@@ -41,7 +45,9 @@ sstables_manager::sstables_manager(
     , _dir_semaphore(dir_sem)
     , _resolve_host_id(std::move(resolve_host_id))
     , _maintenance_sg(std::move(maintenance_sg))
+    , _compressor_factory(compressor_factory)
     , _abort(abort)
+    , _signal_gate("sstables_manager::signal")
 {
     _components_reloader_status = components_reclaim_reload_fiber();
 }
@@ -52,12 +58,37 @@ sstables_manager::~sstables_manager() {
     SCYLLA_ASSERT(_undergoing_close.empty());
 }
 
+void sstables_manager::subscribe(sstables_manager_event_handler& handler) {
+    handler.subscribe(_signal_source.connect([this, &handler] (sstables::generation_type gen, notification_event_type event) mutable -> future<> {
+        if (auto gh = _signal_gate.try_hold()) {
+            switch (event) {
+            case notification_event_type::deleted:
+                co_await handler.deleted_sstable(gen);
+            }
+        }
+    }));
+}
+
+using osp = db::object_storage_endpoint_param;
+
+storage_manager::object_storage_endpoint::object_storage_endpoint(db::object_storage_endpoint_param ep)
+    : cfg(ep)
+{}
+
 storage_manager::storage_manager(const db::config& cfg, config stm_cfg)
-    : _s3_clients_memory(stm_cfg.s3_clients_memory)
+    : _object_storage_clients_memory(stm_cfg.object_storage_clients_memory)
     , _config_updater(this_shard_id() == 0 ? std::make_unique<config_updater>(cfg, *this) : nullptr)
 {
-    for (auto [ep, ecfg] : cfg.object_storage_config()) {
-        _s3_endpoints.emplace(std::make_pair(std::move(ep), make_lw_shared<s3::endpoint_config>(std::move(ecfg))));
+    for (auto& e : cfg.object_storage_endpoints()) {
+        _object_storage_endpoints.emplace(std::make_pair(e.key(), e));
+    }
+
+    if (!stm_cfg.skip_metrics_registration) {
+        namespace sm = seastar::metrics;
+        metrics.add_group("object_storage", {
+            sm::make_gauge("memory_usage", [this, limit = stm_cfg.object_storage_clients_memory] { return limit - _object_storage_clients_memory.available_units(); },
+                    sm::description("Total number of bytes consumed by object storage client"), {}),
+        });
     }
 }
 
@@ -66,7 +97,7 @@ future<> storage_manager::stop() {
         co_await _config_updater->action.join();
     }
 
-    for (auto ep : _s3_endpoints) {
+    for (auto ep : _object_storage_endpoints) {
         if (ep.second.client != nullptr) {
             co_await ep.second.client->close();
         }
@@ -74,27 +105,43 @@ future<> storage_manager::stop() {
 }
 
 future<> storage_manager::update_config(const db::config& cfg) {
-    for (auto [ep, ecfg] : cfg.object_storage_config()) {
-        auto s3_cfg = make_lw_shared<s3::endpoint_config>(std::move(ecfg));
-        auto [it, added] = _s3_endpoints.try_emplace(ep, std::move(s3_cfg));
+    // Updates S3 client configurations if the endpoint is already known and
+    // removes the entries that are not present in the new configuration.
+    // Even though we remove obsolete S3 clients from this map, each IO
+    // holds a shared_ptr to the client, so the clients will be kept alive for
+    // as long as needed. 
+    // This was split in two loops to guarantee the code is exception safe with
+    // regards to _s3_endpoints content.
+    std::unordered_set<sstring> updates;
+    for (auto& e : cfg.object_storage_endpoints()) {
+        auto endpoint = e.key();
+        updates.insert(endpoint);
+
+        auto [it, added] = _object_storage_endpoints.try_emplace(endpoint, e);
         if (!added) {
             if (it->second.client != nullptr) {
-                co_await it->second.client->update_config(s3_cfg);
+                co_await it->second.client->update_config(e);
             }
-            it->second.cfg = std::move(s3_cfg);
+            it->second.cfg = e;
         }
     }
+
+    std::erase_if(_object_storage_endpoints, [&updates](const auto& e) {
+        return !updates.contains(e.first);
+    });
+
+    co_return;
 }
 
-shared_ptr<s3::client> storage_manager::get_endpoint_client(sstring endpoint) {
-    auto found = _s3_endpoints.find(endpoint);
-    if (found == _s3_endpoints.end()) {
+shared_ptr<sstables::object_storage_client> storage_manager::get_endpoint_client(sstring endpoint) {
+    auto found = _object_storage_endpoints.find(endpoint);
+    if (found == _object_storage_endpoints.end()) {
         smlogger.error("unable to find {} in configured object-storage endpoints", endpoint);
         throw std::invalid_argument(format("endpoint {} not found", endpoint));
     }
     auto& ep = found->second;
     if (ep.client == nullptr) {
-        ep.client = s3::client::make(endpoint, ep.cfg, _s3_clients_memory, [ &ct = container() ] (std::string ep) {
+        ep.client = make_object_storage_client(ep.cfg, _object_storage_clients_memory, [&ct = container()] (std::string ep) {
             return ct.local().get_endpoint_client(ep);
         });
     }
@@ -102,7 +149,7 @@ shared_ptr<s3::client> storage_manager::get_endpoint_client(sstring endpoint) {
 }
 
 bool storage_manager::is_known_endpoint(sstring endpoint) const {
-    return _s3_endpoints.contains(endpoint);
+    return _object_storage_endpoints.contains(endpoint);
 }
 
 storage_manager::config_updater::config_updater(const db::config& cfg, storage_manager& sstm)
@@ -111,15 +158,46 @@ storage_manager::config_updater::config_updater(const db::config& cfg, storage_m
             co_await sstm.update_config(cfg);
         });
     })
-    , observer(cfg.object_storage_config.observe(action.make_observer()))
+    , observer(cfg.object_storage_endpoints.observe(action.make_observer()))
 {}
+
+sstables::sstable::version_types sstables_manager::get_highest_supported_format() const noexcept {
+    // FIXME: start announcing `ms` here after it becomes the default.
+    // (There are several tests which expect that new sstables are written with
+    // the format reported by this API).
+    //
+    // After `ms` becomes the default, this function look like this:
+    //
+    // if (_features.ms_sstable) {
+    //     return sstable_version_types::ms;
+    // } else {
+    //     return sstable_version_types::me;
+    // }
+    return sstable_version_types::me;
+}
+
+sstables::sstable::version_types sstables_manager::get_preferred_sstable_version() const {
+    auto preferred_format = sstables::version_from_string(config().sstable_format());
+    auto ms_supported = bool(_features.ms_sstable);
+    if (ms_supported && preferred_format == sstable_version_types::ms) {
+        return sstable_version_types::ms;
+    } else {
+        return sstable_version_types::me;
+    }
+}
+
+sstables::sstable::version_types sstables_manager::get_safe_sstable_version_for_rewrites(sstable_version_types existing_version) const {
+    auto preferred_format = sstables::version_from_string(config().sstable_format());
+    auto ms_supported = bool(_features.ms_sstable) || existing_version >= sstable_version_types::ms;
+    if (ms_supported && preferred_format == sstable_version_types::ms) {
+        return sstable_version_types::ms;
+    } else {
+        return sstable_version_types::me;
+    }
+}
 
 locator::host_id sstables_manager::get_local_host_id() const {
     return _resolve_host_id();
-}
-
-bool sstables_manager::uuid_sstable_identifiers() const {
-    return _features.uuid_sstable_identifiers;
 }
 
 shared_sstable sstables_manager::make_sstable(schema_ptr schema,
@@ -128,10 +206,10 @@ shared_sstable sstables_manager::make_sstable(schema_ptr schema,
         sstable_state state,
         sstable_version_types v,
         sstable_format_types f,
-        gc_clock::time_point now,
+        db_clock::time_point now,
         io_error_handler_gen error_handler_gen,
         size_t buffer_size) {
-    return make_lw_shared<sstable>(std::move(schema), storage, generation, state, v, f, get_large_data_handler(), *this, now, std::move(error_handler_gen), buffer_size);
+    return make_lw_shared<sstable>(std::move(schema), storage, generation, state, v, f, get_large_data_handler(), get_corrupt_data_handler(), *this, now, std::move(error_handler_gen), buffer_size);
 }
 
 sstable_writer_config sstables_manager::configure_writer(sstring origin) const {
@@ -298,7 +376,7 @@ future<> sstables_manager::delete_atomically(std::vector<shared_sstable> ssts) {
     }
 
     // All sstables here belong to the same table, thus they do live
-    // in the same storage so it's OK to get the deleter from the
+    // in the same storage so it's OK to get the deleter from _signal_mana
     // front element. The deleter implementation is welcome to check
     // that sstables from the vector really live in it.
     auto& storage = ssts.front()->get_storage();
@@ -319,6 +397,7 @@ future<> sstables_manager::close() {
     // stop the components reload fiber
     _components_memory_change_event.signal();
     co_await std::move(_components_reloader_status);
+    co_await _signal_gate.close();
 }
 
 void sstables_manager::plug_sstables_registry(std::unique_ptr<sstables::sstables_registry> sr) noexcept {
@@ -345,7 +424,7 @@ void sstables_manager::validate_new_keyspace_storage_options(const data_dictiona
     std::visit(overloaded_functor {
         [] (const data_dictionary::storage_options::local&) {
         },
-        [this] (const data_dictionary::storage_options::s3& so) {
+        [this] (const data_dictionary::storage_options::object_storage& so) {
             if (!_features.keyspace_storage_options) {
                 throw exceptions::invalid_request_exception("Keyspace storage options not supported in the cluster");
             }
@@ -363,6 +442,7 @@ std::vector<std::filesystem::path> sstables_manager::get_local_directories(const
 
 void sstables_manager::on_unlink(sstable* sst) {
     reclaim_memory_and_stop_tracking_sstable(sst);
+    _signal_source(sst->generation(), notification_event_type::deleted);
 }
 
 sstables_registry::~sstables_registry() = default;

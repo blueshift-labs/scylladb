@@ -11,6 +11,7 @@
 #include "sstables/sstable_set.hh"
 #include "streaming/stream_reason.hh"
 #include "service/topology_guard.hh"
+#include <optional>
 
 namespace replica {
 class database;
@@ -19,17 +20,21 @@ class database;
 namespace db {
 namespace view {
 class view_builder;
+class view_building_worker;
 }
 }
 
 namespace streaming {
 
-reader_consumer_v2 make_streaming_consumer(sstring origin,
+mutation_reader_consumer make_streaming_consumer(sstring origin,
     sharded<replica::database>& db,
     db::view::view_builder& vb,
+    sharded<db::view::view_building_worker>& vbw,
     uint64_t estimated_partitions,
     stream_reason reason,
     sstables::offstrategy offstrategy,
-    service::frozen_topology_guard);
+    service::frozen_topology_guard,
+    std::optional<int64_t> repaired_at = std::nullopt,
+    lw_shared_ptr<sstables::sstable_list> sstable_list_to_mark_as_repaired = {});
 
 }

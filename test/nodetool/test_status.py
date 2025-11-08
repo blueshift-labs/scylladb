@@ -16,6 +16,7 @@ import pytest
 class NodeStatus(Enum):
     Up = 'U'
     Down = 'D'
+    Excluded = 'X'
     Unknown = '?'
 
 
@@ -64,7 +65,7 @@ def validate_status_output(res, keyspace, nodes, ownership, resolve, effective_o
         assert lines[i] == "=" * dc_line_len
 
         i += 1
-        assert lines[i] == "Status=Up/Down"
+        lines[i].startswith("Status=Up/Down")
 
         i += 1
         assert lines[i] == "|/ State=Normal/Leaving/Joining/Moving"
@@ -200,6 +201,7 @@ def _do_test_status(request, nodetool, status_query_target, node_list, resolve=N
     moving = [n.endpoint for n in node_list if n.state == NodeState.Moving]
     live = [n.endpoint for n in node_list if n.status == NodeStatus.Up]
     down = [n.endpoint for n in node_list if n.status == NodeStatus.Down]
+    excluded = [n.host_id for n in node_list if n.status == NodeStatus.Excluded]
 
     load_map = [{"key": ep, "value": node.load} for ep, node in nodes.items() if node.load is not None]
 
@@ -223,6 +225,7 @@ def _do_test_status(request, nodetool, status_query_target, node_list, resolve=N
         expected_request("GET", "/storage_service/nodes/joining", response=joining),
         expected_request("GET", "/storage_service/nodes/leaving", response=leaving),
         expected_request("GET", "/storage_service/nodes/moving", response=moving),
+        expected_request("GET", "/storage_service/nodes/excluded", response=excluded),
         expected_request("GET", "/storage_service/load_map", response=load_map),
         expected_request("GET", "/storage_service/tokens_endpoint", params=tokens_endpoint_params,
                          response=tokens_endpoint),
@@ -515,3 +518,41 @@ def test_status_with_zero_token_nodes(request, nodetool):
     ]
 
     _do_test_status(request, nodetool, None, nodes)
+
+
+def test_status_negative_load(request, nodetool):
+    nodes = [
+        Node(
+            endpoint="127.0.0.1",
+            host_id="78a9c1d0-b341-467e-a076-9eff4cf7ffc6",
+            load=-206015,
+            tokens=["-9175818098208185248", "-3983536194780899528"],
+            datacenter="datacenter1",
+            rack="rack1",
+            status=NodeStatus.Unknown,
+            state=NodeState.Joining,
+        ),
+        Node(
+            endpoint="127.0.0.2",
+            host_id="ed341f60-b12a-4fd4-9917-e80977ded0f9",
+            load=277624,
+            tokens=["-1810801828328238220", "2983536194780899528"],
+            datacenter="datacenter1",
+            rack="rack2",
+            status=NodeStatus.Down,
+            state=NodeState.Normal,
+        ),
+        Node(
+            endpoint="127.0.0.3",
+            host_id="1e77eb26-a372-4eb4-aeaa-72f224cf6b4c",
+            load=353236,
+            tokens=["3810801828328238220", "6810801828328238220"],
+            datacenter="datacenter1",
+            rack="rack3",
+            status=NodeStatus.Up,
+            state=NodeState.Normal,
+        ),
+    ]
+
+    status_target = StatusQueryTarget(keyspace="ks", table=None, uses_tablets=False)
+    _do_test_status(request, nodetool, status_target, nodes)

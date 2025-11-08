@@ -225,7 +225,7 @@ public:
      * Resolves with timed_out_error when timeout is reached.
      * @param entry_writers a vector of writers responsible for writing respective entry
      */
-    future<std::vector<rp_handle>> add_entries(std::vector<commitlog_entry_writer> entry_writers, db::timeout_clock::time_point timeout);
+    future<utils::chunked_vector<rp_handle>> add_entries(utils::chunked_vector<commitlog_entry_writer> entry_writers, db::timeout_clock::time_point timeout);
 
     /**
      * Modifies the per-CF dirty cursors of any commit log segments for the column family according to the position
@@ -392,9 +392,7 @@ public:
     class segment_data_corruption_error: public segment_error {
         std::string _msg;
     public:
-        segment_data_corruption_error(std::string msg, uint64_t s)
-                : _msg(std::move(msg)), _bytes(s) {
-        }
+        segment_data_corruption_error(std::string_view msg, uint64_t s);
         uint64_t bytes() const {
             return _bytes;
         }
@@ -425,7 +423,7 @@ public:
         std::string _msg;
         uint64_t _pos;
     public:
-        segment_truncation(uint64_t);
+        segment_truncation(std::string_view reason, uint64_t position);
 
         uint64_t position() const;
         const char* what() const noexcept override;

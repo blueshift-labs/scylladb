@@ -34,7 +34,6 @@
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/coroutine/as_future.hh>
 
-#include "utils/assert.hh"
 #include "utils/error_injection.hh"
 #include "utils/to_string.hh"
 #include "data_dictionary/storage_options.hh"
@@ -77,8 +76,10 @@
 #include "tombstone_gc.hh"
 #include "reader_concurrency_semaphore.hh"
 #include "readers/mutation_source.hh"
-#include "readers/reversing_v2.hh"
-#include "readers/forwardable_v2.hh"
+#include "readers/reversing.hh"
+#include "readers/forwardable.hh"
+#include "sstables/trie/bti_index.hh"
+#include "partition_slice_builder.hh"
 
 #include "release.hh"
 #include "utils/build_id.hh"
@@ -105,6 +106,24 @@ namespace sstables {
 thread_local utils::updateable_value<bool> global_cache_index_pages(true);
 
 logging::logger sstlog("sstable");
+
+[[noreturn]] void on_parse_error(sstring message, std::optional<component_name> filename) {
+    auto make_exception = [&] {
+        if (message.empty()) {
+            message = "parse_assert() failed";
+        }
+        if (filename) {
+            return malformed_sstable_exception(message, *filename);
+        }
+        return malformed_sstable_exception(message);
+    };
+    auto ex = std::make_exception_ptr(make_exception());
+    on_internal_error(sstlog, std::move(ex));
+}
+
+[[noreturn, gnu::noinline]] void on_bti_parse_error(uint64_t pos) {
+    on_internal_error(sstlog, fmt::format("BTI parse error for node at pos {}", pos));
+}
 
 template <typename T>
 const char* nullsafe_typename(T* x) noexcept {
@@ -168,12 +187,17 @@ future<file> sstable::new_sstable_component_file(const io_error_handler& error_h
   }
 }
 
+future<> sstable::unlink_component(component_type type) noexcept {
+    return _storage->unlink_component(*this, type);
+}
+
 const std::unordered_map<sstable_version_types, sstring, enum_hash<sstable_version_types>> version_string = {
     { sstable_version_types::ka , "ka" },
     { sstable_version_types::la , "la" },
     { sstable_version_types::mc , "mc" },
     { sstable_version_types::md , "md" },
     { sstable_version_types::me , "me" },
+    { sstable_version_types::ms , "ms" },
 };
 
 const std::unordered_map<sstable_format_types, sstring, enum_hash<sstable_format_types>> format_string = {
@@ -251,9 +275,11 @@ future<> parse(const schema&, sstable_version_types, random_access_reader& in, T
 // All composite parsers must come after this
 template<typename First, typename... Rest>
 future<> parse(const schema& s, sstable_version_types v, random_access_reader& in, First& first, Rest&&... rest) {
-    return parse(s, v, in, first).then([v, &s, &in, &rest...] {
-        return parse(s, v, in, std::forward<Rest>(rest)...);
-    });
+    auto fut = parse(s, v, in, first);
+    (..., (void)(fut = fut.then([&s, v, &in, &rest] () mutable {
+        return parse(s, v, in, std::forward<Rest>(rest));
+    })));
+    return fut;
 }
 
 // Intended to be used for a type that describes itself through describe_type().
@@ -849,13 +875,18 @@ void sstable::generate_toc() {
     _recognized_components.insert(component_type::TOC);
     _recognized_components.insert(component_type::Statistics);
     _recognized_components.insert(component_type::Digest);
-    _recognized_components.insert(component_type::Index);
-    _recognized_components.insert(component_type::Summary);
+    if (has_summary_and_index(_version)) {
+        _recognized_components.insert(component_type::Index);
+        _recognized_components.insert(component_type::Summary);
+    } else {
+        _recognized_components.insert(component_type::Partitions);
+        _recognized_components.insert(component_type::Rows);
+    }
     _recognized_components.insert(component_type::Data);
     if (_schema->bloom_filter_fp_chance() != 1.0) {
         _recognized_components.insert(component_type::Filter);
     }
-    if (_schema->get_compressor_params().get_compressor() == nullptr) {
+    if (!_schema->get_compressor_params().compression_enabled()) {
         _recognized_components.insert(component_type::CRC);
     } else {
         _recognized_components.insert(component_type::CompressionInfo);
@@ -897,7 +928,7 @@ void file_writer::close() {
     // to work, because file stream would step on unaligned IO and S3 upload
     // stream would send completion message to the server and would lose any
     // subsequent write.
-    SCYLLA_ASSERT(!_closed && "file_writer already closed");
+    parse_assert(!_closed, _component, "file_writer already closed");
     std::exception_ptr ex;
     try {
         _out.flush().get();
@@ -1049,10 +1080,13 @@ template void sstable::write_simple<component_type::Summary>(const sstables::sum
 future<> sstable::read_compression() {
      // FIXME: If there is no compression, we should expect a CRC file to be present.
     if (!has_component(component_type::CompressionInfo)) {
-        return make_ready_future<>();
+        co_return;
     }
 
-    return read_simple<component_type::CompressionInfo>(_components->compression);
+    co_await read_simple<component_type::CompressionInfo>(_components->compression);
+    auto compressor = co_await manager().get_compressor_factory().make_compressor_for_reading(_components->compression);
+    _components->compression.set_compressor(std::move(compressor));
+    _components->compression.discard_hidden_options();
 }
 
 void sstable::write_compression() {
@@ -1274,8 +1308,35 @@ future<> sstable::read_statistics() {
     return read_simple<component_type::Statistics>(_components->statistics);
 }
 
+future<> sstable::read_partitions_db_footer() {
+    if (has_component(component_type::Partitions) && !_partitions_db_footer) {
+        if (!_partitions_file) {
+            _partitions_file = co_await open_file(component_type::Partitions, open_flags::ro);
+            _partitions_file_size = co_await _partitions_file.size();
+        }
+        _partitions_db_footer = co_await trie::read_bti_partitions_db_footer(*_schema, _version, _partitions_file, _partitions_file_size);
+    }
+}
+
 void sstable::write_statistics() {
     write_simple<component_type::Statistics>(_components->statistics);
+}
+
+void sstable::mark_as_being_repaired(const service::session_id& id) {
+    being_repaired = id;
+}
+
+int64_t sstable::update_repaired_at(int64_t repaired_at) {
+    const stats_metadata& old_stats = get_stats_metadata();
+    auto old_repaired_at = old_stats.repaired_at;
+    if (old_repaired_at == repaired_at) {
+        return old_repaired_at;
+    }
+    auto stats = std::make_unique<stats_metadata>(old_stats);
+    stats->repaired_at = repaired_at;
+     _components->statistics.contents[metadata_type::Stats] = std::move(stats);
+    rewrite_statistics();
+    return old_repaired_at;
 }
 
 void sstable::rewrite_statistics() {
@@ -1305,8 +1366,12 @@ future<> sstable::read_summary() noexcept {
             co_return co_await read_simple<component_type::Summary>(_components->summary);
         } catch (...) {
             auto ep = std::current_exception();
-            sstlog.warn("Couldn't read summary file {}: {}. Recreating it.", this->filename(component_type::Summary), ep);
+            sstlog.warn("Couldn't read summary file {}: {}.", this->filename(component_type::Summary), ep);
         }
+    }
+
+    if (!has_component(component_type::Index)) {
+        co_return;
     }
 
     co_await generate_summary();
@@ -1317,16 +1382,27 @@ future<file> sstable::open_file(component_type type, open_flags flags, file_open
 }
 
 future<> sstable::open_or_create_data(open_flags oflags, file_open_options options) noexcept {
-    return when_all_succeed(
-        open_file(component_type::Index, oflags, options).then([this] (file f) { _index_file = std::move(f); }),
-        open_file(component_type::Data, oflags, options).then([this] (file f) { _data_file = std::move(f); })
-    ).discard_result();
+    utils::small_vector<future<>, 4> futures;
+  if (has_component(component_type::Index)) {
+    futures.push_back(open_file(component_type::Index, oflags, options).then([this] (file f) { _index_file = std::move(f); }));
+  }
+    futures.push_back(open_file(component_type::Data, oflags, options).then([this] (file f) { _data_file = std::move(f); }));
+    if (has_component(component_type::Partitions) && !_partitions_file) {
+        // FIXME: if _partitions_file is already opened, we are ignoring options and flags.
+        // (Although in practice the options are always default and flags are always `ro`).
+        // If we care about that, we should close _partition_file and reopen it here.
+        futures.push_back(open_file(component_type::Partitions, oflags, options).then([this] (file f) { _partitions_file = std::move(f); }));
+    }
+    if (has_component(component_type::Rows)) {
+        futures.push_back(open_file(component_type::Rows, oflags, options).then([this] (file f) { _rows_file = std::move(f); }));
+    }
+    return when_all_succeed(futures.begin(), futures.end()).discard_result();
 }
 
 future<> sstable::open_data(sstable_open_config cfg) noexcept {
     co_await open_or_create_data(open_flags::ro);
     co_await update_info_for_opened_data(cfg);
-    SCYLLA_ASSERT(!_shards.empty());
+    parse_assert(!_shards.empty(), get_filename());
     auto* sm = _components->scylla_metadata->data.get<scylla_metadata_type::Sharding, sharding_metadata>();
     if (sm) {
         // Sharding information uses a lot of memory and once we're doing with this computation we will no longer use it.
@@ -1361,15 +1437,44 @@ future<> sstable::update_info_for_opened_data(sstable_open_config cfg) {
     _data_file_size = st.st_size;
     _data_file_write_time = db_clock::from_time_t(st.st_mtime);
 
+  if (_index_file) {
     auto size = co_await _index_file.size();
     _index_file_size = size;
-    SCYLLA_ASSERT(!_cached_index_file);
+    parse_assert(!_cached_index_file, get_filename());
     _cached_index_file = seastar::make_shared<cached_file>(_index_file,
                                                             _manager.get_cache_tracker().get_index_cached_file_stats(),
                                                             _manager.get_cache_tracker().get_lru(),
                                                             _manager.get_cache_tracker().region(),
                                                             _index_file_size);
     _index_file = make_cached_seastar_file(*_cached_index_file);
+  }
+    if (_partitions_file) {
+        auto size = co_await _partitions_file.size();
+        _partitions_file_size = size;
+        _cached_partitions_file = seastar::make_shared<cached_file>(
+            _partitions_file,
+            _manager.get_cache_tracker().get_index_cached_file_stats(),
+            _manager.get_cache_tracker().get_lru(),
+            _manager.get_cache_tracker().region(),
+            size,
+            component_name(*this, component_type::Partitions).format()
+        );
+        _partitions_file = make_cached_seastar_file(*_cached_partitions_file);
+        co_await read_partitions_db_footer();
+    }
+    if (_rows_file) {
+        auto size = co_await _rows_file.size();
+        _rows_file_size = size;
+        _cached_rows_file = seastar::make_shared<cached_file>(
+            _rows_file,
+            _manager.get_cache_tracker().get_index_cached_file_stats(),
+            _manager.get_cache_tracker().get_lru(),
+            _manager.get_cache_tracker().region(),
+            size,
+            component_name(*this, component_type::Rows).format()
+        );
+        _rows_file = make_cached_seastar_file(*_cached_rows_file);
+    }
 
     this->set_min_max_position_range();
     this->set_first_and_last_keys();
@@ -1393,7 +1498,15 @@ future<> sstable::create_data() noexcept {
 }
 
 future<> sstable::drop_caches() {
-    co_await _cached_index_file->evict_gently();
+    if (_cached_index_file) {
+        co_await _cached_index_file->evict_gently();
+    }
+    if (_cached_partitions_file) {
+        co_await _cached_partitions_file->evict_gently();
+    }
+    if (_cached_rows_file) {
+        co_await _cached_rows_file->evict_gently();
+    }
     co_await _index_cache->evict_gently();
 }
 
@@ -1435,6 +1548,9 @@ void sstable::maybe_rebuild_filter_from_index(uint64_t num_partitions) {
     if (!has_component(component_type::Filter)) {
         return;
     }
+    if (!has_component(component_type::Index)) {
+        return;
+    }
 
     // Skip rebuilding the bloom filter if the false positive rate based
     // on the current bitset size is within 75% to 125% of the configured
@@ -1445,6 +1561,21 @@ void sstable::maybe_rebuild_filter_from_index(uint64_t num_partitions) {
     auto bitset_size_upper_bound = utils::i_filter::get_filter_size(num_partitions,
                                                                     _schema->bloom_filter_fp_chance() * 0.75);
     if (bitset_size_lower_bound <= curr_bitset_size && curr_bitset_size <= bitset_size_upper_bound) {
+        return;
+    }
+
+    // The initial partition estimate was inaccurate but perform resize only if it is worth doing, based on the following criteria.
+    // 1. Do not resize if the size difference is less than 10% of the current size, or less than 1K.
+    //    - to prevent resizing for small sstables where the savings are minimal.
+    // 2. Do not resize if the current filter is larger than the optimal one but still under 16K.
+    //    - to avoid downsizing when the savings are minimal.
+    //    - the fp rate is also already at least at the configured value, so no gain there.
+    // 3. Do not resize filters of garbage_collected sstables.
+    const auto optimal_filter_size = utils::i_filter::get_filter_size(num_partitions, _schema->bloom_filter_fp_chance());
+    const auto filter_size_diff = std::abs<int64_t>(optimal_filter_size - curr_bitset_size);
+    if (filter_size_diff < 1024 || filter_size_diff < 0.1 * curr_bitset_size || // [1]
+            (curr_bitset_size > optimal_filter_size && curr_bitset_size < 16384) || // [2]
+            _origin == "garbage_collection") { // [3]
         return;
     }
 
@@ -1494,6 +1625,51 @@ void sstable::maybe_rebuild_filter_from_index(uint64_t num_partitions) {
 
     // Replace the existing filter with the new optimal filter.
     _components->filter.swap(optimal_filter);
+}
+
+void sstable::build_delayed_filter(uint64_t num_partitions) {
+    auto optimal_filter = utils::i_filter::get_filter(num_partitions, _schema->bloom_filter_fp_chance(), get_filter_format(_version));
+    sstlog.debug("Building delayed bloom filter {}: {} filter bytes. sstable origin: {}", filename(component_type::Filter),
+        downcast_ptr<utils::filter::bloom_filter>(optimal_filter.get())->bits().memory_size(), _origin);
+
+    auto hashes_file = open_file(component_type::TemporaryHashes, open_flags::ro).get();
+    auto hashes_file_closer = deferred_close(hashes_file);
+    constexpr uint64_t murmur_hash_size_bytes = 16;
+
+    file_input_stream_options options = {
+        .buffer_size = sstable_buffer_size,
+        .read_ahead = 1,
+    };
+    auto in = make_file_input_stream(hashes_file, 0, num_partitions * murmur_hash_size_bytes, options);
+    auto in_closer = deferred_close(in);
+
+    constexpr uint64_t batch_size_bytes = 4096;
+    static_assert(batch_size_bytes % murmur_hash_size_bytes == 0, "Batch size must be a multiple of hash size");
+
+    size_t processed_hashes = 0;
+    while (processed_hashes < num_partitions) {
+        auto buf = in.read_exactly(batch_size_bytes).get();
+        auto p = buf.get();
+        for (uint64_t offset = 0; offset + murmur_hash_size_bytes <= buf.size(); offset += murmur_hash_size_bytes) {
+            std::array<uint64_t, 2> hash;
+            std::memcpy(hash.data(), p + offset, sizeof(hash));
+            hash[0] = seastar::le_to_cpu(hash[0]);
+            hash[1] = seastar::le_to_cpu(hash[1]);
+            auto hashed_key = utils::hashed_key(hash);
+            optimal_filter->add(hashed_key);
+            processed_hashes++;
+        }
+        if (buf.size() < batch_size_bytes) {
+            break;
+        }
+    }
+    if (processed_hashes != num_partitions) {
+        throw malformed_sstable_exception(fmt::format("Temporary hashes file {} was supposed to contain {} hashes, but it contains only {} hashes",
+            filename(component_type::TemporaryHashes), num_partitions, processed_hashes));
+    }
+
+    _components->filter.swap(optimal_filter);
+    unlink_component(component_type::TemporaryHashes).get();
 }
 
 size_t sstable::total_reclaimable_memory_size() const {
@@ -1549,7 +1725,7 @@ void sstable::disable_component_memory_reload() {
     _total_memory_reclaimed = 0;
 }
 
-future<> sstable::load_metadata(sstable_open_config cfg, bool validate) noexcept {
+future<> sstable::load_metadata(sstable_open_config cfg) noexcept {
     co_await read_toc();
     // read scylla-meta after toc. Might need it to parse
     // rest (hint extensions)
@@ -1561,18 +1737,17 @@ future<> sstable::load_metadata(sstable_open_config cfg, bool validate) noexcept
             [&] { return read_compression(); },
             [&] { return read_filter(cfg); },
             [&] { return read_summary(); });
-    if (validate) {
-        validate_min_max_metadata();
-        validate_max_local_deletion_time();
-        validate_partitioner();
-    }
 }
 
 // This interface is only used during tests, snapshot loading and early initialization.
 // No need to set tunable priorities for it.
 future<> sstable::load(const dht::sharder& sharder, sstable_open_config cfg) noexcept {
-    co_await load_metadata(cfg, true);
+    co_await load_metadata(cfg);
+    validate_min_max_metadata();
+    validate_max_local_deletion_time();
+    validate_partitioner();
     if (_shards.empty()) {
+        co_await read_partitions_db_footer();
         set_first_and_last_keys();
         _shards = cfg.current_shard_as_sstable_owner ?
                 std::vector<unsigned>{this_shard_id()} : compute_shards_for_this_sstable(sharder);
@@ -1585,7 +1760,15 @@ future<> sstable::load(sstables::foreign_sstable_open_info info) noexcept {
     co_await read_toc();
     _components = std::move(info.components);
     _data_file = make_checked_file(_read_error_handler, info.data.to_file());
-    _index_file = make_checked_file(_read_error_handler, info.index.to_file());
+  if (info.index) {
+    _index_file = make_checked_file(_read_error_handler, info.index->to_file());
+  }
+    if (info.partitions) {
+        _partitions_file = make_checked_file(_read_error_handler, info.partitions->to_file());
+    }
+    if (info.rows) {
+        _rows_file = make_checked_file(_read_error_handler, info.rows->to_file());
+    }
     _shards = std::move(info.owners);
     _metadata_size_on_disk = info.metadata_size_on_disk;
     validate_min_max_metadata();
@@ -1598,8 +1781,19 @@ future<> sstable::load(sstables::foreign_sstable_open_info info) noexcept {
 
 future<foreign_sstable_open_info> sstable::get_open_info() & {
     return _components.copy().then([this] (auto c) mutable {
-        return foreign_sstable_open_info{std::move(c), this->get_shards_for_this_sstable(), _data_file.dup(), _index_file.dup(),
-            _generation, _version, _format, data_size(), _metadata_size_on_disk};
+        return foreign_sstable_open_info{
+            .components = std::move(c),
+            .owners = this->get_shards_for_this_sstable(),
+            .data = _data_file.dup(),
+            .index = _index_file ? std::optional<seastar::file_handle>(_index_file.dup()) : std::nullopt,
+            .partitions = _partitions_file ? std::optional<seastar::file_handle>(_partitions_file.dup()) : std::nullopt,
+            .rows = _rows_file ? std::optional<seastar::file_handle>(_rows_file.dup()) : std::nullopt,
+            .generation = _generation,
+            .version = _version,
+            .format = _format,
+            .uncompressed_data_size = data_size(),
+            .metadata_size_on_disk = _metadata_size_on_disk
+        };
     });
 }
 
@@ -1634,6 +1828,7 @@ sstable::load_owner_shards(const dht::sharder& sharder) {
     if (!has_valid_sharding_metadata) {
         sstlog.warn("Sharding metadata not available for {}, so Summary will be read to allow Scylla to compute shards owning the SSTable.", get_filename());
         co_await read_summary();
+        co_await read_partitions_db_footer();
         set_first_and_last_keys();
     }
 
@@ -1642,7 +1837,7 @@ sstable::load_owner_shards(const dht::sharder& sharder) {
 }
 
 void prepare_summary(summary& s, uint64_t expected_partition_count, uint32_t min_index_interval) {
-    SCYLLA_ASSERT(expected_partition_count >= 1);
+    parse_assert(expected_partition_count >= 1);
 
     s.header.min_index_interval = min_index_interval;
     s.header.sampling_level = downsampling::BASE_SAMPLING_LEVEL;
@@ -1664,7 +1859,7 @@ future<> seal_summary(summary& s,
     s.header.size = s.entries.size();
     s.header.size_at_full_sampling = sstable::get_size_at_full_sampling(state.partition_count, s.header.min_index_interval);
 
-    SCYLLA_ASSERT(first_key); // assume non-empty sstable
+    parse_assert(bool(first_key), {}, "attempted to seal summary of empty sstable");
     s.first_key.value = first_key->get_bytes();
 
     if (last_key) {
@@ -1803,12 +1998,24 @@ sstable::read_scylla_metadata() noexcept {
         if (!has_component(component_type::Scylla)) {
             return make_ready_future<>();
         }
-        return read_simple<component_type::Scylla>(*_components->scylla_metadata);
+        return read_simple<component_type::Scylla>(*_components->scylla_metadata).then([this] {
+            _features = _components->scylla_metadata->get_features();
+        });
     });
 }
 
+static sstable_column_kind to_sstable_column_kind(column_kind k) {
+    switch (k) {
+        case column_kind::partition_key: return sstable_column_kind::partition_key;
+        case column_kind::clustering_key: return sstable_column_kind::clustering_key;
+        case column_kind::static_column: return sstable_column_kind::static_column;
+        case column_kind::regular_column: return sstable_column_kind::regular_column;
+    }
+    on_internal_error(sstlog, format("to_sstable_column_kind(): unknown column kind {}", static_cast<std::underlying_type_t<column_kind>>(k)));
+}
+
 void
-sstable::write_scylla_metadata(shard_id shard, sstable_enabled_features features, struct run_identifier identifier,
+sstable::write_scylla_metadata(shard_id shard, struct run_identifier identifier,
         std::optional<scylla_metadata::large_data_stats> ld_stats, std::optional<scylla_metadata::ext_timestamp_stats> ts_stats) {
     auto&& first_key = get_first_decorated_key();
     auto&& last_key = get_last_decorated_key();
@@ -1826,7 +2033,8 @@ sstable::write_scylla_metadata(shard_id shard, sstable_enabled_features features
     }
 
     _components->scylla_metadata->data.set<scylla_metadata_type::Sharding>(std::move(sm));
-    _components->scylla_metadata->data.set<scylla_metadata_type::Features>(std::move(features));
+    // Note: data.set() wants an rvalue, so we have to make a copy. It's a uint64 anyway.
+    _components->scylla_metadata->data.set<scylla_metadata_type::Features>(sstable_enabled_features(_features));
     _components->scylla_metadata->data.set<scylla_metadata_type::RunIdentifier>(std::move(identifier));
     if (ld_stats) {
         _components->scylla_metadata->data.set<scylla_metadata_type::LargeDataStats>(std::move(*ld_stats));
@@ -1871,6 +2079,16 @@ sstable::write_scylla_metadata(shard_id shard, sstable_enabled_features features
         sstlog.info("SSTable {} has numerical generation. SSTable identifier in scylla_metadata set to {}", get_filename(), sid);
     }
     _components->scylla_metadata->data.set<scylla_metadata_type::SSTableIdentifier>(scylla_metadata::sstable_identifier{sid});
+
+    sstable_schema_type sstable_schema;
+    sstable_schema.id = _schema->id();
+    sstable_schema.version = _schema->version();
+    sstable_schema.keyspace_name.value = to_bytes(_schema->ks_name());
+    sstable_schema.table_name.value = to_bytes(_schema->cf_name());
+    for (const auto& col : _schema->all_columns()) {
+        sstable_schema.columns.elements.push_back(sstable_column_description{to_sstable_column_kind(col.kind), {col.name()}, {to_bytes(col.type->name())}});
+    }
+    _components->scylla_metadata->data.set<scylla_metadata_type::Schema>(std::move(sstable_schema));
 
     write_simple<component_type::Scylla>(*_components->scylla_metadata);
 }
@@ -2144,10 +2362,10 @@ uint64_t sstable::bytes_on_disk() const {
     if (!_data_file_size) {
         on_internal_error(sstlog, "On-disk size of sstable data was not set");
     }
-    if (!_index_file_size) {
+    if (!_index_file_size && !_partitions_file_size) {
         on_internal_error(sstlog, "On-disk size of sstable index was not set");
     }
-    return _metadata_size_on_disk + _data_file_size + _index_file_size;
+    return _metadata_size_on_disk + _data_file_size + _index_file_size + _partitions_file_size + _rows_file_size;
 }
 
 uint64_t sstable::filter_size() const {
@@ -2232,9 +2450,11 @@ sstring sstable::component_basename(const sstring& ks, const sstring& cf, versio
     case sstable::version_types::mc:
     case sstable::version_types::md:
     case sstable::version_types::me:
+    case sstable::version_types::ms:
         return v + "-" + g + "-" + f + "-" + component;
     }
-    SCYLLA_ASSERT(0 && "invalid version");
+    on_internal_error(sstlog, seastar::format("invalid version {} for sstable: table={}.{}, generation={}, format={}, component={}",
+            static_cast<std::underlying_type<version_types>::type>(version), ks, cf, g, f, component));
 }
 
 sstring sstable::component_basename(const sstring& ks, const sstring& cf, version_types version, generation_type generation,
@@ -2296,10 +2516,28 @@ sstable::make_reader(
         streamed_mutation::forwarding fwd,
         mutation_reader::forwarding fwd_mr,
         read_monitor& mon,
-        integrity_check integrity) {
+        integrity_check integrity,
+        const utils::hashed_key* single_partition_read_murmur_hash
+) {
     const auto reversed = slice.is_reversed();
+
+    auto index_caching = use_caching(global_cache_index_pages && !slice.options.contains(query::partition_slice::option::bypass_cache));
+    auto index_reader = make_index_reader(permit, trace_state, index_caching, range.is_singular());
+
     if (_version >= version_types::mc && (!reversed || range.is_singular())) {
-        return mx::make_reader(shared_from_this(), std::move(query_schema), std::move(permit), range, slice, std::move(trace_state), fwd, fwd_mr, mon, integrity);
+        return mx::make_reader(
+            shared_from_this(),
+            std::move(query_schema),
+            std::move(permit),
+            range,
+            slice,
+            std::move(trace_state),
+            fwd,
+            fwd_mr,
+            mon,
+            integrity,
+            std::move(index_reader),
+            single_partition_read_murmur_hash);
     }
 
     // Multi-partition reversed queries are not yet supported natively in the mx reader.
@@ -2310,7 +2548,8 @@ sstable::make_reader(
     if (_version >= version_types::mc) {
         // The only mx case falling through here is reversed multi-partition reader
         auto rd = make_reversing_reader(mx::make_reader(shared_from_this(), query_schema->make_reversed(), std::move(permit),
-                range, reverse_slice(*query_schema, slice), std::move(trace_state), streamed_mutation::forwarding::no, fwd_mr, mon, integrity),
+                range, reverse_slice(*query_schema, slice), std::move(trace_state), streamed_mutation::forwarding::no, fwd_mr, mon,
+                integrity, std::move(index_reader), single_partition_read_murmur_hash),
             max_result_size);
         if (fwd) {
             rd = make_forwardable(std::move(rd));
@@ -2351,10 +2590,13 @@ static std::tuple<entry_descriptor, sstring, sstring> make_entry_descriptor(cons
     //   la-42-big-Data.db
     //   ka-42-big-Data.db
     //   me-3g8w_00qf_4pbog2i7h2c7am0uoe-big-Data.db
-    static boost::regex la_mx("(la|m[cde])-([^-]+)-(\\w+)-(.*)");
+    static boost::regex la_mx("(la|m[cdes])-([^-]+)-(\\w+)-(.*)");
     static boost::regex ka("(\\w+)-(\\w+)-ka-(\\d+)-(.*)");
 
-    static boost::regex dir(format(".*/([^/]*)/([^/]+)-[\\da-fA-F]+(?:/({}|{}|{}|{})(?:/[^/]+)?)?/?",
+    // Use non-greedy match so that a snapshot tag that ressembles a name-<uuid> wouldn't match
+    // the keyspace/table-<uuid> part of the regular expression.
+    // See https://github.com/scylladb/scylladb/issues/25242
+    static boost::regex dir(format(".*?/([^/]*)/([^/]+)-[\\da-fA-F]+(?:/({}|{}|{}|{})(?:/[^/]+)?)?/?",
             sstables::staging_dir, sstables::quarantine_dir, sstables::upload_dir, sstables::snapshots_dir).c_str());
 
     boost::smatch match;
@@ -2432,6 +2674,10 @@ sstable_format_types format_from_string(std::string_view s) {
     }
 }
 
+bool has_summary_and_index(sstable_version_types v) {
+    return v != sstable_version_types::ms;
+}
+
 component_type sstable::component_from_sstring(version_types v, const sstring &s) {
     try {
         return reverse_map(s, sstable_version_constants::get_component_map(v));
@@ -2440,7 +2686,7 @@ component_type sstable::component_from_sstring(version_types v, const sstring &s
     }
 }
 
-input_stream<char> sstable::data_stream(uint64_t pos, size_t len,
+future<input_stream<char>> sstable::data_stream(uint64_t pos, size_t len,
         reader_permit permit, tracing::trace_state_ptr trace_state, lw_shared_ptr<file_input_stream_history> history, raw_stream raw,
         integrity_check integrity, integrity_error_handler error_handler) {
     file_input_stream_options options;
@@ -2457,13 +2703,15 @@ input_stream<char> sstable::data_stream(uint64_t pos, size_t len,
     if (integrity == integrity_check::yes) {
         digest = get_digest();
     }
-
+    auto stream_creator = [this, f](uint64_t pos, uint64_t len, file_input_stream_options options) mutable -> future<input_stream<char>> {
+        co_return input_stream<char>(co_await _storage->make_data_or_index_source(*this, component_type::Data, std::move(f), pos, len, std::move(options)));
+    };
     if (_components->compression && raw == raw_stream::no) {
         if (_version >= sstable_version_types::mc) {
-            return make_compressed_file_m_format_input_stream(f, &_components->compression,
+            co_return make_compressed_file_m_format_input_stream(stream_creator, &_components->compression,
                pos, len, std::move(options), permit, digest);
         } else {
-            return make_compressed_file_k_l_format_input_stream(f, &_components->compression,
+            co_return make_compressed_file_k_l_format_input_stream(stream_creator, &_components->compression,
                 pos, len, std::move(options), permit, digest);
         }
     }
@@ -2471,22 +2719,21 @@ input_stream<char> sstable::data_stream(uint64_t pos, size_t len,
         auto checksum = get_checksum();
         auto file_len = data_size();
         if (_version >= sstable_version_types::mc) {
-             return make_checksummed_file_m_format_input_stream(f, file_len,
+             co_return make_checksummed_file_m_format_input_stream(stream_creator, file_len,
                 *checksum, pos, len, std::move(options), digest, error_handler);
         } else {
-            return make_checksummed_file_k_l_format_input_stream(f, file_len,
+            co_return make_checksummed_file_k_l_format_input_stream(stream_creator, file_len,
                 *checksum, pos, len, std::move(options), digest, error_handler);
         }
     }
-    return make_file_input_stream(f, pos, len, std::move(options));
+    co_return co_await stream_creator(pos, len, std::move(options));
 }
 
 future<temporary_buffer<char>> sstable::data_read(uint64_t pos, size_t len, reader_permit permit) {
-    return do_with(data_stream(pos, len, std::move(permit), tracing::trace_state_ptr(), {}), [len] (auto& stream) {
-        return stream.read_exactly(len).finally([&stream] {
-            return stream.close();
-        });
-    });
+    auto stream = co_await data_stream(pos, len, std::move(permit), tracing::trace_state_ptr(), {});
+    auto buff = co_await stream.read_exactly(len);
+    co_await stream.close();
+    co_return buff;
 }
 
 template <typename ChecksumType>
@@ -2596,7 +2843,7 @@ future<lw_shared_ptr<checksum>> sstable::read_checksum() {
         co_return nullptr;
     }
     auto checksum = make_lw_shared<sstables::checksum>();
-    co_await do_read_simple(component_type::CRC, [checksum, this] (version_types v, file crc_file) -> future<> {
+    co_await do_read_simple(component_type::CRC, [&checksum, this] (version_types v, file crc_file) -> future<> {
         file_input_stream_options options;
         options.buffer_size = 4096;
 
@@ -2623,7 +2870,14 @@ future<lw_shared_ptr<checksum>> sstable::read_checksum() {
 
         co_await crc_stream.close();
         maybe_rethrow_exception(std::move(ex));
-        _components->checksum = checksum->weak_from_this();
+        if (!_components->checksum) {
+            _components->checksum = checksum->weak_from_this();
+        } else {
+            // Race condition: Another fiber/thread has called `read_checksum()`
+            // while we were loading the component from disk. Discard our local
+            // copy and use theirs.
+            checksum = _components->checksum->shared_from_this();
+        }
     });
 
     co_return std::move(checksum);
@@ -2643,18 +2897,16 @@ future<validate_checksums_result> validate_checksums(shared_sstable sst, reader_
         co_return ret;
     }
 
-    input_stream<char> data_stream;
-    if (sst->get_compression()) {
-        data_stream = sst->data_stream(0, sst->ondisk_data_size(), permit,
-                nullptr, nullptr, sstable::raw_stream::yes);
-    } else {
-        data_stream = sst->data_stream(0, sst->data_size(), permit,
+    input_stream<char> data_stream = co_await (sst->get_compression()
+        ? sst->data_stream(0, sst->ondisk_data_size(), permit,
+                nullptr, nullptr, sstable::raw_stream::yes)
+        : sst->data_stream(0, sst->data_size(), permit,
                 nullptr, nullptr, sstable::raw_stream::no,
                 integrity_check::yes, [&ret](sstring msg) {
                     sstlog.error("{}", msg);
                     ret.status = validate_checksums_status::invalid;
-                });
-    }
+                })
+        );
 
     auto valid = true;
     std::exception_ptr ex;
@@ -2693,13 +2945,22 @@ void sstable::set_first_and_last_keys() {
         auto pk = key::from_bytes(value).to_partition_key(*_schema);
         return dht::decorate_key(*_schema, std::move(pk));
     };
-    auto first = decorate_key("first", _components->summary.first_key.value);
-    auto last = decorate_key("last", _components->summary.last_key.value);
-    if (first.tri_compare(*_schema, last) > 0) {
-        throw malformed_sstable_exception(format("{}: first and last keys of summary are misordered: first={} > last={}", get_filename(), first, last));
+    std::optional<dht::decorated_key> first;
+    std::optional<dht::decorated_key> last;
+    if (_components->summary) {
+        first = decorate_key("first", _components->summary.first_key.value);
+        last = decorate_key("last", _components->summary.last_key.value);
+    } else if (_partitions_db_footer) {
+        first = decorate_key("first", _partitions_db_footer->first_key.get_bytes());
+        last = decorate_key("last", _partitions_db_footer->last_key.get_bytes());
+    } else {
+        throw malformed_sstable_exception(format("{}: neither Summary.db nor Partitions.db component is present, can't determine first and last partition key", get_filename()));
     }
-    _first = std::move(first);
-    _last = std::move(last);
+    if (first.value().tri_compare(*_schema, last.value()) > 0) {
+        throw malformed_sstable_exception(format("{}: first and last keys of summary are misordered: first={} > last={}", get_filename(), first.value(), last.value()));
+    }
+    _first = std::move(first.value());
+    _last = std::move(last.value());
 }
 
 const partition_key& sstable::get_first_partition_key() const {
@@ -2790,19 +3051,30 @@ int sstable::compare_by_max_timestamp(const sstable& other) const {
 }
 
 future<> sstable::close_files() {
-    auto index_closed = make_ready_future<>();
+    utils::small_vector<future<>, 4> close_futures;
     if (_index_file) {
-        index_closed = _index_file.close().handle_exception([me = shared_from_this()] (auto ep) {
+        close_futures.push_back(_index_file.close().handle_exception([me = shared_from_this()] (auto ep) {
             sstlog.warn("sstable close index_file failed: {}", ep);
             general_disk_error();
-        });
+        }));
     }
-    auto data_closed = make_ready_future<>();
     if (_data_file) {
-        data_closed = _data_file.close().handle_exception([me = shared_from_this()] (auto ep) {
+        close_futures.push_back(_data_file.close().handle_exception([me = shared_from_this()] (auto ep) {
             sstlog.warn("sstable close data_file failed: {}", ep);
             general_disk_error();
-        });
+        }));
+    }
+    if (_partitions_file) {
+        close_futures.push_back(_partitions_file.close().handle_exception([me = shared_from_this()] (auto ep) {
+            sstlog.warn("sstable close partitions_db failed: {}", ep);
+            general_disk_error();
+        }));
+    }
+    if (_rows_file) {
+        close_futures.push_back(_rows_file.close().handle_exception([me = shared_from_this()] (auto ep) {
+            sstlog.warn("sstable close rows_db failed: {}", ep);
+            general_disk_error();
+        }));
     }
 
     auto unlinked = make_ready_future<>();
@@ -2828,7 +3100,7 @@ future<> sstable::close_files() {
 
     _on_closed(*this);
 
-    return when_all_succeed(std::move(index_closed), std::move(data_closed), std::move(unlinked)).discard_result().then([this, me = shared_from_this()] {
+    return when_all_succeed(close_futures.begin(), close_futures.end()).discard_result().then([this, me = shared_from_this()] {
         if (_open_mode) {
             if (_open_mode.value() == open_flags::ro) {
                 _stats.on_close_for_reading();
@@ -2942,35 +3214,73 @@ std::optional<std::pair<uint64_t, uint64_t>> sstable::get_index_pages_for_range(
     return std::nullopt;
 }
 
-std::vector<dht::decorated_key> sstable::get_key_samples(const schema& s, const dht::token_range& range) {
-    auto index_range = get_sample_indexes_for_range(range);
-    std::vector<dht::decorated_key> res;
-    if (index_range) {
-        for (auto idx = index_range->first; idx < index_range->second; ++idx) {
-            auto pkey = _components->summary.entries[idx].get_key().to_partition_key(s);
-            res.push_back(dht::decorate_key(s, std::move(pkey)));
-        }
-    }
-    return res;
-}
-
-uint64_t sstable::estimated_keys_for_range(const dht::token_range& range) {
+future<uint64_t> sstable::estimated_keys_for_range(const dht::token_range& range) {
+  if (_components->summary) {
     auto page_range = get_index_pages_for_range(range);
     if (!page_range) {
-        return 0;
+        co_return 0;
     }
     using uint128_t = unsigned __int128;
     uint64_t range_pages = page_range->second - page_range->first;
     auto total_keys = get_estimated_key_count();
     auto total_pages = _components->summary.entries.size();
     uint64_t estimated_keys = (uint128_t)range_pages * total_keys / total_pages;
-    return std::max(uint64_t(1), estimated_keys);
+    co_return std::max(uint64_t(1), estimated_keys);
+  } else if (_partitions_db_footer) {
+    // This is an extra conditional for the special case when the given range
+    // doesn't overlap with the sstable's range at all.
+    //
+    // In this case, if the ranges are adjacent, the main code path could easily
+    // return "1 partition" instead of "0 partitions",
+    // due to the inexactness of BTI indexes for range queries.
+    // Returning something non-zero in this case would be unfortunate,
+    // so the extra conditional makes sure that we return 0.
+    auto local_tr = dht::token_range::make({get_first_decorated_key().token()}, {get_last_decorated_key().token()});
+    if (!local_tr.overlaps(range, dht::token_comparator())) {
+        co_return 0;
+    }
+
+    uint64_t result;
+
+    auto& sem = _manager.sstable_metadata_concurrency_sem();
+    uint64_t estimated_memory = 16 * 1024; // Value pulled from thin air
+    reader_permit permit = co_await sem.obtain_permit(_schema, "sstable::estimated_keys_for_range", estimated_memory, db::no_timeout, {});
+    auto ir = make_index_reader(std::move(permit));
+
+    std::exception_ptr ex;
+    try {
+        co_await ir->advance_to(dht::to_partition_range(range));
+        auto data_file_range = ir->data_file_positions();
+        auto uncompressed_data_size = data_size();
+        auto start = data_file_range.start;
+        auto end = data_file_range.end.value_or(uncompressed_data_size);
+        auto total_count = get_estimated_key_count();
+        sstlog.debug("estimated_keys_for_range(sst={}, range={}): data_start: {}, data_end: {}, data_size: {}, estimated_key_count: {}",
+                get_filename(), range, start, end, uncompressed_data_size, total_count);
+        if (start == end) {
+            result = 0;
+        } else {
+            result = std::ceil(double(end - start) / uncompressed_data_size * total_count);
+        }
+    } catch (...) {
+        ex = std::current_exception();
+    }
+    co_await ir->close();
+    if (ex) {
+        co_return coroutine::exception(std::move(ex));
+    } else {
+        co_return result;
+    }
+  } else {
+    co_return coroutine::exception(std::make_exception_ptr(malformed_sstable_exception(
+        format("{}: neither Summary.db nor Partitions.db component is present, can't estimate number of partitions in range", get_filename()))));
+  }
 }
 
 std::vector<unsigned>
 sstable::compute_shards_for_this_sstable(const dht::sharder& sharder_) const {
     std::unordered_set<unsigned> shards;
-    dht::partition_range_vector token_ranges;
+    utils::chunked_vector<dht::partition_range> token_ranges;
     const auto* sm = _components->scylla_metadata
             ? _components->scylla_metadata->data.get<scylla_metadata_type::Sharding, sharding_metadata>()
             : nullptr;
@@ -2988,7 +3298,7 @@ sstable::compute_shards_for_this_sstable(const dht::sharder& sharder_) const {
         };
         token_ranges = sm->token_ranges.elements
                 | std::views::transform(disk_token_range_to_ring_position_range)
-                | std::ranges::to<dht::partition_range_vector>();
+                | std::ranges::to<utils::chunked_vector<dht::partition_range>>();
     }
     sstlog.trace("{}: token_ranges={}", get_filename(), token_ranges);
     auto sharder = dht::ring_position_range_vector_sharder(sharder_, std::move(token_ranges));
@@ -3009,16 +3319,21 @@ future<bool> sstable::has_partition_key(const utils::hashed_key& hk, const dht::
     std::exception_ptr ex;
     auto sem = reader_concurrency_semaphore(reader_concurrency_semaphore::no_limits{}, "sstables::has_partition_key()",
             reader_concurrency_semaphore::register_metrics::no);
-    std::unique_ptr<sstables::index_reader> lh_index_ptr = nullptr;
+
+    auto slice = partition_slice_builder(*_schema).with_no_regular_columns().with_no_static_columns().build();
+    auto pr = dht::partition_range::make_singular(dk);
+    auto reader = make_reader(
+        _schema,
+        sem.make_tracking_only_permit(_schema, fmt::to_string(s->get_filename()), db::no_timeout, {}),
+        pr,
+        slice);
     try {
-        lh_index_ptr = std::make_unique<sstables::index_reader>(s, sem.make_tracking_only_permit(_schema, fmt::to_string(s->get_filename()), db::no_timeout, {}));
-        present = co_await lh_index_ptr->advance_lower_and_check_if_present(dk);
+        reader.set_max_buffer_size(1);
+        present = bool(co_await reader.peek());
     } catch (...) {
         ex = std::current_exception();
     }
-    if (auto lhi_ptr = std::move(lh_index_ptr)) {
-        co_await lhi_ptr->close();
-    }
+    co_await reader.close();
     co_await sem.stop();
     if (ex) {
         co_return coroutine::exception(std::move(ex));
@@ -3195,8 +3510,9 @@ sstable::sstable(schema_ptr schema,
         version_types v,
         format_types f,
         db::large_data_handler& large_data_handler,
+        db::corrupt_data_handler& corrupt_data_handler,
         sstables_manager& manager,
-        gc_clock::time_point now,
+        db_clock::time_point now,
         io_error_handler_gen error_handler_gen,
         size_t buffer_size)
     : sstable_buffer_size(buffer_size)
@@ -3212,6 +3528,7 @@ sstable::sstable(schema_ptr schema,
     , _read_error_handler(error_handler_gen(sstable_read_error))
     , _write_error_handler(error_handler_gen(sstable_write_error))
     , _large_data_handler(large_data_handler)
+    , _corrupt_data_handler(corrupt_data_handler)
     , _manager(manager)
 {
     manager.add(this);
@@ -3219,6 +3536,14 @@ sstable::sstable(schema_ptr schema,
 
 file sstable::uncached_index_file() {
     return _cached_index_file->get_file();
+}
+
+file sstable::uncached_partitions_file() {
+    return _cached_partitions_file->get_file();
+}
+
+file sstable::uncached_rows_file() {
+    return _cached_rows_file->get_file();
 }
 
 void sstable::unused() {
@@ -3292,7 +3617,7 @@ gc_clock::time_point sstable::get_gc_before_for_fully_expire(const gc_clock::tim
     // No need to query gc_before for the sstable if the max_deletion_time is max()
     if (deletion_time == gc_clock::time_point(gc_clock::duration(std::numeric_limits<int>::max()))) {
         sstlog.trace("sstable={}, ks={}, cf={}, get_max_local_deletion_time={}, min_timestamp={}, gc_grace_seconds={}, shortcut",
-                get_filename(), s->ks_name(), s->cf_name(), deletion_time, get_stats_metadata().min_timestamp, s->gc_grace_seconds().count());
+                get_filename(), s->ks_name(), s->cf_name(), deletion_time, seastar::value_of([this] { return get_stats_metadata().min_timestamp; }), s->gc_grace_seconds().count());
         return gc_clock::time_point::min();
     }
     auto start = get_first_decorated_key().token();
@@ -3302,6 +3627,49 @@ gc_clock::time_point sstable::get_gc_before_for_fully_expire(const gc_clock::tim
             get_filename(), s->ks_name(), s->cf_name(), range, deletion_time, get_stats_metadata().min_timestamp, s->gc_grace_seconds().count(), bool(gc_state));
     auto res = gc_state.get_gc_before_for_range(s, range, compaction_time);
     return res.knows_entire_range ? res.min_gc_before : gc_clock::time_point::min();
+}
+
+std::unique_ptr<abstract_index_reader> sstable::make_index_reader(
+    reader_permit permit,
+    tracing::trace_state_ptr trace_state,
+    use_caching caching,
+    bool single_partition_read
+) {
+    if (!_index_file) {
+        if (!_partitions_db_footer) [[unlikely]] {
+            on_internal_error(sstlog, fmt::format("_partitions_db_footer is empty for sstable {}", get_filename()));
+        }
+        auto cached_partitions_file = caching == use_caching::yes
+            ? _cached_partitions_file
+            :  seastar::make_shared<cached_file>(
+                uncached_partitions_file(),
+                _manager.get_cache_tracker().get_index_cached_file_stats(),
+                _manager.get_cache_tracker().get_lru(),
+                _manager.get_cache_tracker().region(),
+                _cached_partitions_file->size(),
+                trace_state ? component_name(*this, component_type::Partitions).format() : sstring()
+            );
+            auto cached_rows_file = caching == use_caching::yes
+            ? _cached_rows_file
+            :  seastar::make_shared<cached_file>(
+                uncached_rows_file(),
+                _manager.get_cache_tracker().get_index_cached_file_stats(),
+                _manager.get_cache_tracker().get_lru(),
+                _manager.get_cache_tracker().region(),
+                _cached_rows_file->size(),
+                trace_state ? component_name(*this, component_type::Rows).format() : sstring()
+            );
+        return trie::make_bti_index_reader(
+            cached_partitions_file,
+            cached_rows_file,
+            _partitions_db_footer.value().trie_root_position,
+            data_size(),
+            _schema,
+            std::move(permit),
+            std::move(trace_state)
+        );
+    }
+    return std::make_unique<index_reader>(shared_from_this(), std::move(permit), std::move(trace_state), caching, single_partition_read);
 }
 
 // Returns error code, 0 is success
@@ -3360,9 +3728,10 @@ future<> remove_table_directory_if_has_no_snapshots(fs::path table_dir) {
 }
 
 std::string to_string(const shared_sstable& sst, bool include_origin) {
+    auto repaired_at = sst->get_stats_metadata().repaired_at;
     return include_origin ?
-        fmt::format("{}:level={:d}:origin={}", sst->get_filename(), sst->get_sstable_level(), sst->get_origin()) :
-        fmt::format("{}:level={:d}", sst->get_filename(), sst->get_sstable_level());
+        fmt::format("{}:level={:d}:origin={}:repaired_at={}", sst->get_filename(), sst->get_sstable_level(), sst->get_origin(), repaired_at) :
+        fmt::format("{}:level={:d}:repaired_at={}", sst->get_filename(), sst->get_sstable_level(), repaired_at);
 }
 
 std::string sstable_stream_source::component_basename() const {
@@ -3411,11 +3780,10 @@ std::vector<std::unique_ptr<sstable_stream_source>> create_stream_sources(const 
                     buffer_data_sink_impl(std::vector<temporary_buffer<char>>& bufs)
                         : _bufs(bufs)
                     {}
-                    future<> put(net::packet data) override {
-                        throw std::logic_error("unsupported operation");
-                    }
-                    future<> put(temporary_buffer<char> buf) override {
-                        _bufs.emplace_back(std::move(buf));
+                    future<> put(std::span<temporary_buffer<char>> bufs) override {
+                        for (auto&& buf : bufs) {
+                            _bufs.emplace_back(std::move(buf));
+                        }
                         return make_ready_future<>();
                     }
                     future<> flush() override {
@@ -3561,10 +3929,10 @@ public:
         if (!_sst) {
             co_return;
         }
-        auto filename = fs::path(_sst->_storage->prefix()) / std::string_view(_sst->component_basename(_type));
+        auto filename = fmt::to_string(_sst->filename(_type));
         // TODO: if we are the last component (or really always), should we remove all component files?
         // For now, this remains the responsibility of calling code (see handle_tablet_migration etc)
-        co_await remove_file(filename.native());
+        co_await remove_file(filename);
     }
 };
 
@@ -3626,6 +3994,47 @@ future<data_sink> file_io_extension::wrap_sink(const sstable& sst, component_typ
     f = co_await wrap_file(sst, c, create_file_for_sink(std::move(sink)), open_flags::wo);
     co_return co_await make_file_data_sink(std::move(f), file_output_stream_options{});
 }
+
+future<data_source> file_io_extension::wrap_source(const sstable& sst, component_type c, data_source) {
+    SCYLLA_ASSERT(0 && "You are not supposed to get here, file_io_extension::wrap_source() is not implemented");
+}
+
+namespace trie {
+
+// This implementation would belong better in sstables/trie/bti_partition_index_writer.cc,
+// but we put it here to have access to the `parse(...)` helpers.
+future<bti_partitions_db_footer> read_bti_partitions_db_footer(const schema& s, sstable_version_types v, const seastar::file& f, uint64_t file_size) {
+    file_random_access_reader reader(f, file_size, default_sstable_buffer_size);
+    if (file_size < 24) {
+        throw malformed_sstable_exception(fmt::format("Partitions.db file is too small: file_size={}", file_size));
+    }
+    co_await reader.seek(file_size - 24);
+    uint64_t keys_position;
+    uint64_t partition_count;
+    uint64_t trie_root;
+    co_await parse(s, v, reader, keys_position);
+    co_await parse(s, v, reader, partition_count);
+    co_await parse(s, v, reader, trie_root);
+    if (trie_root >= file_size) {
+        throw malformed_sstable_exception(fmt::format("Partitions.db malformed: trie_root={}, file_size={}", trie_root, file_size));
+    }
+    if (keys_position >= file_size) {
+        throw malformed_sstable_exception(fmt::format("Partitions.db malformed: keys_position={}, file_size={}", keys_position, file_size));
+    }
+    co_await reader.seek(keys_position);
+    disk_string<uint16_t> first_key;
+    disk_string<uint16_t> last_key;
+    co_await parse(s, v, reader, first_key);
+    co_await parse(s, v, reader, last_key);
+    co_return trie::bti_partitions_db_footer{
+        .first_key = sstables::key::from_bytes(std::move(first_key.value)),
+        .last_key = sstables::key::from_bytes(std::move(last_key.value)),
+        .partition_count = partition_count,
+        .trie_root_position = trie_root,
+    };
+}
+
+} // namespace trie
 
 } // namespace sstables
 

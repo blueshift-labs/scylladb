@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 import random
@@ -22,7 +23,7 @@ from test.pylib.util import wait_for, wait_for_cql_and_get_hosts
 from test.cluster.util import wait_for_token_ring_and_group0_consistency, get_coordinator_host
 from test.cluster.conftest import skip_mode
 from test.pylib.internal_types import ServerUpState
-from test.cluster.random_failures.cluster_events import CLUSTER_EVENTS, TOPOLOGY_TIMEOUT
+from test.cluster.random_failures.cluster_events import CLUSTER_EVENTS, TOPOLOGY_TIMEOUT, feed_rack_seed, get_random_rack
 from test.cluster.random_failures.error_injections import ERROR_INJECTIONS, ERROR_INJECTIONS_NODE_MAY_HANG
 
 if TYPE_CHECKING:
@@ -35,7 +36,10 @@ TESTS_COUNT = 1  # number of tests from the whole matrix to run, None to run the
 
 # Following parameters can be adjusted to run same sequence of tests from a previous run.  Look at logs for the values.
 # Also see `pytest_generate_tests()` below for details.
-TESTS_SHUFFLE_SEED = random.randrange(sys.maxsize)  # seed for the tests order randomization
+
+# Seed for the tests order randomization.
+TESTS_SHUFFLE_SEED = int(os.environ.get("TOPOLOGY_RANDOM_FAILURES_TEST_SHUFFLE_SEED", random.randrange(sys.maxsize)))
+
 ERROR_INJECTIONS_COUNT = len(ERROR_INJECTIONS)  # change it to limit number of error injections
 CLUSTER_EVENTS_COUNT = len(CLUSTER_EVENTS)  # change it to limit number of cluster events
 
@@ -48,10 +52,11 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     tests = list(itertools.product(error_injections, cluster_events))
 
     random.Random(TESTS_SHUFFLE_SEED).shuffle(tests)
+    feed_rack_seed(TESTS_SHUFFLE_SEED)
 
     # Deselect unsupported combinations.  Do it after the shuffle to have the stable order.
     tests = [
-        (inj, event) for inj, event in tests if inj not in getattr(event, "deselected_random_failures", {})
+        (inj, event) for inj, event in tests if not inj.startswith("REMOVED_") and inj not in getattr(event, "deselected_random_failures", {})
     ]
 
     metafunc.parametrize(["error_injection", "cluster_event"], tests[:TESTS_COUNT])
@@ -60,8 +65,15 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 @pytest.fixture
 async def four_nodes_cluster(manager: ManagerClient) -> None:
     LOGGER.info("Booting initial 4-node cluster.")
-    for _ in range(4):
-        server = await manager.server_add()
+
+    servers = await manager.servers_add(4, property_file=[
+        {"dc": "dc1", "rack": "rack1"},
+        {"dc": "dc1", "rack": "rack2"},
+        {"dc": "dc1", "rack": "rack3"},
+        {"dc": "dc1", "rack": "rack3"}
+    ])
+
+    for server in servers:
         await manager.api.enable_injection(
             node_ip=server.ip_addr,
             injection="raft_server_set_snapshot_thresholds",
@@ -71,6 +83,7 @@ async def four_nodes_cluster(manager: ManagerClient) -> None:
                 "snapshot_trailing": "1",
             }
         )
+
     await wait_for_token_ring_and_group0_consistency(manager=manager, deadline=time.time() + 30)
 
 
@@ -110,9 +123,12 @@ async def test_random_failures(manager: ManagerClient,
         )
         coordinator_log = await manager.server_open_log(server_id=coordinator.server_id)
         coordinator_log_mark = await coordinator_log.mark()
-        s_info = await manager.server_add(expected_server_up_state=ServerUpState.PROCESS_STARTED)
+
+        rack = get_random_rack()
+        s_info = await manager.server_add(expected_server_up_state=ServerUpState.PROCESS_STARTED,
+                                          property_file={"dc": "dc1", "rack": rack})
         await coordinator_log.wait_for(
-            pattern="topology_coordinator_pause_after_updating_cdc_generation: waiting",
+            "topology_coordinator_pause_after_updating_cdc_generation: waiting",
             from_mark=coordinator_log_mark,
         )
         await manager.server_pause(server_id=s_info.server_id)
@@ -121,8 +137,10 @@ async def test_random_failures(manager: ManagerClient,
             injection="topology_coordinator_pause_after_updating_cdc_generation",
         )
     else:
+        rack = get_random_rack()
         s_info = await manager.server_add(
             config={"error_injections_at_startup": [{"name": error_injection, "one_shot": True}]},
+            property_file={"dc": "dc1", "rack": rack},
             expected_server_up_state=ServerUpState.PROCESS_STARTED,
         )
 

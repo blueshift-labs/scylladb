@@ -66,9 +66,9 @@ public:
 
     virtual future<role_set> query_granted(std::string_view grantee_name, recursive_role_query) override;
 
-    virtual future<role_to_directly_granted_map> query_all_directly_granted() override;
+    virtual future<role_to_directly_granted_map> query_all_directly_granted(::service::query_state&) override;
 
-    virtual future<role_set> query_all() override;
+    virtual future<role_set> query_all(::service::query_state&) override;
 
     virtual future<bool> exists(std::string_view role_name) override;
 
@@ -76,9 +76,9 @@ public:
 
     virtual future<bool> can_login(std::string_view role_name) override;
 
-    virtual future<std::optional<sstring>> get_attribute(std::string_view role_name, std::string_view attribute_name) override;
+    virtual future<std::optional<sstring>> get_attribute(std::string_view role_name, std::string_view attribute_name, ::service::query_state&) override;
 
-    virtual future<role_manager::attribute_vals> query_attribute_for_all(std::string_view attribute_name) override;
+    virtual future<role_manager::attribute_vals> query_attribute_for_all(std::string_view attribute_name, ::service::query_state&) override;
 
     virtual future<> set_attribute(std::string_view role_name, std::string_view attribute_name, std::string_view attribute_value, ::service::group0_batch& mc) override;
 
@@ -95,9 +95,12 @@ private:
 
     future<> migrate_legacy_metadata();
 
-    future<> create_default_role_if_missing();
+    future<> legacy_create_default_role_if_missing();
 
-    future<> create_or_replace(std::string_view role_name, const role_config&, ::service::group0_batch&);
+    future<> maybe_create_default_role();
+    future<> maybe_create_default_role_with_retries();
+
+    future<> create_or_replace(std::string_view auth_ks_name, std::string_view role_name, const role_config&, ::service::group0_batch&);
 
     future<> legacy_modify_membership(std::string_view role_name, std::string_view grantee_name, membership_change);
 

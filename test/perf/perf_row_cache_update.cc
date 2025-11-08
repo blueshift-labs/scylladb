@@ -6,7 +6,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/thread.hh>
@@ -88,7 +88,7 @@ void run_test(const sstring& name, schema_ptr s, MutationGenerator&& gen) {
         // Create a reader which tests the case of memtable snapshots
         // going away after memtable was merged to cache.
         auto rd = std::make_unique<mutation_fragment_v1_stream>(
-            mutation_fragment_v1_stream(make_combined_reader(s, permit, cache.make_reader(s, permit), mt->make_flat_reader(s, permit))));
+            mutation_fragment_v1_stream(make_combined_reader(s, permit, cache.make_reader(s, permit), mt->make_mutation_reader(s, permit))));
         auto close_rd = defer([&rd] { rd->close().get(); });
         rd->set_max_buffer_size(1);
         rd->fill_buffer().get();

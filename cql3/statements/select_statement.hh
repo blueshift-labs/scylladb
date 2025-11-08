@@ -15,10 +15,13 @@
 #include "cql3/cql_statement.hh"
 #include "cql3/stats.hh"
 #include <seastar/core/shared_ptr.hh>
+#include <string_view>
 #include "transport/messages/result_message.hh"
 #include "index/secondary_index_manager.hh"
 #include "exceptions/coordinator_result.hh"
 #include "locator/host_id.hh"
+#include "service/cas_shard.hh"
+#include "vector_search/vector_store_client.hh"
 
 namespace service {
     class client_state;
@@ -42,6 +45,13 @@ namespace restrictions {
 
 namespace statements {
 
+
+/// Encapsulates a partition key and clustering key prefix as a primary key.
+struct primary_key {
+    dht::decorated_key partition;
+    clustering_key_prefix clustering;
+};
+
 /**
  * Encapsulates a completely parsed SELECT query, including the target
  * column family, expression, result count, and ordering clause.
@@ -53,7 +63,7 @@ public:
     using coordinator_result = exceptions::coordinator_result<T>;
     using parameters = raw::select_statement::parameters;
     using ordering_comparator_type = raw::select_statement::ordering_comparator_type;
-    static constexpr int DEFAULT_COUNT_PAGE_SIZE = 10000;
+    using prepared_ann_ordering_type = raw::select_statement::prepared_ann_ordering_type;
     bool _may_use_token_aware_routing;
 protected:
     static thread_local const lw_shared_ptr<const parameters> _default_parameters;
@@ -125,17 +135,13 @@ public:
 
     future<::shared_ptr<cql_transport::messages::result_message>> execute_without_checking_exception_message_non_aggregate_unpaged(query_processor& qp,
         lw_shared_ptr<query::read_command> cmd, dht::partition_range_vector&& partition_ranges, service::query_state& state,
-         const query_options& options, gc_clock::time_point now) const;
+        const query_options& options, gc_clock::time_point now,
+        std::optional<service::cas_shard> cas_shard) const;
 
     future<::shared_ptr<cql_transport::messages::result_message>> execute_without_checking_exception_message_aggregate_or_paged(query_processor& qp,
         lw_shared_ptr<query::read_command> cmd, dht::partition_range_vector&& partition_ranges, service::query_state& state,
-         const query_options& options, gc_clock::time_point now, int32_t page_size, bool aggregate, bool nonpaged_filtering, uint64_t limit) const;
-
-
-    struct primary_key {
-        dht::decorated_key partition;
-        clustering_key_prefix clustering;
-    };
+         const query_options& options, gc_clock::time_point now, int32_t page_size, bool aggregate, bool nonpaged_filtering, uint64_t limit,
+        std::optional<service::cas_shard> cas_shard) const;
 
     future<shared_ptr<cql_transport::messages::result_message>> process_results(foreign_ptr<lw_shared_ptr<query::result>> results,
         lw_shared_ptr<query::read_command> cmd, const query_options& options, gc_clock::time_point now) const;
@@ -178,7 +184,7 @@ public:
                      std::unique_ptr<cql3::attributes> attrs);
 };
 
-class indexed_table_select_statement : public select_statement {
+class view_indexed_table_select_statement : public select_statement {
     secondary_index::index _index;
     expr::expression _used_index_restrictions;
     schema_ptr _view_schema;
@@ -201,7 +207,7 @@ public:
                                                                     cql_stats &stats,
                                                                     std::unique_ptr<cql3::attributes> attrs);
 
-    indexed_table_select_statement(schema_ptr schema,
+    view_indexed_table_select_statement(schema_ptr schema,
                                    uint32_t bound_terms,
                                    lw_shared_ptr<const parameters> parameters,
                                    ::shared_ptr<selection::selection> selection,
@@ -220,9 +226,12 @@ public:
 private:
     virtual future<::shared_ptr<cql_transport::messages::result_message>> do_execute(query_processor& qp,
             service::query_state& state, const query_options& options) const override;
+            
+    future<::shared_ptr<cql_transport::messages::result_message>> actually_do_execute(query_processor& qp,
+            service::query_state& state, const query_options& options) const;
 
     lw_shared_ptr<const service::pager::paging_state> generate_view_paging_state_from_base_query_results(lw_shared_ptr<const service::pager::paging_state> paging_state,
-            const foreign_ptr<lw_shared_ptr<query::result>>& results, service::query_state& state, const query_options& options) const;
+            const foreign_ptr<lw_shared_ptr<query::result>>& results, service::query_state& state, const query_options& options, uint32_t internal_page_size) const;
 
     future<coordinator_result<std::tuple<dht::partition_range_vector, lw_shared_ptr<const service::pager::paging_state>>>> find_index_partition_ranges(query_processor& qp,
                                                                     service::query_state& state,
@@ -239,7 +248,8 @@ private:
             service::query_state& state,
             const query_options& options,
             gc_clock::time_point now,
-            lw_shared_ptr<const service::pager::paging_state> paging_state) const;
+            lw_shared_ptr<const service::pager::paging_state> paging_state,
+            uint32_t internal_page_size) const;
 
     lw_shared_ptr<query::read_command>
     prepare_command_for_base_query(query_processor& qp, const query_options& options, service::query_state& state, gc_clock::time_point now,
@@ -348,6 +358,48 @@ private:
             service::query_state& state, const query_options& options) const override;
 };
 
-}
 
+class vector_indexed_table_select_statement : public select_statement {
+    secondary_index::index _index;
+    prepared_ann_ordering_type _prepared_ann_ordering;
+    mutable gc_clock::time_point _query_start_time_point;
+
+public:
+    static constexpr size_t max_ann_query_limit = 1000;
+
+    static ::shared_ptr<cql3::statements::select_statement> prepare(data_dictionary::database db, schema_ptr schema, uint32_t bound_terms,
+            lw_shared_ptr<const parameters> parameters, ::shared_ptr<selection::selection> selection,
+            ::shared_ptr<restrictions::statement_restrictions> restrictions, ::shared_ptr<std::vector<size_t>> group_by_cell_indices, bool is_reversed,
+            ordering_comparator_type ordering_comparator, prepared_ann_ordering_type prepared_ann_ordering, std::optional<expr::expression> limit,
+            std::optional<expr::expression> per_partition_limit, cql_stats& stats, std::unique_ptr<cql3::attributes> attrs);
+
+    vector_indexed_table_select_statement(schema_ptr schema, uint32_t bound_terms, lw_shared_ptr<const parameters> parameters,
+            ::shared_ptr<selection::selection> selection, ::shared_ptr<const restrictions::statement_restrictions> restrictions,
+            ::shared_ptr<std::vector<size_t>> group_by_cell_indices, bool is_reversed, ordering_comparator_type ordering_comparator,
+            prepared_ann_ordering_type prepared_ann_ordering, std::optional<expr::expression> limit, std::optional<expr::expression> per_partition_limit,
+            cql_stats& stats, const secondary_index::index& index, std::unique_ptr<cql3::attributes> attrs);
+
+private:
+    future<::shared_ptr<cql_transport::messages::result_message>> do_execute(
+            query_processor& qp, service::query_state& state, const query_options& options) const override;
+
+    void update_stats() const;
+
+    lw_shared_ptr<query::read_command> prepare_command_for_base_query(query_processor& qp, service::query_state& state, const query_options& options) const;
+
+    std::vector<float> get_ann_ordering_vector(const query_options& options) const;
+
+    future<::shared_ptr<cql_transport::messages::result_message>> query_base_table(
+            query_processor& qp, service::query_state& state, const query_options& options, const std::vector<vector_search::primary_key>& pkeys) const;
+
+    future<::shared_ptr<cql_transport::messages::result_message>> query_base_table(query_processor& qp, service::query_state& state,
+            const query_options& options, lw_shared_ptr<query::read_command> command, lowres_clock::time_point timeout,
+            const std::vector<vector_search::primary_key>& pkeys) const;
+
+    future<::shared_ptr<cql_transport::messages::result_message>> query_base_table(query_processor& qp, service::query_state& state,
+            const query_options& options, lw_shared_ptr<query::read_command> command, lowres_clock::time_point timeout,
+            std::vector<dht::partition_range> partition_ranges) const;
+};
+
+}
 }

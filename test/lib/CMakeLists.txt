@@ -7,7 +7,6 @@ target_sources(test-lib
     log.cc
     test_utils.cc
     tmpdir.cc
-    alternator_test_env.cc
     cql_test_env.cc
     expr_test_utils.cc
     test_services.cc
@@ -19,7 +18,10 @@ target_sources(test-lib
     sstable_run_based_compaction_strategy_for_tests.cc
     sstable_utils.cc
     data_model.cc
-    eventually.cc)
+    eventually.cc
+    proc_utils.cc
+    gcs_fixture.cc
+    )
 target_include_directories(test-lib
   PUBLIC
     ${CMAKE_SOURCE_DIR})
@@ -45,6 +47,7 @@ target_link_libraries(test-lib
     scylla_version
     service
     sstables
+    vector_search # used by cql3
     utils
     Boost::regex
     Boost::unit_test_framework)

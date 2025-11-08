@@ -9,8 +9,10 @@
 #include "instance_profile_credentials_provider.hh"
 #include "utils/http.hh"
 #include "utils/s3/client.hh"
+#include "utils/s3/default_aws_retry_strategy.hh"
 #include <rapidjson/document.h>
 #include <rapidjson/error/en.h>
+#include <seastar/http/client.hh>
 #include <seastar/http/request.hh>
 #include <seastar/util/short_streams.hh>
 
@@ -22,20 +24,17 @@ static logging::logger ec2_md_logger("ec2_metadata");
 instance_profile_credentials_provider::instance_profile_credentials_provider(const std::string& _host, unsigned _port) : ec2_metadata_ip(_host), port(_port) {
 }
 
-bool instance_profile_credentials_provider::is_time_to_refresh() const {
-    return seastar::lowres_clock::now() >= creds.expires_at;
+future<> instance_profile_credentials_provider::reload() {
+    co_await update_credentials();
 }
 
-future<> instance_profile_credentials_provider::reload() {
-    if (is_time_to_refresh() || !creds) {
-        co_await update_credentials();
-    }
-}
+static constexpr auto EC2_SECURITY_CREDENTIALS_RESOURCE = "/latest/meta-data/iam/security-credentials";
 
 future<> instance_profile_credentials_provider::update_credentials() {
-    auto factory = std::make_unique<utils::http::dns_connection_factory>(ec2_metadata_ip, port, false, ec2_md_logger);
-    retryable_http_client http_client(std::move(factory), 1, retryable_http_client::ignore_exception, http::experimental::client::retry_requests::yes, retry_strategy);
-
+    http::experimental::client http_client(std::make_unique<utils::http::dns_connection_factory>(ec2_metadata_ip, port, false, ec2_md_logger),
+                                           1,
+                                           1_MiB,
+                                           std::make_unique<default_aws_retry_strategy>());
     auto req = http::request::make("PUT", ec2_metadata_ip, "/latest/api/token");
     req._headers["x-aws-ec2-metadata-token-ttl-seconds"] = format("{}", session_duration);
 
@@ -49,7 +48,7 @@ future<> instance_profile_credentials_provider::update_credentials() {
         http::reply::status_type::ok);
 
     std::string role;
-    req = http::request::make("GET", ec2_metadata_ip, "/latest/meta-data/iam/security-credentials/");
+    req = http::request::make("GET", ec2_metadata_ip, seastar::format("{}/", EC2_SECURITY_CREDENTIALS_RESOURCE));
     req._headers["x-aws-ec2-metadata-token"] = token;
     co_await http_client.make_request(
         std::move(req),
@@ -59,7 +58,7 @@ future<> instance_profile_credentials_provider::update_credentials() {
         },
         http::reply::status_type::ok);
 
-    req = http::request::make("GET", ec2_metadata_ip, seastar::format("/latest/meta-data/iam/security-credentials/{}", role));
+    req = http::request::make("GET", ec2_metadata_ip, seastar::format("{}/{}", EC2_SECURITY_CREDENTIALS_RESOURCE, role));
     req._headers["x-aws-ec2-metadata-token"] = token;
     co_await http_client.make_request(
         std::move(req),

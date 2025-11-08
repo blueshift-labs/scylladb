@@ -109,6 +109,32 @@ to do what, configure the following in ScyllaDB's configuration:
     alternator_enforce_authorization: true
 ```
 
+Note: switching `alternator_enforce_authorization` from `false` to `true`
+before the client application has the proper secret keys and permission
+tables set up will cause the application's requests to immediately fail.
+Therefore, we recommend to begin by keeping `alternator_enforce_authorization`
+set to `false` and setting `alternator_warn_authorization` to `true`.
+This setting will continue to allow all requests without failing on
+authentication or authorization errors - but will _count_ would-be
+authentication and authorization failures in the two metrics:
+
+* `scylla_alternator_authentication_failures`
+* `scylla_alternator_authorization_failures`
+
+`alternator_warn_authorization=true` also generates a WARN-level log message
+on each authentication or authorization failure. These log messages each
+includes the string `alternator_enforce_authorization=true`, and information
+that can help pinpoint the source of the error - such as the username
+involved in the attempt, and the address of the client sending the request.
+
+When you see that both metrics are not increasing (or, alternatively, that no
+more log messages appear), you can be sure that the application is properly
+set up and can finally set `alternator_enforce_authorization` to `true`.
+You can leave `alternator_warn_authorization` set or unset, depending on
+whether or not you want to see log messages when requests fail on
+authentication/authorization (in any case, the metric counts these failures,
+and the client will also get the error).
+
 Alternator implements the same [signature protocol](https://docs.aws.amazon.com/general/latest/gr/signature-version-4.html)
 as DynamoDB and the rest of AWS. Clients use, as usual, an access key ID and
 a secret access key to prove their identity and the authenticity of their
@@ -211,11 +237,6 @@ In Alternator, the expiration delay is configurable - it can be set
 with the `--alternator-ttl-period-in-seconds` configuration option.
 The default is 24 hours.
 
-One thing the implementation is missing is that expiration
-events appear in the Streams API as normal deletions - without the
-distinctive marker on deletions which are really expirations.
-See <https://github.com/scylladb/scylla/issues/5060>.
-
 ## Scan ordering
 
 In DynamoDB, scanning the _entire_ table returns the partitions sorted by
@@ -231,6 +252,24 @@ in DynamoDB and Scylla - determined by the _sort key_ defined for that table.
 
 ---
 
+## Configurable or different limits
+
+Some features have fixed limits in DynamoDB, but the limit does not exist,
+is different, or can be configured in Alternator:
+
+* DynamoDB limits each BatchWriteItem request to 25 items. In Alternator,
+  this limit defaults to 100 but can be changed with 
+  the `alternator_max_items_in_batch_write` configuration parameter.
+
+* DynamoDB limits the name of tables, GSIs and LSIs, to 255 characters each.
+  In Alternator, the limit is different:
+    * A table's name is limited to 192 characters.
+    * For a GSI, the sum of the length of the table name and the GSI name,
+      plus one, is limited to 222 characters.
+    * For an LSI, the sum of the length of the table name and the LSI name,
+      plus two, is limited to 222 characters.
+  So for example, if you create a table whose name is 192 characters, you
+  can't create a GSI whose name is longer than 29 characters.
 
 ## Experimental API features
 
@@ -264,6 +303,14 @@ experimental:
     instead of just a single MODIFY or INSERT.
     <https://github.com/scylladb/scylla/issues/6930>
     <https://github.com/scylladb/scylla/issues/6918>
+  * In GetRecords responses, Alternator sets `eventSource` to
+    `scylladb:alternator`, rather than `aws:dynamodb`, and doesn't set the
+    `SizeBytes` subfield inside the `dynamodb` field.
+    <https://github.com/scylladb/scylla/issues/6931>
+  * The optional ShardFilter parameter to DescribeStream, added to DynamoDB
+    in July 2025 to optimize shard discovery, is not yet implemented in
+    Alternator.
+    <https://github.com/scylladb/scylla/issues/25160>
 
 ## Unimplemented API features
 
@@ -328,10 +375,8 @@ they should be easy to detect. Here is a list of these unimplemented features:
   another cache in front of the it. We wrote more about this here:
   <https://www.scylladb.com/2017/07/31/database-caches-not-good/>
 
-* The DescribeTable is missing information about creation date and size
-  estimates, and also part of the information about indexes enabled on 
-  the table.
-  <https://github.com/scylladb/scylla/issues/5013>
+* The DescribeTable is missing information about size estimates, and 
+  also part of the information about indexes enabled on the table.
   <https://github.com/scylladb/scylla/issues/5320>
   <https://github.com/scylladb/scylla/issues/7550>
   <https://github.com/scylladb/scylla/issues/7551>

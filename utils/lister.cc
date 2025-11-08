@@ -7,6 +7,7 @@
 #include "utils/assert.hh"
 #include "utils/lister.hh"
 #include "utils/checked-file-impl.hh"
+#include "utils/error_injection.hh"
 
 static seastar::logger llogger("lister");
 
@@ -20,7 +21,11 @@ lister::lister(file f, dir_entry_types type, walker_type walker, filter_type fil
         , _show_hidden(do_show_hidden) {}
 
 future<> lister::visit(directory_entry de) {
-    return guarantee_type(std::move(de)).then([this] (directory_entry de) {
+    return refresh_type(std::move(de)).then([this] (directory_entry de) {
+        // The entry was removed between readdir and stat, just skip it
+        if (!de.type.has_value()) {
+            return make_ready_future<>();
+        }
         // Hide all synthetic directories and hidden files if not requested to show them.
         if ((_expected_type && !_expected_type.contains(*(de.type))) || (!_show_hidden && de.name[0] == '.')) {
             return make_ready_future<>();
@@ -41,16 +46,19 @@ future<> lister::done() {
     });
 }
 
-future<directory_entry> lister::guarantee_type(directory_entry de) {
+future<directory_entry> lister::refresh_type(directory_entry de) {
+    if (utils::get_local_injector().enter("lister_refresh_type")) {
+        de.type.reset();
+        if (de.name == *utils::get_local_injector().inject_parameter<std::string_view>("lister_refresh_type", "unlink_file")) {
+            fs::remove((_dir / de.name).native());
+        }
+    }
+
     if (de.type) {
         return make_ready_future<directory_entry>(std::move(de));
     } else {
         auto f = file_type((_dir / de.name.c_str()).native(), follow_symlink::no);
-        return f.then([dir = _dir, de = std::move(de)] (std::optional<directory_entry_type> t) mutable {
-            // If some FS error occurs - return an exceptional future
-            if (!t) {
-                return make_exception_future<directory_entry>(std::runtime_error(fmt::format("Failed to get {} type.", (dir / de.name.c_str()).native())));
-            }
+        return f.then([de = std::move(de)] (std::optional<directory_entry_type> t) mutable {
             de.type = t;
             return make_ready_future<directory_entry>(std::move(de));
         });
@@ -81,53 +89,54 @@ future<> lister::rmdir(fs::path dir) {
 }
 
 directory_lister::~directory_lister() {
-    if (_lister) {
+    if (_gen) {
         on_internal_error(llogger, "directory_lister not closed when destroyed");
     }
 }
 
 future<std::optional<directory_entry>> directory_lister::get() {
-    if (!_opt_done_fut) {
-        auto dir = co_await open_checked_directory(general_disk_error_handler, _dir.native());
-        auto walker = [this] (fs::path dir, directory_entry de) {
-            return _queue.push_eventually(std::make_optional<directory_entry>(std::move(de)));
-        };
-        SCYLLA_ASSERT(!_lister);
-        _lister = std::make_unique<lister>(std::move(dir), _type, std::move(walker), _filter, _dir, _do_show_hidden);
-        _opt_done_fut = _lister->done().then_wrapped([this] (future<> f) {
-            if (f.failed()) [[unlikely]] {
-                _queue.abort(f.get_exception());
-                return make_ready_future<>();
-            }
-            return _queue.push_eventually(std::nullopt);
-        }).finally([this] {
-            _lister.reset();
-        });
+    if (!_opened) {
+        _opened = co_await open_checked_directory(general_disk_error_handler, _dir.native());
+        _gen.emplace(_opened.experimental_list_directory());
+    }
+    if (!_gen) {
+        co_return coroutine::exception(std::make_exception_ptr(seastar::broken_pipe_exception()));
     }
     std::exception_ptr ex;
     try {
-        auto ret = co_await _queue.pop_eventually();
-        if (ret) {
-            co_return ret;
+        while (auto de = co_await (*_gen)()) {
+            if (!de->type) {
+                de->type = co_await file_type((_dir / de->name).native(), follow_symlink::no);
+                if (!de->type) {
+                    continue;
+                }
+            }
+            if (_type && !_type.contains(de->type.value())) {
+                continue;
+            }
+            if (!_do_show_hidden && de->name[0] == '.') {
+                continue;
+            }
+            if (!_filter(_dir, *de)) {
+                continue;
+            }
+
+            co_return de;
         }
     } catch (...) {
         ex = std::current_exception();
     }
-    co_await close();
+    _gen.reset();
     if (ex) {
+        co_await _opened.close();
         co_return coroutine::exception(std::move(ex));
     }
     co_return std::nullopt;
 }
 
 future<> directory_lister::close() noexcept {
-    if (!_opt_done_fut) {
-        return make_ready_future<>();
+    _gen.reset();
+    if (_opened) {
+        co_await _opened.close();
     }
-    // The queue has to be aborted if the user didn't get()
-    // all entries.
-    _queue.abort(std::make_exception_ptr(broken_pipe_exception()));
-    return std::exchange(_opt_done_fut, std::make_optional<future<>>(make_ready_future<>()))->handle_exception([] (std::exception_ptr) {
-        // ignore all errors
-    });
 }

@@ -5,16 +5,26 @@
 #
 # This file configures pytest for all tests in this directory, and also
 # defines common test fixtures for all of them to use
-import pathlib
+
+from __future__ import annotations
+
+import asyncio
 import ssl
+import tempfile
 import platform
 import urllib.parse
-from functools import partial
-from typing import List, Optional, Dict
+from multiprocessing import Event, Process
+from pathlib import Path
+from typing import TYPE_CHECKING
+from test.pylib.runner import testpy_test_fixture_scope
 from test.pylib.random_tables import RandomTables
 from test.pylib.util import unique_name
-from test.pylib.manager_client import ManagerClient, IPAddress
-from test.pylib.async_cql import event_loop, run_async
+from test.pylib.manager_client import ManagerClient
+from test.pylib.async_cql import run_async
+from test.pylib.scylla_cluster import ScyllaClusterManager, ScyllaVersionDescription, get_scylla_2025_1_description
+from test.pylib.suite.base import get_testpy_test
+from test.pylib.suite.python import add_cql_connection_options
+from test.pylib.encryption_provider import KeyProvider, make_key_provider_factory
 import logging
 import pytest
 from cassandra.auth import PlainTextAuthProvider                         # type: ignore # pylint: disable=no-name-in-module
@@ -27,7 +37,16 @@ from cassandra.policies import TokenAwarePolicy                          # type:
 from cassandra.policies import WhiteListRoundRobinPolicy                 # type: ignore
 from cassandra.connection import DRIVER_NAME       # type: ignore # pylint: disable=no-name-in-module
 from cassandra.connection import DRIVER_VERSION    # type: ignore # pylint: disable=no-name-in-module
-from cassandra.connection import EndPoint          # type: ignore # pylint: disable=no-name-in-module
+from collections.abc import AsyncIterator
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+    from typing import Callable
+
+    from cassandra.connection import EndPoint
+
+    from test.pylib.internal_types import IPAddress
+    from test.pylib.suite.base import Test
 
 
 Session.run_async = run_async     # patch Session for convenience
@@ -39,18 +58,11 @@ print(f"Driver name {DRIVER_NAME}, version {DRIVER_VERSION}")
 
 
 def pytest_addoption(parser):
-    parser.addoption('--manager-api', action='store', required=True,
+    parser.addoption('--manager-api', action='store',
                      help='Manager unix socket path')
-    parser.addoption('--host', action='store', default='localhost',
-                     help='CQL server host to connect to')
-    parser.addoption('--port', action='store', default='9042',
-                     help='CQL server port to connect to')
-    parser.addoption('--ssl', action='store_true',
-                     help='Connect to CQL via an encrypted TLSv1.2 connection')
-    parser.addoption('--auth_username', action='store', default=None,
-                        help='username for authentication')
-    parser.addoption('--auth_password', action='store', default=None,
-                        help='password for authentication')
+    add_cql_connection_options(parser)
+    parser.addoption('--skip-internet-dependent-tests', action='store_true',
+                     help='Skip tests which depend on artifacts from the internet')
     parser.addoption('--artifacts_dir_url', action='store', type=str, default=None, dest='artifacts_dir_url',
                      help='Provide the URL to artifacts directory to generate the link to failed tests directory '
                           'with logs')
@@ -58,7 +70,7 @@ def pytest_addoption(parser):
 
 # This is a constant used in `pytest_runtest_makereport` below to store the full report for the test case
 # in a stash which can then be accessed from fixtures to print the stacktrace for the failed test
-PHASE_REPORT_KEY = pytest.StashKey[Dict[str, pytest.CollectReport]]()
+PHASE_REPORT_KEY = pytest.StashKey[dict[str, pytest.CollectReport]]()
 
 
 @pytest.hookimpl(tryfirst=True, hookwrapper=True)
@@ -90,7 +102,8 @@ class CustomConnection(Cluster.connection_class):
 
 
 # cluster_con helper: set up client object for communicating with the CQL API.
-def cluster_con(hosts: List[IPAddress | EndPoint], port: int, use_ssl: bool, auth_provider=None, load_balancing_policy=RoundRobinPolicy()):
+def cluster_con(hosts: list[IPAddress | EndPoint], port: int = 9042, use_ssl: bool = False, auth_provider=None,
+                load_balancing_policy=RoundRobinPolicy()):
     """Create a CQL Cluster connection object according to configuration.
        It does not .connect() yet."""
     assert len(hosts) > 0, "python driver connection needs at least one host to connect to"
@@ -152,8 +165,40 @@ def cluster_con(hosts: List[IPAddress | EndPoint], port: int, use_ssl: bool, aut
                    )
 
 
-@pytest.fixture(scope="session")
-async def manager_internal(event_loop, request):
+@pytest.fixture(scope=testpy_test_fixture_scope)
+async def manager_api_sock_path(request: pytest.FixtureRequest, testpy_test: Test | None) -> AsyncGenerator[str]:
+    if testpy_test is None:
+        yield request.config.getoption("--manager-api")
+    else:
+        test_uname = testpy_test.uname
+        clusters = testpy_test.suite.clusters
+        base_dir = str(testpy_test.suite.log_dir)
+        sock_path = f"{tempfile.mkdtemp(prefix='manager-', dir='/tmp')}/api"
+
+        start_event = Event()
+        stop_event = Event()
+
+        async def run_manager() -> None:
+            mgr = ScyllaClusterManager(test_uname=test_uname, clusters=clusters, base_dir=base_dir, sock_path=sock_path)
+            await mgr.start()
+            start_event.set()
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, stop_event.wait)
+            finally:
+                await mgr.stop()
+
+        manager_process = Process(target=lambda: asyncio.run(run_manager()))
+        manager_process.start()
+        start_event.wait()
+
+        yield sock_path
+
+        stop_event.set()
+        manager_process.join()
+
+
+@pytest.fixture(scope=testpy_test_fixture_scope)
+async def manager_internal(request: pytest.FixtureRequest, manager_api_sock_path: str) -> Callable[[], ManagerClient]:
     """Session fixture to prepare client object for communicating with the Cluster API.
        Pass the Unix socket path where the Manager server API is listening.
        Pass a function to create driver connections.
@@ -167,26 +212,29 @@ async def manager_internal(event_loop, request):
         auth_provider = PlainTextAuthProvider(username=auth_username, password=auth_password)
     else:
         auth_provider = None
-    manager_int = partial(ManagerClient, request.config.getoption('manager_api'), port, use_ssl, auth_provider, cluster_con)
-    yield manager_int
+    return lambda: ManagerClient(
+        sock_path=manager_api_sock_path,
+        port=port,
+        use_ssl=use_ssl,
+        auth_provider=auth_provider,
+        con_gen=cluster_con,
+    )
 
 
 @pytest.fixture(scope="function")
-async def manager(request, manager_internal, record_property, build_mode):
-    """Per test fixture to notify Manager client object when tests begin so it can
-    perform checks for cluster state.
+async def manager(request: pytest.FixtureRequest,
+                  manager_internal: Callable[[], ManagerClient],
+                  record_property: Callable[[str, object], None],
+                  build_mode: str) -> AsyncGenerator[ManagerClient]:
     """
+    Per test fixture to notify Manager client object when tests begin so it can perform checks for cluster state.
+    """
+    testpy_test = await get_testpy_test(path=request.path, options=request.config.option, mode=build_mode)
     test_case_name = request.node.name
-    run_id = request.config.getoption('run_id')
-    tmp_dir = pathlib.Path(request.config.getoption('tmpdir'))
-    xml_path: pathlib.Path = pathlib.Path(request.config.getoption('xmlpath'))
-    suite_testpy_log = (tmp_dir /
-                        build_mode /
-                        f"{pathlib.Path(xml_path.stem).stem}.log"
-                        )
-    test_log = suite_testpy_log.parent / f"{suite_testpy_log.stem}.{test_case_name}.log"
+    suite_testpy_log = testpy_test.log_filename
+    test_log = suite_testpy_log.parent / f"{Path(suite_testpy_log.stem).stem}.{test_case_name}.log"
     # this should be consistent with scylla_cluster.py handler name in _before_test method
-    test_py_log_test = suite_testpy_log.parent / f"{suite_testpy_log.stem}_{test_case_name}_cluster.log"
+    test_py_log_test = suite_testpy_log.parent / f"{test_log.stem}_cluster.log"
 
     manager_client = manager_internal()  # set up client object in fixture with scope function
     await manager_client.before_test(test_case_name, test_log)
@@ -199,13 +247,13 @@ async def manager(request, manager_internal, record_property, build_mode):
         # Save scylladb logs for failed tests in a separate directory and copy XML report to the same directory to have
         # all related logs in one dir.
         # Then add property to the XML report with the path to the directory, so it can be visible in Jenkins
-        failed_test_dir_path = tmp_dir / build_mode / "failed_test" / f"{test_case_name}"
+        failed_test_dir_path = testpy_test.suite.log_dir / "failed_test" / test_case_name
         failed_test_dir_path.mkdir(parents=True, exist_ok=True)
         await manager_client.gather_related_logs(
             failed_test_dir_path,
             {'pytest.log': test_log, 'test_py.log': test_py_log_test}
         )
-        with open(failed_test_dir_path / f"stacktrace", 'w') as f:
+        with open(failed_test_dir_path / "stacktrace.txt", "w") as f:
             f.write(report.longreprtext)
         if request.config.getoption('artifacts_dir_url') is not None:
             # get the relative path to the tmpdir for the failed directory
@@ -217,7 +265,11 @@ async def manager(request, manager_internal, record_property, build_mode):
     cluster_status = await manager_client.after_test(test_case_name, not failed)
     await manager_client.stop()  # Stop client session and close driver after each test
     if cluster_status["server_broken"]:
-        pytest.fail(f"test case {test_case_name} leave unfinished tasks on Scylla server. Server marked as broken, server_broken_reason: {cluster_status["message"]}")
+        pytest.fail(
+            f"test case {test_case_name} leave unfinished tasks on Scylla server. Server marked as broken,"
+            f" server_broken_reason: {cluster_status["message"]}"
+        )
+
 
 # "cql" fixture: set up client object for communicating with the CQL API.
 # Since connection is managed by manager just return that object
@@ -254,7 +306,7 @@ skipped_funcs = {}
 # The reason to skip a test should be specified, used as a comment only.
 # Additionally, platform_key can be specified to limit the scope of the attribute
 # to the specified platform. Example platform_key-s: [aarch64, x86_64]
-def skip_mode(mode: str, reason: str, platform_key: Optional[str]=None):
+def skip_mode(mode: str, reason: str, platform_key: str | None = None):
     def wrap(func):
         skipped_funcs.setdefault((func, mode), []).append((reason, platform_key))
         return func
@@ -271,3 +323,26 @@ def skip_mode_fixture(request, build_mode):
 async def prepare_3_nodes_cluster(request, manager):
     if request.node.get_closest_marker("prepare_3_nodes_cluster"):
         await manager.servers_add(3)
+
+
+@pytest.fixture(scope="function", autouse=True)
+async def prepare_3_racks_cluster(request, manager):
+    if request.node.get_closest_marker("prepare_3_racks_cluster"):
+        await manager.servers_add(3, auto_rack_dc="dc1")
+
+
+@pytest.fixture(scope="function")
+def internet_dependency_enabled(request) -> None:
+    if request.config.getoption('skip_internet_dependent_tests'):
+        pytest.skip(reason="skip_internet_dependent_tests is set")
+
+
+@pytest.fixture(scope="function")
+async def scylla_2025_1(request, build_mode, internet_dependency_enabled) -> AsyncIterator[ScyllaVersionDescription]:
+    yield await get_scylla_2025_1_description(build_mode)
+
+@pytest.fixture(scope="function", params=list(KeyProvider))
+async def key_provider(request, tmpdir):
+    """Encryption providers fixture"""
+    async with make_key_provider_factory(request.param, tmpdir) as res:
+        yield res

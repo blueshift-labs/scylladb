@@ -25,15 +25,17 @@
 
 import re
 import time
+from bisect import bisect_left
 from contextlib import contextmanager
+from functools import lru_cache
 
 import pytest
 import requests
 from botocore.exceptions import ClientError
 
 from test.alternator.test_manual_requests import get_signed_request
-from test.alternator.util import random_string, new_test_table, is_aws
-
+from test.alternator.test_cql_rbac import new_dynamodb, new_role
+from test.alternator.util import random_string, new_test_table, is_aws, scylla_config_read, scylla_config_temporary
 
 # Fixture for checking if we are able to test Scylla metrics. Scylla metrics
 # are not available on AWS (of course), but may also not be available for
@@ -43,7 +45,7 @@ from test.alternator.util import random_string, new_test_table, is_aws
 # Tests using this fixture may call get_metrics(metrics).
 @pytest.fixture(scope="module")
 def metrics(dynamodb):
-    if dynamodb.meta.client._endpoint.host.endswith('.amazonaws.com'):
+    if is_aws(dynamodb):
         pytest.skip('Scylla-only feature not supported by AWS')
     url = dynamodb.meta.client._endpoint.host
     # The Prometheus API is on port 9180, and always http, not https.
@@ -101,15 +103,22 @@ def check_increases_metric(metrics, metric_names, requested_labels=None):
     yield
     the_metrics = get_metrics(metrics)
     for n in metric_names:
-        assert saved_metrics[n] < get_metric(metrics, n, requested_labels, the_metrics), f'metric {n} did not increase'
+        assert saved_metrics[n] < get_metric(metrics, n, requested_labels, the_metrics), f"Metric '{n}' with labels {requested_labels} did not increase"
 
 @contextmanager
-def check_increases_metric_exact(metrics, metric_name, increase_value):
+def check_increases_metric_exact(metrics, metric_name, value_and_labels):
     the_metrics = get_metrics(metrics)
-    saved_metric = get_metric(metrics, metric_name, None, the_metrics)
+    saved_metric = [get_metric(metrics, metric_name, vl[1], the_metrics) for vl in value_and_labels]
     yield
     the_metrics = get_metrics(metrics)
-    assert get_metric(metrics, metric_name, None, the_metrics) - saved_metric == increase_value, f'metric {metric_name} did not increase at expected value {increase_value}'
+    for (expected_increase, labels), base_value in zip(value_and_labels, saved_metric):
+        actual_increase = get_metric(metrics, metric_name, labels, the_metrics) - base_value
+        assert actual_increase == expected_increase, (
+            f"Metric '{metric_name}' with labels {labels} did not increase by an exact value. "
+            f"Initial value: {base_value}. "
+            f"Expected increase: {expected_increase}. "
+            f"Actual increase: {actual_increase}."
+        )
 
 @contextmanager
 def check_increases_operation(metrics, operation_names, metric_name = 'scylla_alternator_operation', expected_value=None):
@@ -123,12 +132,121 @@ def check_increases_operation(metrics, operation_names, metric_name = 'scylla_al
         else:
             assert saved_metrics[op] < get_metric(metrics, metric_name, {'op': op}, the_metrics)
 
+@contextmanager
+def check_table_increases_operation(metrics, operation_names, table, metric_name = 'scylla_alternator_table_operation', expected_value=None):
+    the_metrics = get_metrics(metrics)
+    saved_metrics = { x: get_metric(metrics, metric_name, {'op': x, 'cf': table}, the_metrics) for x in operation_names }
+    yield
+    the_metrics = get_metrics(metrics)
+    for op in operation_names:
+        if expected_value:
+            assert expected_value == get_metric(metrics, metric_name, {'op': op, 'cf': table}, the_metrics) - saved_metrics[op]
+        else:
+            assert saved_metrics[op] < get_metric(metrics, metric_name, {'op': op, 'cf': table}, the_metrics)
+
+@lru_cache
+def histogram_bucket_offsets(size, ratio=1.2):
+    """
+    Generate bucket offsets for an estimated histogram.
+    
+    Args:
+        size (int): Number of bucket offsets to generate
+        ratio (float): The multiplier for the exponential growth (default is 1.2)
+        
+    Returns:
+        list: List of bucket offset values
+    """
+    if size == 0:
+        return []
+
+    bucket_offsets = [1]
+    last = 1
+    for _ in range(size - 1):
+        current = round(last * ratio)
+        if current == last:
+            current += 1
+        bucket_offsets.append(current)
+        last = current
+    return bucket_offsets
+
+def bucket_idx(size_in_kb, bucket_count=30, ratio=1.2):
+    buckets = histogram_bucket_offsets(bucket_count, ratio)
+    return bisect_left(buckets, size_in_kb)
+
+def bucket(size_in_kb, bucket_count=30, ratio=1.2):
+    buckets = histogram_bucket_offsets(bucket_count, ratio)
+    idx = bucket_idx(size_in_kb, bucket_count, ratio)
+    return str(buckets[idx]) + '.000000' if size_in_kb <= buckets[-1] else '+Inf'
+
+def next_bucket(size_in_kb, bucket_count=30, ratio=1.2):
+    buckets = histogram_bucket_offsets(bucket_count, ratio)
+    idx = bucket_idx(size_in_kb, bucket_count, ratio)
+    return str(buckets[idx + 1]) + '.000000' if idx + 1 < bucket_count else None
+
+def prev_bucket(size_in_kb, bucket_count=30, ratio=1.2):
+    buckets = histogram_bucket_offsets(bucket_count, ratio)
+    idx = bucket_idx(size_in_kb, bucket_count, ratio)
+    return str(buckets[idx - 1]) + '.000000' if idx > 0 else None
+
 ###### Test for metrics that count DynamoDB API operations:
 
 def test_batch_write_item(test_table_s, metrics):
     with check_increases_operation(metrics, ['BatchWriteItem']):
         test_table_s.meta.client.batch_write_item(RequestItems = {
             test_table_s.name: [{'PutRequest': {'Item': {'p': random_string(), 'a': 'hi'}}}]})
+
+def test_table_batch_write_item(test_table_s, metrics):
+    with check_table_increases_operation(metrics, ['BatchWriteItem'], test_table_s.name, expected_value=1):
+        test_table_s.meta.client.batch_write_item(RequestItems = {
+            test_table_s.name: [{'PutRequest': {'Item': {'p': random_string(), 'a': 'hi'}}}]})
+
+def test_batch_write_item_histogram(test_table_s, metrics):
+    with check_increases_metric_exact(metrics, "scylla_alternator_batch_item_count_histogram_bucket", [[0, {'op': 'BatchWriteItem', 'le': '2.000000'}], [1, {'op': 'BatchWriteItem', 'le': '3.000000'}]]):
+        test_table_s.meta.client.batch_write_item(RequestItems = {
+            test_table_s.name: [{'PutRequest': {'Item': {'p': random_string(), 'a': 'hi'}}}, {'PutRequest': {'Item': {'p': random_string(), 'a': 'hi1'}}}, {'PutRequest': {'Item': {'p': random_string(), 'a': 'hi1'}}}]})
+    items = [{'PutRequest': {'Item': {'p': random_string(), 'a': 'hi'}}} for i in range(100)]
+    items2 = [{'PutRequest': {'Item': {'p': random_string(), 'a': 'hi'}}} for i in range(100)]
+    with check_increases_metric_exact(metrics, "scylla_alternator_batch_item_count_histogram_bucket", [[0, {'op': 'BatchWriteItem', 'le': '86.000000'}], [2, {'op': 'BatchWriteItem', 'le': '103.000000'}]]):
+        test_table_s.meta.client.batch_write_item(RequestItems = {
+            test_table_s.name: items})
+        test_table_s.meta.client.batch_write_item(RequestItems = {
+            test_table_s.name: items2})
+
+def test_table_batch_write_item_histogram(test_table_s, metrics):
+    with check_increases_metric_exact(metrics, "scylla_alternator_table_batch_item_count_histogram_bucket", [[0, {'op': 'BatchWriteItem', 'le': '2.000000', 'cf': test_table_s.name}], [1, {'op': 'BatchWriteItem', 'le': '3.000000', 'cf': test_table_s.name}]]):
+        test_table_s.meta.client.batch_write_item(RequestItems = {
+            test_table_s.name: [{'PutRequest': {'Item': {'p': random_string(), 'a': 'hi'}}}, {'PutRequest': {'Item': {'p': random_string(), 'a': 'hi1'}}}, {'PutRequest': {'Item': {'p': random_string(), 'a': 'hi1'}}}]})
+    items = [{'PutRequest': {'Item': {'p': random_string(), 'a': 'hi'}}} for i in range(100)]
+    items2 = [{'PutRequest': {'Item': {'p': random_string(), 'a': 'hi'}}} for i in range(100)]
+    with check_increases_metric_exact(metrics, "scylla_alternator_table_batch_item_count_histogram_bucket", [[0, {'op': 'BatchWriteItem', 'le': '86.000000', 'cf': test_table_s.name}], [2, {'op': 'BatchWriteItem', 'le': '103.000000', 'cf': test_table_s.name}]]):
+        test_table_s.meta.client.batch_write_item(RequestItems = {
+            test_table_s.name: items})
+        test_table_s.meta.client.batch_write_item(RequestItems = {
+            test_table_s.name: items2})
+
+def test_batch_get_item_histogram(test_table_s, metrics):
+    with check_increases_metric_exact(metrics, "scylla_alternator_batch_item_count_histogram_bucket", [[0, {'op': 'BatchWriteItem', 'le': '2.000000'}], [1, {'op': 'BatchGetItem', 'le': '3.000000'}]]):
+        test_table_s.meta.client.batch_get_item(RequestItems = {
+            test_table_s.name: {'Keys': [{'p': random_string()}, {'p': random_string()}, {'p': random_string()}], 'ConsistentRead': True}})
+    keys = [{'p': random_string()} for i in range(100) ]
+    keys2 = [{'p': random_string()} for i in range(100) ]
+    with check_increases_metric_exact(metrics, "scylla_alternator_batch_item_count_histogram_bucket", [[0, {'op': 'BatchGetItem', 'le': '86.000000'}], [2, {'op': 'BatchGetItem', 'le': '103.000000'}]]):
+        test_table_s.meta.client.batch_get_item(RequestItems = {
+            test_table_s.name: {'Keys': keys, 'ConsistentRead': True}})
+        test_table_s.meta.client.batch_get_item(RequestItems = {
+            test_table_s.name: {'Keys': keys2, 'ConsistentRead': True}})
+
+def test_table_batch_get_item_histogram(test_table_s, metrics):
+    with check_increases_metric_exact(metrics, "scylla_alternator_table_batch_item_count_histogram_bucket", [[0, {'op': 'BatchWriteItem', 'le': '2.000000', 'cf': test_table_s.name}], [1, {'op': 'BatchGetItem', 'le': '3.000000', 'cf': test_table_s.name}]]):
+        test_table_s.meta.client.batch_get_item(RequestItems = {
+            test_table_s.name: {'Keys': [{'p': random_string()}, {'p': random_string()}, {'p': random_string()}], 'ConsistentRead': True}})
+    keys = [{'p': random_string()} for i in range(100) ]
+    keys2 = [{'p': random_string()} for i in range(100) ]
+    with check_increases_metric_exact(metrics, "scylla_alternator_table_batch_item_count_histogram_bucket", [[0, {'op': 'BatchGetItem', 'le': '86.000000', 'cf': test_table_s.name}], [2, {'op': 'BatchGetItem', 'le': '103.000000', 'cf': test_table_s.name}]]):
+        test_table_s.meta.client.batch_get_item(RequestItems = {
+            test_table_s.name: {'Keys': keys, 'ConsistentRead': True}})
+        test_table_s.meta.client.batch_get_item(RequestItems = {
+            test_table_s.name: {'Keys': keys2, 'ConsistentRead': True}})
 
 # Reproduces issue #9406:
 def test_batch_get_item(test_table_s, metrics):
@@ -148,7 +266,7 @@ def test_batch_get_item_count(test_table_s, metrics):
 
 KB = 1024
 def test_rcu(test_table_s, metrics):
-    with check_increases_metric_exact(metrics, 'scylla_alternator_rcu_total', 4):
+    with check_increases_metric_exact(metrics, 'scylla_alternator_rcu_total', [[2, None]]):
         p = random_string()
         val = random_string()
         total_length = len(p) + len(val) + len("pattanother")
@@ -158,12 +276,38 @@ def test_rcu(test_table_s, metrics):
         test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
 
 def test_wcu(test_table_s, metrics):
-    with check_increases_operation(metrics, ['PutItem'], 'scylla_alternator_wcu_total', 6):
+    with check_increases_operation(metrics, ['PutItem'], 'scylla_alternator_wcu_total', 3):
         p = random_string()
         val = random_string()
         total_length = len(p) + len(val) + len("pattanother")
         val2 = 'a' * (2 * KB - total_length + 1) # message length 2K + 1
         test_table_s.put_item(Item={'p': p, 'att': val, 'another': val2})
+
+def test_rcu_per_table(test_table_s, metrics):
+    with check_increases_metric_exact(metrics, 'scylla_alternator_table_rcu_total', [[2, {'cf': test_table_s.name}]]):
+        p = random_string()
+        val = random_string()
+        total_length = len(p) + len(val) + len("pattanother")
+        val2 = 'a' * (4 * KB - total_length + 1) # message length 4KB +1
+
+        test_table_s.put_item(Item={'p': p, 'att': val, 'another': val2})
+        test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
+
+def test_wcu_per_table(test_table_s, metrics):
+    with check_table_increases_operation(metrics, ['PutItem'], test_table_s.name, 'scylla_alternator_table_wcu_total', 3):
+        p = random_string()
+        val = random_string()
+        total_length = len(p) + len(val) + len("pattanother")
+        val2 = 'a' * (2 * KB - total_length + 1) # message length 2K + 1
+        test_table_s.put_item(Item={'p': p, 'att': val, 'another': val2})
+
+def test_wcu_batch_write_item(test_table_s, metrics):
+    with check_increases_operation(metrics, ['PutItem'], 'scylla_alternator_wcu_total', 3):
+        p1 = random_string()
+        p2 = random_string()
+        response = test_table_s.meta.client.batch_write_item(RequestItems = {
+            test_table_s.name: [{'PutRequest': {'Item': {'p': p1, 'a': 'hi'}}}, {'PutRequest': {'Item': {'p': p2, 'a': 'a' * KB}}}]
+        })
 
 # Test counters for CreateTable, DescribeTable, UpdateTable and DeleteTable
 def test_table_operations(dynamodb, metrics):
@@ -181,6 +325,15 @@ def test_table_operations(dynamodb, metrics):
 # Test counters for DeleteItem, GetItem, PutItem and UpdateItem:
 def test_item_operations(test_table_s, metrics):
     with check_increases_operation(metrics, ['DeleteItem', 'GetItem', 'PutItem', 'UpdateItem']):
+        p = random_string()
+        test_table_s.put_item(Item={'p': p})
+        test_table_s.get_item(Key={'p': p})
+        test_table_s.delete_item(Key={'p': p})
+        test_table_s.update_item(Key={'p': p})
+
+# Test counters for DeleteItem, GetItem, PutItem and UpdateItem:
+def test_table_item_operations(test_table_s, metrics):
+    with check_table_increases_operation(metrics, ['DeleteItem', 'GetItem', 'PutItem', 'UpdateItem'], test_table_s.name):
         p = random_string()
         test_table_s.put_item(Item={'p': p})
         test_table_s.get_item(Key={'p': p})
@@ -303,7 +456,7 @@ def test_streams_latency(dynamodb, dynamodbstreams, metrics):
     # latency metrics are only updated for *successful* operations so we
     # need to use a real Alternator Stream in this test.
     with new_test_table(dynamodb,
-        # Alternator Streams is expected to fail with tablets due to #16317.
+        # Alternator Streams is expected to fail with tablets due to #23838.
         # To ensure that this test still runs, instead of xfailing it, we
         # temporarily coerce Altenator to avoid using default tablets
         # setting, even if it's available. We do this by using the following
@@ -333,6 +486,305 @@ def test_streams_latency(dynamodb, dynamodbstreams, metrics):
         with check_sets_latency(metrics, ['GetRecords']):
             dynamodbstreams.get_records(ShardIterator=it)
 
+###### Test metrics that are item size histograms of DynamoDB API operations which manipulate data:
+# Tests for histogram metrics operation_size_kb.
+
+INF = float('inf')
+
+def check_histogram_metric_increases(op, name, metrics, do_test, probes):
+    points = [[value, {'op': op, 'le': le}] for value, le in probes]
+    metric_bucket = f'scylla_alternator_table_{name}_bucket'
+    with check_increases_metric_exact(metrics, metric_bucket, points):
+        do_test()
+
+@pytest.mark.parametrize("force_rbw", [True, False])
+def test_get_item_size_not_found_doesnt_increase_the_metric(dynamodb, test_table_s, metrics, force_rbw):
+    with scylla_config_temporary(dynamodb, 'alternator_force_read_before_write', str(force_rbw).lower()):
+        def do_test():
+            test_table_s.get_item(Key={'p': random_string()})
+        check_histogram_metric_increases('GetItem', 'operation_size_kb', metrics, do_test, [(0, bucket(INF))])
+
+@pytest.mark.parametrize("force_rbw", [True, False])
+def test_get_item_size_item_falls_into_appropriate_bucket(dynamodb, test_table_s, metrics, force_rbw):
+    with scylla_config_temporary(dynamodb, 'alternator_force_read_before_write', str(force_rbw).lower()):
+        pk = random_string()
+        test_table_s.put_item(Item={'p': pk, 'a': 'a' * 7 * KB, 'b': 'b' * 10 * KB})
+        def do_test():
+            test_table_s.get_item(Key={'p': pk})
+        check_histogram_metric_increases('GetItem', 'operation_size_kb', metrics, do_test, [(0, bucket(17)), (1, bucket(17.1)), (1, bucket(INF))])
+
+def test_put_item_many_items_fall_into_appropriate_buckets(test_table_s, metrics):
+    def do_test():
+        pk = random_string()
+        test_table_s.put_item(Item={'p': pk, 'a': 'a' * 1 * KB, 'b': 'b' * 5 * KB})
+        test_table_s.put_item(Item={'p': pk, 'a': 'a' * 6 * KB})
+        test_table_s.put_item(Item={'p': pk, 'a': 'a' * 401 * KB})
+    check_histogram_metric_increases('PutItem', 'operation_size_kb', metrics, do_test, [(0, prev_bucket(6.1)), (2, bucket(6.1)), (2, prev_bucket(401.1)), (3, bucket(401.1)), (3, bucket(INF))])
+
+# Verify that only the new item size is counted in the histogram. The WCU is
+# calculated as the maximum of the old and new item sizes, but the histogram
+# should log only the new item size.
+def test_put_item_increases_metrics_for_new_item_size_only(test_table_s, metrics):
+    pk = random_string()
+    points = [[value, {'op': 'PutItem', 'le': le}] for value, le in [(0, prev_bucket(6.1)), (1, bucket(6.1)), (1, bucket(INF))]]
+
+    test_table_s.put_item(Item={'p': pk, 'b': 'b' * 3 * KB})
+    with check_increases_metric_exact(metrics, 'scylla_alternator_table_operation_size_kb_bucket', points):
+        test_table_s.put_item(Item={'p': pk, 'a': 'a' * 6 * KB})
+
+@pytest.mark.parametrize("force_rbw", [True, False])
+def test_delete_item_is_zero_for_nonexistent_item(dynamodb, test_table_s, metrics, force_rbw):
+    with scylla_config_temporary(dynamodb, 'alternator_force_read_before_write', str(force_rbw).lower()):
+        def do_test():
+            test_table_s.delete_item(Key={'p': random_string()})
+        check_histogram_metric_increases('DeleteItem', 'operation_size_kb', metrics, do_test, [(0, bucket(INF))])
+
+@pytest.mark.parametrize("force_rbw", [True, False])
+def test_delete_item_many_items_fall_into_appropriate_buckets(dynamodb, test_table_s, metrics, force_rbw):
+    with scylla_config_temporary(dynamodb, 'alternator_force_read_before_write', str(force_rbw).lower()):
+        if force_rbw:
+            points = [[value, {'op': 'DeleteItem', 'le': le}] for value, le in [(0, prev_bucket(24.1)), (1, bucket(24.1)), (1, prev_bucket(378.1)), (2, bucket(378.1)), (3, bucket(INF))]]
+        else:
+            points = [[0, {'op': 'DeleteItem', 'le': bucket(INF)}]]
+
+        # ~378KB, ~24KB, ~401KB
+        pks = [random_string() for _ in range(3)]
+        test_table_s.put_item(Item={'p': pks[0], 'a': 'a' * 128 * KB, 'b': 'b' * 250 * KB})
+        test_table_s.put_item(Item={'p': pks[1], 'a': 'a' * 24 * KB})
+        test_table_s.put_item(Item={'p': pks[2], 'a': 'a' * 447 * KB})
+        with check_increases_metric_exact(metrics, 'scylla_alternator_table_operation_size_kb_bucket', points):
+            for pk in pks:
+                test_table_s.delete_item(Key={'p': pk})
+
+# The item does not exist, so only the new item size is counted in the histogram.
+@pytest.mark.parametrize("force_rbw", [True, False])
+def test_update_item_single_pk_item(dynamodb, test_table_s, metrics, force_rbw):
+    with scylla_config_temporary(dynamodb, 'alternator_force_read_before_write', str(force_rbw).lower()):
+        def do_test():
+            test_table_s.update_item(Key={'p': random_string()})
+        check_histogram_metric_increases('UpdateItem', 'operation_size_kb', metrics, do_test, [(1, bucket(0.1)), (1, bucket(INF))])
+
+@pytest.mark.xfail(reason="Updates doesn't add up the existing parameters and the new parameters. This issue will be fixed in a next PR.")
+def test_update_item_many_items_fall_into_appropriate_buckets(dynamodb, test_table_s, metrics):
+    with scylla_config_temporary(dynamodb, 'alternator_force_read_before_write', 'true'):
+        pk = random_string()
+        test_table_s.put_item(Item={'p': pk, 'a': 'a'})
+
+        def do_test():
+            # Update 1: item becomes ~216KB
+            test_table_s.update_item(Key={'p': pk}, UpdateExpression="SET b = :b, c = :c", ExpressionAttributeValues={':b': 'b' * 47 * KB, ':c': 'c' * 169 * KB})
+            # Update 2: item becomes ~250KB, 34KB + 216KB = 250KB logged
+            test_table_s.update_item(Key={'p': pk}, UpdateExpression="SET a = :a", ExpressionAttributeValues={':a': 'a' * 34 * KB})
+            # Update 3: item becomes ~550KB, 250KB + 300KB = 550KB logged
+            test_table_s.update_item(Key={'p': pk}, UpdateExpression="SET a = :a", ExpressionAttributeValues={':a': 'a' * 300 * KB})
+        check_histogram_metric_increases('UpdateItem', 'operation_size_kb', metrics, do_test, [(0, prev_bucket(216.1)), (2, bucket(250.1)), (2, prev_bucket(550.1)), (3, bucket(INF))])
+
+# Verify that only the new item size is counted in the histogram if RBW is
+# disabled, and both sizes if it is enabled. The WCU is calculated as the
+# maximum of the old and new item sizes.
+@pytest.mark.xfail(reason="Updates don't consider the larger of the old item size and the new item size. This will be fixed in a next PR.")
+@pytest.mark.parametrize("force_rbw", [True, False])
+def test_update_item_increases_metrics_for_new_item_size_only(dynamodb, test_table_s, metrics, force_rbw):
+    with scylla_config_temporary(dynamodb, 'alternator_force_read_before_write', str(force_rbw).lower()):
+        if force_rbw:
+            points = [(0, prev_bucket(32.1)), (1, bucket(32.1)), (1, bucket(INF))]
+        else:
+            points = [(0, prev_bucket(22.1)), (1, bucket(22.1)), (1, bucket(INF))]
+
+        pk = random_string()
+        test_table_s.put_item(Item={'p': pk, 'a': 'a' * 10 * KB })
+        def do_test():
+            test_table_s.update_item(Key={'p': pk}, UpdateExpression="SET a = :a", ExpressionAttributeValues={':a': 'a' * 22 * KB})
+        check_histogram_metric_increases('UpdateItem', 'operation_size_kb', metrics, do_test, points)
+
+def test_batch_get_item_size_no_items_increases_zero_interval(test_table_s, metrics):
+    def do_test():
+        # An item whose size rounds down to 0 KB shouldn't increase any metric.
+        test_table_s.meta.client.batch_get_item(RequestItems={
+            test_table_s.name: {
+                'Keys': [{'p': random_string()}],
+                'ConsistentRead': True,
+            }
+        })
+    check_histogram_metric_increases('BatchGetItem', 'operation_size_kb', metrics, do_test, [(0, bucket(INF))])
+
+@pytest.mark.parametrize("force_rbw", [True, False])
+def test_batch_get_item_size_256kb_item_falls_into_appropriate_bucket(dynamodb, test_table_s, metrics, force_rbw):
+    with scylla_config_temporary(dynamodb, 'alternator_force_read_before_write', str(force_rbw).lower()):
+        def do_test():
+            pk = random_string()
+            test_table_s.put_item(Item={'p': pk, 'a': 'a' * 256 * KB})
+            test_table_s.meta.client.batch_get_item(RequestItems={
+                test_table_s.name: {
+                    'Keys': [{'p': pk}],
+                    'ConsistentRead': True,
+                }
+            })
+        check_histogram_metric_increases('BatchGetItem', 'operation_size_kb', metrics, do_test, [(0, prev_bucket(256.1)), (1, bucket(256.1)), (1, bucket(INF))])
+
+@pytest.mark.parametrize("force_rbw", [True, False])
+def test_batch_get_item_size_many_items_fall_into_appropriate_buckets(dynamodb, test_table_s, metrics, force_rbw):
+    with scylla_config_temporary(dynamodb, 'alternator_force_read_before_write', str(force_rbw).lower()):
+        def do_test():
+            pk = random_string()
+            pk2 = random_string()
+            pk3 = random_string()
+            test_table_s.put_item(Item={'p': pk, 'a': 'a' * 2 * KB, 'b': 'b' * 8 * KB})
+            test_table_s.put_item(Item={'p': pk3, 'a': 'a' * 7 * KB})
+            test_table_s.meta.client.batch_get_item(RequestItems={
+                test_table_s.name: {
+                    'Keys': [{'p': pk}, {'p': pk2}, {'p': pk3}],
+                    'ConsistentRead': True,
+                }
+            })
+        check_histogram_metric_increases('BatchGetItem', 'operation_size_kb', metrics, do_test, [(0, prev_bucket(7.1)), (1, bucket(7.1)),
+                                                                                                 (1, prev_bucket(10.1)), (2, bucket(10.1)), (2, bucket(INF))])
+
+def test_batch_write_item_many_putitems_falls_into_appropriate_bucket(dynamodb, test_table_s, metrics):
+    with scylla_config_temporary(dynamodb, 'alternator_force_read_before_write', 'true'):
+        def do_test():
+            items = [
+                {'PutRequest': {'Item': {'p': random_string(), 'a': 'a' * 47 * KB, 'b': 'b' * 169 * KB}}},
+                {'PutRequest': {'Item': {'p': random_string(), 'a': 'a' * 80 * KB}}},
+            ]
+            test_table_s.meta.client.batch_write_item(RequestItems={test_table_s.name: items})
+        check_histogram_metric_increases('BatchWriteItem', 'operation_size_kb', metrics, do_test, [(0, prev_bucket(80.1)), (1, bucket(80.1)),
+                                                                                                   (1, prev_bucket(216.1)), (2, bucket(216.1)), (2, bucket(INF))])
+
+def test_batch_write_item_increases_metrics_for_bigger_item_only(dynamodb, test_table_s, metrics):
+    with scylla_config_temporary(dynamodb, 'alternator_force_read_before_write', 'true'):
+        pk = random_string()
+        probes = [[value, {'op': 'BatchWriteItem', 'le': le}] for value, le in [(0, prev_bucket(250.1)), (1, bucket(250.1)), (1, bucket(INF))]]
+        test_table_s.put_item(Item={'p': pk, 'a': 'a', 'b': 'b' * 250 * KB})
+        with check_increases_metric_exact(metrics, 'scylla_alternator_table_operation_size_kb_bucket', probes):
+            test_table_s.meta.client.batch_write_item(RequestItems={
+                test_table_s.name: [{'PutRequest': {'Item': {'p': pk, 'a': 'a' * 128 * KB}}}]
+            })
+
+### Test isolation of operation_size_kb metrics between multiple tables:
+# The tests check if operations on two different tables don't affect each 
+# others' metrics.
+
+def check_table_histogram_metric_increases(op, metrics, do_test, table_name_and_probes):
+    points = [[value, {'op': op, 'le': le, 'cf': table_name}] for table_name in table_name_and_probes for value, le in table_name_and_probes[table_name]]
+    with check_increases_metric_exact(metrics, 'scylla_alternator_table_operation_size_kb_bucket', points):
+        do_test()
+
+def test_get_item_size_separate_tables_track_metrics_independently(test_table_s, test_table_s_2, metrics):
+    # Prepare items in both tables
+    pk_1 = random_string()
+    pk_2 = random_string()
+    test_table_s.put_item(Item={'p': pk_1, 'a': 'a' * 12 * KB})  # 12KB item
+    test_table_s_2.put_item(Item={'p': pk_2, 'a': 'a' * 35 * KB})  # 35KB item
+    
+    def do_test():
+        # Table1: Get 12KB+ item. Should fall in (12.000000, 14.000000] bucket
+        test_table_s.get_item(Key={'p': pk_1})
+        # Table2: Get 35KB+ item. Should fall in (35.000000, 42.000000] bucket
+        test_table_s_2.get_item(Key={'p': pk_2})
+
+    check_table_histogram_metric_increases('GetItem', metrics, do_test, {
+        test_table_s.name: [(0, prev_bucket(12.1)), (1, bucket(12.1)), (1, bucket(INF))],
+        test_table_s_2.name: [(0, prev_bucket(35.1)), (1, bucket(35.1)), (1, bucket(INF))],
+    })
+
+def test_put_item_size_separate_tables_track_metrics_independently(test_table_s, test_table_s_2, metrics):
+    def do_test():
+        # Table1: Put 8KB item. Should fall in (8.000000, 10.000000] bucket
+        pk_1 = random_string()
+        test_table_s.put_item(Item={'p': pk_1, 'a': 'a' * 8 * KB})
+        # Table2: Put 50KB item. Should fall in (50.000000, 60.000000] bucket
+        pk_2 = random_string()
+        test_table_s_2.put_item(Item={'p': pk_2, 'a': 'a' * 50 * KB})
+
+    check_table_histogram_metric_increases('PutItem', metrics, do_test, {
+        test_table_s.name: [(0, prev_bucket(8.1)), (1, bucket(8.1)), (1, bucket(INF))],
+        test_table_s_2.name: [(0, prev_bucket(50.1)), (1, bucket(50.1)), (1, bucket(INF))],
+    })
+
+def test_delete_item_size_separate_tables_track_metrics_independently(dynamodb, test_table_s, test_table_s_2, metrics):
+    with scylla_config_temporary(dynamodb, 'alternator_force_read_before_write', 'true'):
+        # Prepare items in both tables
+        pk_1 = random_string()
+        pk_2 = random_string()
+        test_table_s.put_item(Item={'p': pk_1, 'a': 'a' * 60 * KB})  # 60KB item
+        test_table_s_2.put_item(Item={'p': pk_2, 'a': 'a' * 86 * KB})  # 86KB item
+        
+        def do_test():
+            # Table1: Delete 60KB+ item. Should fall in (60.000000, 72.000000] bucket
+            test_table_s.delete_item(Key={'p': pk_1})
+            # Table2: Delete 86KB item. Should fall in (86.000000, 103.000000] bucket
+            test_table_s_2.delete_item(Key={'p': pk_2})
+
+        check_table_histogram_metric_increases('DeleteItem', metrics, do_test, {
+            test_table_s.name: [(0, prev_bucket(60.1)), (1, bucket(60.1)), (1, bucket(INF))],
+            test_table_s_2.name: [(0, prev_bucket(86.1)), (1, bucket(86.1)), (1, bucket(INF))],
+        })
+
+def test_update_item_size_separate_tables_track_metrics_independently(dynamodb, test_table_s, test_table_s_2, metrics):
+    with scylla_config_temporary(dynamodb, 'alternator_force_read_before_write', 'true'):
+        # Prepare items in both tables
+        pk_1 = random_string()
+        pk_2 = random_string()
+        test_table_s.put_item(Item={'p': pk_1})
+        test_table_s_2.put_item(Item={'p': pk_2})
+        
+        def do_test():
+            # Table1: Update to create 24KB+ item. Should fall in (24.000000, 29.000000] bucket
+            test_table_s.update_item(Key={'p': pk_1}, UpdateExpression="SET a = :a", 
+                                     ExpressionAttributeValues={':a': 'a' * 24 * KB})
+            # Table2: Update to create 72KB+ item. Should fall in (72.000000, 86.000000] bucket
+            test_table_s_2.update_item(Key={'p': pk_2}, UpdateExpression="SET b = :b", 
+                                       ExpressionAttributeValues={':b': 'b' * 72 * KB})
+
+        check_table_histogram_metric_increases('UpdateItem', metrics, do_test, {
+            test_table_s.name: [(0, prev_bucket(24.1)), (1, bucket(24.1)), (1, bucket(INF))],
+            test_table_s_2.name: [(0, prev_bucket(72.1)), (1, bucket(72.1)), (1, bucket(INF))],
+        })
+
+def test_batch_get_item_size_separate_tables_track_metrics_independently(test_table_s, test_table_s_2, metrics):
+    # Prepare items in both tables
+    pk_1 = random_string()
+    pk_2 = random_string()
+    test_table_s.put_item(Item={'p': pk_1, 'a': 'a' * 72 * KB})  # 72KB item
+    test_table_s_2.put_item(Item={'p': pk_2, 'a': 'a' * 86 * KB})  # 86KB item
+    
+    def do_test():
+        # Table1: BatchGet 72KB+ item. Should fall in (72.000000, 86.000000] buckets
+        test_table_s.meta.client.batch_get_item(RequestItems={
+            test_table_s.name: {
+                'Keys': [{'p': pk_1}],
+                'ConsistentRead': True,
+            }
+        })
+        # Table2: BatchGet 86KB item. Should fall in (86.000000, 103.000000] bucket
+        test_table_s_2.meta.client.batch_get_item(RequestItems={
+            test_table_s_2.name: {
+                'Keys': [{'p': pk_2}],
+                'ConsistentRead': True,
+            }
+        })
+
+    check_table_histogram_metric_increases('BatchGetItem', metrics, do_test, {
+        test_table_s.name: [(0, prev_bucket(72.1)), (1, bucket(72.1)), (1, bucket(INF))],
+        test_table_s_2.name: [(0, prev_bucket(86.1)), (1, bucket(86.1)), (1, bucket(INF))],
+    })
+
+def test_batch_write_item_size_separate_tables_track_metrics_independently(dynamodb, test_table_s, test_table_s_2, metrics):
+    with scylla_config_temporary(dynamodb, 'alternator_force_read_before_write', 'true'):
+        def do_test():
+            # Table1: BatchWrite 60KB item. Should fall in (60.000000, 72.000000] bucket
+            items_1 = [{'PutRequest': {'Item': {'p': random_string(), 'a': 'a' * 60 * KB}}}]
+            test_table_s.meta.client.batch_write_item(RequestItems={test_table_s.name: items_1})
+            # Table2: BatchWrite 86KB item. Should fall in (86.000000, 103.000000] bucket
+            items_2 = [{'PutRequest': {'Item': {'p': random_string(), 'a': 'a' * 86 * KB}}}]
+            test_table_s_2.meta.client.batch_write_item(RequestItems={test_table_s_2.name: items_2})
+
+        check_table_histogram_metric_increases('BatchWriteItem', metrics, do_test, {
+            test_table_s.name: [(0, prev_bucket(60.1)), (1, bucket(60.1)), (1, bucket(INF))],
+            test_table_s_2.name: [(0, prev_bucket(86.1)), (1, bucket(86.1)), (1, bucket(INF))],
+        })
+
 ###### Test for other metrics, not counting specific DynamoDB API operations:
 
 # Test that unsupported operations operations increment a counter. Instead
@@ -356,21 +808,17 @@ def test_total_operations(dynamodb, metrics):
 # this configuration does not exist, skip this test. If the configuration
 # isn't low enough (it is more than one second), skip this test unless
 # the "--runveryslow" option is used.
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def alternator_ttl_period_in_seconds(dynamodb, request):
     # If not running on Scylla, skip the test
     if is_aws(dynamodb):
         pytest.skip('Scylla-only test skipped')
     # In Scylla, we can inspect the configuration via a system table
     # (which is also visible in Alternator)
-    config_table = dynamodb.Table('.scylla.alternator.system.config')
-    resp = config_table.query(
-            KeyConditionExpression='#key=:val',
-            ExpressionAttributeNames={'#key': 'name'},
-            ExpressionAttributeValues={':val': 'alternator_ttl_period_in_seconds'})
-    if not 'Items' in resp:
+    period = scylla_config_read(dynamodb, 'alternator_ttl_period_in_seconds')
+    if period is None:
         pytest.skip('missing TTL feature, skipping test')
-    period = float(resp['Items'][0]['value'])
+    period = float(period)
     if period > 1 and not request.config.getoption('runveryslow'):
         pytest.skip('need --runveryslow option to run')
     return period
@@ -413,6 +861,119 @@ def test_ttl_stats(dynamodb, metrics, alternator_ttl_period_in_seconds):
                     break
                 time.sleep(0.1)
             assert not 'Item' in table.get_item(Key={'p': p0})
+
+# The following tests check the authentication and authorization failure
+# counters:
+#  * scylla_alternator_authentication_failures
+#  * scylla_alternator_authorization_failures
+# as well as their interaction with the alternator_enforce_authorization
+# and alternator_warn_authorization configuration options:
+#
+# 1. When alternator_enforce_authorization and alternator_warn_authorization
+#    are both set to "false", these two metrics aren't incremented (and
+#    operations are allowed).
+# 2. When alternator_enforce_authorization is set to false but
+#    alternator_warn_authorization is set to true, the two metrics are
+#    incremented but the operations are still allowed.
+# 3. When alternator_enforce_authorization is set to "true", the two metrics
+#    are incremented and the operations are not allowed.
+#
+# We have several tests here, for several kinds of authentication and
+# authorization errors. These are tests for issue #25308.
+
+@contextmanager
+def scylla_config_auth_temporary(dynamodb, enforce_auth, warn_auth):
+    with scylla_config_temporary(dynamodb, 'alternator_enforce_authorization', 'true' if enforce_auth else 'false'):
+        with scylla_config_temporary(dynamodb, 'alternator_warn_authorization', 'true' if warn_auth else 'false'):
+            yield
+
+# authentication failure 1: bogus username and secret key
+@pytest.mark.parametrize("enforce_auth", [True, False])
+@pytest.mark.parametrize("warn_auth", [True, False])
+def test_authentication_failure_1(dynamodb, metrics, test_table_s, enforce_auth, warn_auth):
+    with scylla_config_auth_temporary(dynamodb, enforce_auth, warn_auth):
+        with new_dynamodb(dynamodb, 'bogus_username', 'bogus_secret_key') as d:
+            # We don't expect get_item() to find any item, we just care if
+            # to see if it experiences an authentication failure, and if
+            # it increments the authentication failure metric.
+            saved_auth_failures = get_metric(metrics, 'scylla_alternator_authentication_failures')
+            tab = d.Table(test_table_s.name)
+            try:
+                tab.get_item(Key={'p': 'dog'})
+                operation_succeeded = True
+            except ClientError as e:
+                assert 'UnrecognizedClientException' in str(e)
+                operation_succeeded = False
+            if enforce_auth:
+                assert not operation_succeeded
+            else:
+                assert operation_succeeded
+            new_auth_failures = get_metric(metrics, 'scylla_alternator_authentication_failures')
+            if warn_auth or enforce_auth:
+                # If Alternator has any reason to check the authentication
+                # headers (i.e., either warn_auth or enforce_auth is enabled)
+                # then it will count the errors.
+                assert new_auth_failures == saved_auth_failures + 1
+            else:
+                # If Alternator has no reason to check the authentication
+                # headers (i.e., both warn_auth and enforce_auth are off)
+                # it won't check - and won't find or count auth errors.
+                assert new_auth_failures == saved_auth_failures
+
+# authentication failure 2: real username, wrong secret key
+# Unfortunately, tests that create a new role need to use CQL too.
+@pytest.mark.parametrize("enforce_auth", [True, False])
+@pytest.mark.parametrize("warn_auth", [True, False])
+def test_authentication_failure_2(dynamodb, cql, metrics, test_table_s, enforce_auth, warn_auth):
+    with scylla_config_auth_temporary(dynamodb, enforce_auth, warn_auth):
+        with new_role(cql) as (role, key):
+            with new_dynamodb(dynamodb, role, 'bogus_secret_key') as d:
+                saved_auth_failures = get_metric(metrics, 'scylla_alternator_authentication_failures')
+                tab = d.Table(test_table_s.name)
+                try:
+                    tab.get_item(Key={'p': 'dog'})
+                    operation_succeeded = True
+                except ClientError as e:
+                    assert 'UnrecognizedClientException' in str(e)
+                    operation_succeeded = False
+                if enforce_auth:
+                    assert not operation_succeeded
+                else:
+                    assert operation_succeeded
+                new_auth_failures = get_metric(metrics, 'scylla_alternator_authentication_failures')
+                if enforce_auth or warn_auth:
+                    assert new_auth_failures == saved_auth_failures + 1
+                else:
+                    assert new_auth_failures == saved_auth_failures
+
+# Authorization failure - a valid user but without permissions to do a
+# given operation.
+@pytest.mark.parametrize("enforce_auth", [True, False])
+@pytest.mark.parametrize("warn_auth", [True, False])
+def test_authorization_failure(dynamodb, cql, metrics, test_table_s, enforce_auth, warn_auth):
+    with scylla_config_auth_temporary(dynamodb, enforce_auth, warn_auth):
+        with new_role(cql) as (role, key):
+            with new_dynamodb(dynamodb, role, key) as d:
+                saved_auth_failures = get_metric(metrics, 'scylla_alternator_authorization_failures')
+                tab = d.Table(test_table_s.name)
+                try:
+                    # Note that the new role is not a superuser, so should
+                    # not have permissions to read from this table created
+                    # earlier by the superuser.
+                    tab.get_item(Key={'p': 'dog'})
+                    operation_succeeded = True
+                except ClientError as e:
+                    assert 'AccessDeniedException' in str(e)
+                    operation_succeeded = False
+                if enforce_auth:
+                    assert not operation_succeeded
+                else:
+                    assert operation_succeeded
+                new_auth_failures = get_metric(metrics, 'scylla_alternator_authorization_failures')
+                if enforce_auth or warn_auth:
+                    assert new_auth_failures == saved_auth_failures + 1
+                else:
+                    assert new_auth_failures == saved_auth_failures
 
 # TODO: there are additional metrics which we don't yet test here. At the
 # time of this writing they are:

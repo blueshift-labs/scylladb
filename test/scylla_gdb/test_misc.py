@@ -187,6 +187,11 @@ def coro_task(gdb, scylla_gdb):
         name = scylla_gdb.resolve(vtable_addr)
         if name and '.resume' in name.strip():
             gdb.write(f'{name}\n')
+    # This test fails sometimes, but rarely and unreliably.
+    # We want to get a coredump from it the next time it fails.
+    # Sending a SIGSEGV should induce that.
+    # https://github.com/scylladb/scylladb/issues/22501
+    gdb.execute("signal SIGSEGV")
     raise gdb.error("No coroutine frames found with expected name")
 
 def test_coro_frame(gdb, coro_task):
@@ -206,6 +211,9 @@ def test_read_stats(gdb, sstable):
 
 def test_get_config_value(gdb):
     scylla(gdb, f'get-config-value compaction_static_shares')
+
+def test_prepared_statements(gdb):
+    scylla(gdb, f'prepared-statements')
 
 @pytest.mark.without_scylla
 def test_run_without_scylla(scylla_gdb):

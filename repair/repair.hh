@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <stdexcept>
 #include <unordered_map>
 #include <exception>
 #include <fmt/core.h>
@@ -26,6 +27,10 @@
 #include "repair/sync_boundary.hh"
 #include "tasks/types.hh"
 #include "gms/gossip_address_map.hh"
+
+struct tablets_unsupported : std::runtime_error {
+    tablets_unsupported() : std::runtime_error("tablets are not supported for this operation") {}
+};
 
 namespace tasks {
 namespace repair {
@@ -48,6 +53,8 @@ namespace service {
 class migration_manager;
 }
 namespace gms { class gossiper; }
+
+namespace locator { enum class tablet_repair_incremental_mode : uint8_t; }
 
 class repair_exception : public std::exception {
 private:
@@ -91,6 +98,7 @@ constexpr shard_id repair_unspecified_shard = shard_id(-1);
 // repair_get_status(). The returned future<int> becomes available quickly,
 // as soon as repair_get_status() can be used - it doesn't wait for the
 // repair to complete.
+// repair_start() repairs only vnode keyspaces.
 future<int> repair_start(seastar::sharded<repair_service>& repair, sharded<gms::gossip_address_map>& am,
         sstring keyspace, std::unordered_map<sstring, sstring> options);
 
@@ -189,21 +197,34 @@ struct node_repair_meta_id {
 // Represent a partition_key and frozen_mutation_fragments within the partition_key.
 class partition_key_and_mutation_fragments {
     partition_key _key;
-    std::list<frozen_mutation_fragment> _mfs;
+    utils::chunked_vector<frozen_mutation_fragment> _mfs;
+    // When this is set to true, the receiver should use the last partition_key
+    // sent by the sender and the partition_key _key will be an empty partition
+    // key. This is used as an optimization to avoid sending the same
+    // partition_key more than once.
+    bool _use_last_partition_key = false;
 public:
     partition_key_and_mutation_fragments()
         : _key(std::vector<bytes>() ) {
     }
-    partition_key_and_mutation_fragments(partition_key key, std::list<frozen_mutation_fragment> mfs)
+    partition_key_and_mutation_fragments(partition_key key, utils::chunked_vector<frozen_mutation_fragment> mfs, bool use_last_partition_key)
         : _key(std::move(key))
-        , _mfs(std::move(mfs)) {
+        , _mfs(std::move(mfs))
+        , _use_last_partition_key(use_last_partition_key) {
+    }
+    partition_key_and_mutation_fragments(utils::chunked_vector<frozen_mutation_fragment> mfs)
+        : partition_key_and_mutation_fragments(partition_key::make_empty(), std::move(mfs), true) {
+    }
+    partition_key_and_mutation_fragments(partition_key key, utils::chunked_vector<frozen_mutation_fragment> mfs)
+        : partition_key_and_mutation_fragments(std::move(key), std::move(mfs), false) {
     }
     const partition_key& get_key() const { return _key; }
-    const std::list<frozen_mutation_fragment>& get_mutation_fragments() const { return _mfs; }
+    const utils::chunked_vector<frozen_mutation_fragment>& get_mutation_fragments() const { return _mfs; }
     partition_key& get_key() { return _key; }
-    std::list<frozen_mutation_fragment>& get_mutation_fragments() { return _mfs; }
+    utils::chunked_vector<frozen_mutation_fragment>& get_mutation_fragments() { return _mfs; }
     void push_mutation_fragment(frozen_mutation_fragment mf) { _mfs.push_back(std::move(mf)); }
     future<> clear_gently() { return utils::clear_gently(_mfs); };
+    bool use_last_partition_key() const { return _use_last_partition_key; }
 };
 
 using repair_row_on_wire = partition_key_and_mutation_fragments;
@@ -269,6 +290,12 @@ struct tablet_repair_task_meta {
     repair_neighbors neighbors;
     locator::tablet_replica_set replicas;
     locator::effective_replication_map_ptr erm;
+};
+
+struct tablet_repair_sched_info {
+    bool sched_by_scheduler = false;
+    bool for_tablet_rebuild = false;
+    locator::tablet_repair_incremental_mode incremental_mode;
 };
 
 namespace std {

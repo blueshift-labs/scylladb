@@ -137,14 +137,6 @@ future<> unset_load_meter(http_context& ctx) {
     return ctx.http_server.set_routes([&ctx] (routes& r) { unset_load_meter(ctx, r); });
 }
 
-future<> set_format_selector(http_context& ctx, db::sstables_format_selector& sel) {
-    return ctx.http_server.set_routes([&ctx, &sel] (routes& r) { set_format_selector(ctx, r, sel); });
-}
-
-future<> unset_format_selector(http_context& ctx) {
-    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_format_selector(ctx, r); });
-}
-
 future<> set_server_sstables_loader(http_context& ctx, sharded<sstables_loader>& sst_loader) {
     return ctx.http_server.set_routes([&ctx, &sst_loader] (routes& r) { set_sstables_loader(ctx, r, sst_loader); });
 }
@@ -224,15 +216,22 @@ future<> unset_server_gossip(http_context& ctx) {
     });
 }
 
-future<> set_server_column_family(http_context& ctx, sharded<db::system_keyspace>& sys_ks) {
-    return register_api(ctx, "column_family",
-                "The column family API", [&sys_ks] (http_context& ctx, routes& r) {
-                    set_column_family(ctx, r, sys_ks);
+future<> set_server_column_family(http_context& ctx, sharded<replica::database>& db) {
+    co_await register_api(ctx, "column_family",
+                "The column family API", [&db] (http_context& ctx, routes& r) {
+                    set_column_family(ctx, r, db);
+                });
+    co_await register_api(ctx, "cache_service",
+            "The cache service API", [&db] (http_context& ctx, routes& r) {
+                    set_cache_service(ctx, db, r);
                 });
 }
 
 future<> unset_server_column_family(http_context& ctx) {
-    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_column_family(ctx, r); });
+    return ctx.http_server.set_routes([&ctx] (routes& r) {
+        unset_column_family(ctx, r);
+        unset_cache_service(ctx, r);
+    });
 }
 
 future<> set_server_messaging_service(http_context& ctx, sharded<netw::messaging_service>& ms) {
@@ -264,15 +263,6 @@ future<> unset_server_stream_manager(http_context& ctx) {
     return ctx.http_server.set_routes([&ctx] (routes& r) { unset_stream_manager(ctx, r); });
 }
 
-future<> set_server_cache(http_context& ctx) {
-    return register_api(ctx, "cache_service",
-            "The cache service API", set_cache_service);
-}
-
-future<> unset_server_cache(http_context& ctx) {
-    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_cache_service(ctx, r); });
-}
-
 future<> set_hinted_handoff(http_context& ctx, sharded<service::storage_proxy>& proxy, sharded<gms::gossiper>& g) {
     return register_api(ctx, "hinted_handoff",
                 "The hinted handoff API", [&proxy, &g] (http_context& ctx, routes& r) {
@@ -284,7 +274,7 @@ future<> unset_hinted_handoff(http_context& ctx) {
     return ctx.http_server.set_routes([&ctx] (routes& r) { unset_hinted_handoff(ctx, r); });
 }
 
-future<> set_server_compaction_manager(http_context& ctx, sharded<compaction_manager>& cm) {
+future<> set_server_compaction_manager(http_context& ctx, sharded<compaction::compaction_manager>& cm) {
     return register_api(ctx, "compaction_manager", "The Compaction manager API", [&cm] (http_context& ctx, routes& r) {
         set_compaction_manager(ctx, r, cm);
     });
@@ -389,33 +379,6 @@ future<> set_server_raft(http_context& ctx, sharded<service::raft_group_registry
 
 future<> unset_server_raft(http_context& ctx) {
     return ctx.http_server.set_routes([&ctx] (routes& r) { unset_raft(ctx, r); });
-}
-
-void req_params::process(const request& req) {
-    // Process mandatory parameters
-    for (auto& [name, ent] : params) {
-        if (!ent.is_mandatory) {
-            continue;
-        }
-        try {
-            ent.value = req.get_path_param(name);
-        } catch (std::out_of_range&) {
-            throw httpd::bad_param_exception(fmt::format("Mandatory parameter '{}' was not provided", name));
-        }
-    }
-
-    // Process optional parameters
-    for (auto& [name, value] : req.query_parameters) {
-        try {
-            auto& ent = params.at(name);
-            if (ent.is_mandatory) {
-                throw httpd::bad_param_exception(fmt::format("Parameter '{}' is expected to be provided as part of the request url", name));
-            }
-            ent.value = value;
-        } catch (std::out_of_range&) {
-            throw httpd::bad_param_exception(fmt::format("Unsupported optional parameter '{}'", name));
-        }
-    }
 }
 
 }

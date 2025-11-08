@@ -17,7 +17,7 @@ import pytest
 import boto3
 from botocore.exceptions import ClientError
 
-from .util import new_test_table
+from .util import new_test_table, wait_for_gsi, random_string, full_scan, full_query, multiset
 
 # All tests in this file are scylla-only
 @pytest.fixture(scope="function", autouse=True)
@@ -84,21 +84,9 @@ def test_initial_tablets_number(dynamodb):
     with new_test_table(dynamodb, **schema) as table:
         assert not uses_tablets(dynamodb, table)
 
-# Before Alternator TTL is supported with tablets (#16567), let's verify
-# that enabling TTL results in an orderly error. This test should be deleted
-# when #16567 is fixed.
-def test_ttl_enable_error_with_tablets(dynamodb):
-    with new_test_table(dynamodb,
-        Tags=[{'Key': initial_tablets_tag, 'Value': '4'}],
-        KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, ],
-        AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' } ]) as table:
-        with pytest.raises(ClientError, match='ValidationException.*tablets'):
-            table.meta.client.update_time_to_live(TableName=table.name,
-                TimeToLiveSpecification={'AttributeName': 'expiration', 'Enabled': True})
-
-# Before Alternator Streams is supported with tablets (#16317), let's verify
+# Before Alternator Streams is supported with tablets (#23838), let's verify
 # that enabling Streams results in an orderly error. This test should be
-# deleted when #16317 is fixed.
+# deleted when #23838 is fixed.
 def test_streams_enable_error_with_tablets(dynamodb):
     # Test attempting to create a table already with streams
     with pytest.raises(ClientError, match='ValidationException.*tablets'):
@@ -116,11 +104,10 @@ def test_streams_enable_error_with_tablets(dynamodb):
         with pytest.raises(ClientError, match='ValidationException.*tablets'):
             table.update(StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'KEYS_ONLY'});
 
-# Currently, LWT is not supported for tablets because of known bugs
-# (see #18068). We still allow creating an Alternator table with
-# tablets and using LWT for write isolation (always_use_lwt),
-# but the writes themselves will fail. When #18068 is fixed, this
-# test should be fixed to expect success - not failure.
+# For a while (see #18068) it was possible to create an Alternator table with
+# tablets enabled and choose LWT for write isolation (always_use_lwt)
+# but the writes themselves failed. This test verifies that this is no longer
+# the case, and the LWT writes succeed even when tables are used.
 def test_alternator_tablets_and_lwt(dynamodb):
     schema = {
         'Tags': [
@@ -130,10 +117,9 @@ def test_alternator_tablets_and_lwt(dynamodb):
         'AttributeDefinitions': [ { 'AttributeName': 'p', 'AttributeType': 'S' }]}
     with new_test_table(dynamodb, **schema) as table:
         assert uses_tablets(dynamodb, table)
-        # This put_item should pass after #18068 is fixed:
-        with pytest.raises(ClientError, match="InternalServerError"):
-            table.put_item(Item={'p': 'hello'})
-            assert table.get_item(Key={'p': 'hello'})['Item'] == {'p': 'hello'}
+        # This put_item() failed before #18068 was fixed:
+        table.put_item(Item={'p': 'hello'})
+        assert table.get_item(Key={'p': 'hello'}, ConsistentRead=True)['Item'] == {'p': 'hello'}
 
 # An Alternator table created tablets and with a write isolation
 # mode that doesn't use LWT ("forbid_rmw") works normally, even
@@ -149,3 +135,101 @@ def test_alternator_tablets_without_lwt(dynamodb):
         assert uses_tablets(dynamodb, table)
         table.put_item(Item={'p': 'hello'})
         assert table.get_item(Key={'p': 'hello'})['Item'] == {'p': 'hello'}
+
+# Reproduces scylladb/scylladb#26615
+def test_gsi_with_tablets(dynamodb):
+    schema = {
+        'Tags': [{'Key': initial_tablets_tag, 'Value': '4'}],
+        'KeySchema': [ { 'AttributeName': 'p', 'KeyType': 'HASH' },
+                    { 'AttributeName': 'c', 'KeyType': 'RANGE' }
+        ],
+        'AttributeDefinitions': [
+                    { 'AttributeName': 'p', 'AttributeType': 'S' },
+                    { 'AttributeName': 'c', 'AttributeType': 'S' },
+        ],
+        'GlobalSecondaryIndexes': [
+            {   'IndexName': 'hello',
+                'KeySchema': [
+                    { 'AttributeName': 'c', 'KeyType': 'HASH' },
+                    { 'AttributeName': 'p', 'KeyType': 'RANGE' },
+                ],
+                'Projection': { 'ProjectionType': 'ALL' }
+            }
+        ],
+    }
+    with new_test_table(dynamodb, **schema) as table:
+        desc = table.meta.client.describe_table(TableName=table.name)
+        table_status = desc['Table']['TableStatus']
+        assert table_status == 'ACTIVE'
+
+        index_desc = [x for x in desc['Table']['GlobalSecondaryIndexes'] if x['IndexName'] == 'hello']
+        assert len(index_desc) == 1
+        index_status = index_desc[0]['IndexStatus']
+        assert index_status == 'ACTIVE'
+
+        # When the index is ACTIVE, this must be after backfilling completed
+        assert not 'Backfilling' in index_desc[0]
+
+# This test is copy of alternator/test_gsi_backfill.py::test_gsi_backfill but with enabled tablets.
+def test_gsi_backfill_with_tablets(dynamodb):
+    # First create, and fill, a table without GSI. The items in items1
+    # will have the appropriate string type for 'x' and will later get
+    # indexed. Items in item2 have no value for 'x', and in items in
+    # items3 'x' is not a string; So the items in items2 and items3
+    # will be missing in the index that we'll create later.
+    with new_test_table(dynamodb,
+        Tags=[{'Key': initial_tablets_tag, 'Value': '4'}],
+        KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' } ],
+        AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' } ]) as table:
+        items1 = [{'p': random_string(), 'x': random_string(), 'y': random_string()} for i in range(10)]
+        items2 = [{'p': random_string(), 'y': random_string()} for i in range(10)]
+        items3 = [{'p': random_string(), 'x': i} for i in range(10)]
+        items = items1 + items2 + items3
+        with table.batch_writer() as batch:
+            for item in items:
+                batch.put_item(item)
+        assert multiset(items) == multiset(full_scan(table))
+        # Now use UpdateTable to create the GSI
+        dynamodb.meta.client.update_table(TableName=table.name,
+            AttributeDefinitions=[{ 'AttributeName': 'x', 'AttributeType': 'S' }],
+            GlobalSecondaryIndexUpdates=[ {  'Create':
+                {  'IndexName': 'hello',
+                    'KeySchema': [{ 'AttributeName': 'x', 'KeyType': 'HASH' }],
+                    'Projection': { 'ProjectionType': 'ALL' }
+                }}])
+        # update_table is an asynchronous operation. We need to wait until it
+        # finishes and the table is backfilled.
+        wait_for_gsi(table, 'hello')
+        # As explained above, only items in items1 got copied to the gsi,
+        # so this is what a full table scan on the GSI 'hello' should return.
+        # Note that we don't need to retry the reads here (i.e., use the
+        # assert_index_scan() function) because after we waited for
+        # backfilling to complete, we know all the pre-existing data is
+        # already in the index.
+        assert multiset(items1) == multiset(full_scan(table, ConsistentRead=False, IndexName='hello'))
+        # We can also use Query on the new GSI, to search on the attribute x:
+        assert multiset([items1[3]]) == multiset(full_query(table,
+            ConsistentRead=False, IndexName='hello',
+            KeyConditions={'x': {'AttributeValueList': [items1[3]['x']], 'ComparisonOperator': 'EQ'}}))
+        # Because the GSI now exists, we are no longer allowed to add to the
+        # base table items with a wrong type for x (like we were able to add
+        # earlier - see items3). But if x is missing (as in items2), we
+        # *are* allowed to add the item and it appears in the base table
+        # (but the view table doesn't change).
+        p = random_string()
+        y = random_string()
+        table.put_item(Item={'p': p, 'y': y})
+        assert table.get_item(Key={'p':  p}, ConsistentRead=True)['Item'] == {'p': p, 'y': y}
+        with pytest.raises(ClientError, match='ValidationException.*mismatch'):
+            table.put_item(Item={'p': random_string(), 'x': 3})
+
+        # Let's also test that we cannot add another index with the same name
+        # that already exists
+        with pytest.raises(ClientError, match='ValidationException.*already exists'):
+            dynamodb.meta.client.update_table(TableName=table.name,
+                AttributeDefinitions=[{ 'AttributeName': 'y', 'AttributeType': 'S' }],
+                GlobalSecondaryIndexUpdates=[ {  'Create':
+                    {  'IndexName': 'hello',
+                        'KeySchema': [{ 'AttributeName': 'y', 'KeyType': 'HASH' }],
+                        'Projection': { 'ProjectionType': 'ALL' }
+                    }}])

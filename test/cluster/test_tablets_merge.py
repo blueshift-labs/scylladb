@@ -7,7 +7,7 @@
 from test.pylib.internal_types import ServerInfo
 from test.pylib.manager_client import ManagerClient
 from test.pylib.rest_client import inject_error_one_shot, read_barrier
-from test.pylib.tablets import get_all_tablet_replicas
+from test.pylib.tablets import get_tablet_replica, get_all_tablet_replicas, get_tablet_count
 from test.pylib.util import wait_for
 from test.cluster.conftest import skip_mode
 from test.cluster.util import new_test_keyspace, create_new_test_keyspace
@@ -34,18 +34,6 @@ async def disable_injection_on(manager, error_name, servers):
     await asyncio.gather(*errs)
 
 
-async def get_tablet_count(manager: ManagerClient, server: ServerInfo, keyspace_name: str, table_name: str):
-    host = manager.cql.cluster.metadata.get_host(server.ip_addr)
-
-    # read_barrier is needed to ensure that local tablet metadata on the queried node
-    # reflects the finalized tablet movement.
-    await read_barrier(manager.api, server.ip_addr)
-
-    table_id = await manager.get_table_id(keyspace_name, table_name)
-    rows = await manager.cql.run_async(f"SELECT tablet_count FROM system.tablets where "
-                                       f"table_id = {table_id}", host=host)
-    return rows[0].tablet_count
-
 @pytest.mark.asyncio
 @skip_mode('release', 'error injections are not supported in release mode')
 async def test_tablet_merge_simple(manager: ManagerClient):
@@ -57,7 +45,7 @@ async def test_tablet_merge_simple(manager: ManagerClient):
         '--target-tablet-size-in-bytes', '30000',
     ]
     servers = [await manager.server_add(config={
-        'error_injections_at_startup': ['short_tablet_stats_refresh_interval']
+        'tablet_load_stats_refresh_interval_in_seconds': 1
     }, cmdline=cmdline)]
 
     await manager.api.disable_tablet_balancing(servers[0].ip_addr)
@@ -203,7 +191,7 @@ async def test_tablet_split_and_merge_with_concurrent_topology_changes(manager: 
         '--target-tablet-size-in-bytes', '30000',
     ]
     config = {
-        'error_injections_at_startup': ['short_tablet_stats_refresh_interval']
+        'tablet_load_stats_refresh_interval_in_seconds': 1
     }
     servers = [await manager.server_add(config=config, cmdline=cmdline),
                await manager.server_add(config=config, cmdline=cmdline),
@@ -340,8 +328,7 @@ async def test_tablet_split_and_merge_with_concurrent_topology_changes(manager: 
 @skip_mode('release', 'error injections are not supported in release mode')
 async def test_tablet_merge_cross_rack_migrations(manager: ManagerClient, racks):
     cmdline = ['--target-tablet-size-in-bytes', '30000',]
-    config = {'error_injections_at_startup': ['short_tablet_stats_refresh_interval']}
-
+    config = {'tablet_load_stats_refresh_interval_in_seconds': 1}
     servers = []
     rf = racks
     for rack_id in range(0, racks):
@@ -387,3 +374,278 @@ async def test_tablet_merge_cross_rack_migrations(manager: ManagerClient, racks)
         tablet_count = await get_tablet_count(manager, servers[0], ks, 'test')
         return tablet_count < old_tablet_count or None
     await wait_for(finished_merging, time.time() + 120)
+
+# Reproduces #23284
+@pytest.mark.asyncio
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_tablet_split_merge_with_many_tables(build_mode: str, manager: ManagerClient, racks = 2):
+    cmdline = ['--smp', '4', '-m', '2G', '--target-tablet-size-in-bytes', '30000', '--max-task-backlog', '200',]
+    config = {'tablet_load_stats_refresh_interval_in_seconds': 1}
+
+    servers = []
+    rf = racks
+    for rack_id in range(0, racks):
+        rack = f'rack{rack_id+1}'
+        servers.extend(await manager.servers_add(3, config=config, cmdline=cmdline, property_file={'dc': 'mydc', 'rack': rack}))
+
+    cql = manager.get_cql()
+    ks = await create_new_test_keyspace(cql, f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': {rf}}} AND tablets = {{'initial': 1}}")
+    await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c blob) WITH compression = {{'sstable_compression': ''}};")
+    num_tables = 200 if build_mode != 'debug' else 20
+    await asyncio.gather(*[cql.run_async(f"CREATE TABLE {ks}.test{i} (pk int PRIMARY KEY, c blob);") for i in range(1, num_tables)])
+
+    async def check_logs(when):
+        for server in servers:
+            log = await manager.server_open_log(server.server_id)
+            matches = await log.grep("Too long queue accumulated for gossip")
+            if matches:
+                pytest.fail(f"Server {server.server_id} has too long queue accumulated for gossip {when}: {matches=}")
+
+    await check_logs("after creating tables")
+
+    total_keys = 400
+    keys = range(total_keys)
+    insert = cql.prepare(f"INSERT INTO {ks}.test(pk, c) VALUES(?, ?)")
+    for pk in keys:
+        value = random.randbytes(2000)
+        cql.execute(insert, [pk, value])
+
+    for server in servers:
+        await manager.api.flush_keyspace(server.ip_addr, ks)
+
+    async def finished_splitting():
+        # FIXME: fragile since it's expecting on-disk size will be enough to produce a few splits.
+        #   (raw_data=800k / target_size=30k) = ~26, lower power-of-two is 16. Compression was disabled.
+        #   Per-table hints (min_tablet_count) can be used to improve this.
+        tablet_count = await get_tablet_count(manager, servers[0], ks, 'test')
+        return tablet_count >= 16 or None
+    # Give enough time for split to happen in debug mode
+    await wait_for(finished_splitting, time.time() + 120)
+
+    await check_logs("after split completion")
+
+    delete_keys = range(total_keys - 1)
+    await asyncio.gather(*[cql.run_async(f"DELETE FROM {ks}.test WHERE pk={k};") for k in delete_keys])
+    keys = range(total_keys - 1, total_keys)
+
+    old_tablet_count = await get_tablet_count(manager, servers[0], ks, 'test')
+
+    for server in servers:
+        await manager.api.flush_keyspace(server.ip_addr, ks)
+        await manager.api.keyspace_compaction(server.ip_addr, ks)
+
+    async def finished_merging():
+        tablet_count = await get_tablet_count(manager, servers[0], ks, 'test')
+        return tablet_count < old_tablet_count or None
+    await wait_for(finished_merging, time.time() + 120)
+
+    await check_logs("after merge completion")
+
+# Reproduces use-after-free when migration right after merge, but concurrently to background
+# merge completion handler.
+# See: https://github.com/scylladb/scylladb/issues/24045
+@pytest.mark.asyncio
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_migration_running_concurrently_to_merge_completion_handling(manager: ManagerClient):
+    cmdline = []
+    cfg = {}
+    servers = [await manager.server_add(cmdline=cmdline, config=cfg)]
+
+    await manager.api.disable_tablet_balancing(servers[0].ip_addr)
+
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 2}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
+
+        tablet_count = await get_tablet_count(manager, servers[0], ks, 'test')
+        assert tablet_count == 2
+
+        old_tablet_count = tablet_count
+
+        keys = range(100)
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});") for k in keys])
+
+        await cql.run_async(f"ALTER KEYSPACE {ks} WITH tablets = {{'initial': 1}};")
+
+        s0_log = await manager.server_open_log(servers[0].server_id)
+        s0_mark = await s0_log.mark()
+
+        await manager.api.enable_injection(servers[0].ip_addr, "merge_completion_fiber", one_shot=True)
+        await manager.api.enable_injection(servers[0].ip_addr, "replica_merge_completion_wait", one_shot=True)
+        await manager.api.enable_tablet_balancing(servers[0].ip_addr)
+
+        servers.append(await manager.server_add(cmdline=cmdline, config=cfg))
+        s1_host_id = await manager.get_host_id(servers[1].server_id)
+
+        async def finished_merging():
+            tablet_count = await get_tablet_count(manager, servers[0], ks, 'test')
+            return tablet_count < old_tablet_count or None
+
+        await wait_for(finished_merging, time.time() + 120)
+
+        await manager.api.disable_tablet_balancing(servers[0].ip_addr)
+        await manager.api.enable_injection(servers[0].ip_addr, "take_storage_snapshot", one_shot=True)
+
+        await s0_log.wait_for(f"merge_completion_fiber: waiting", from_mark=s0_mark)
+
+        tablet_count = await get_tablet_count(manager, servers[0], ks, 'test')
+        assert tablet_count == 1
+
+        tablet_token = 0 # Doesn't matter since there is one tablet
+        replica = await get_tablet_replica(manager, servers[0], ks, 'test', tablet_token)
+
+        s0_host_id = await manager.get_host_id(servers[0].server_id)
+        src_shard = replica[1]
+        dst_shard = src_shard
+
+        migration = asyncio.create_task(manager.api.move_tablet(servers[0].ip_addr, ks, "test", replica[0], src_shard, s1_host_id, dst_shard, tablet_token))
+
+        await s0_log.wait_for(f"take_storage_snapshot: waiting", from_mark=s0_mark)
+
+        await manager.api.message_injection(servers[0].ip_addr, "merge_completion_fiber")
+        await s0_log.wait_for(f"Merge completion fiber finished", from_mark=s0_mark)
+
+        await manager.api.message_injection(servers[0].ip_addr, "take_storage_snapshot")
+
+        await migration
+
+        rows = await cql.run_async(f"SELECT * FROM {ks}.test;")
+        assert len(rows) == len(keys)
+
+@pytest.mark.asyncio
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_missing_data(manager: ManagerClient):
+
+    # This is a test and reproducer for issue:
+    # https://github.com/scylladb/scylladb/issues/23313
+
+    logger.info('Bootstrapping cluster')
+    cfg = { 'enable_tablets': True,
+            'tablet_load_stats_refresh_interval_in_seconds': 1
+    }
+    cmdline = [
+        '--logger-log-level', 'load_balancer=debug',
+        '--logger-log-level', 'debug_error_injection=debug',
+    ]
+    server = await manager.server_add(cmdline=cmdline, config=cfg)
+
+    logger.info(f'server_id = {server.server_id}')
+
+    cql = manager.get_cql()
+
+    await manager.api.disable_tablet_balancing(server.ip_addr)
+
+    inital_tablets = 32
+
+    async with new_test_keyspace(manager, f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}} AND tablets = {{'initial': {inital_tablets}}}") as ks:
+        await cql.run_async(f'CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);')
+
+        await manager.api.disable_autocompaction(server.ip_addr, ks, 'test')
+
+        # insert data
+        pks = range(inital_tablets)
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});") for k in pks])
+
+        # flush the table
+        await manager.api.flush_keyspace(server.ip_addr, ks)
+
+        # force merge on the test table
+        expected_tablet_count = inital_tablets // 2
+        await cql.run_async(f"ALTER KEYSPACE {ks} WITH tablets = {{'initial': {expected_tablet_count}}}")
+
+        await manager.api.enable_tablet_balancing(server.ip_addr)
+
+        # wait for merge to complete
+        actual_tablet_count = 0
+        started = time.time()
+        while expected_tablet_count != actual_tablet_count:
+            actual_tablet_count = await get_tablet_count(manager, server, ks, 'test')
+            logger.debug(f'actual/expected tablet count: {actual_tablet_count}/{expected_tablet_count}')
+
+            assert time.time() - started < 60, 'Timeout while waiting for tablet merge'
+
+            await asyncio.sleep(.1)
+
+        logger.info(f'Merged test table; new number of tablets: {expected_tablet_count}')
+
+        # assert that the number of records has not changed
+        qry = f'SELECT * FROM {ks}.test'
+        logger.info(f'Running: {qry}')
+        res = cql.execute(qry)
+        missing = set(pks)
+        rec_count = 0
+        for row in res:
+            rec_count += 1
+            missing.discard(row.pk)
+
+        assert rec_count == len(pks), f"received {rec_count} records instead of {len(pks)} while querying server {server.server_id}; missing keys: {missing}"
+
+@pytest.mark.asyncio
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_merge_with_drop(manager: ManagerClient):
+
+    # This is a test and reproducer for issue:
+    # https://github.com/scylladb/scylladb/issues/23313
+
+    logger.info('Bootstrapping cluster')
+    cfg = { 'enable_tablets': True,
+            'tablet_load_stats_refresh_interval_in_seconds': 1
+            }
+    cmdline = [
+        '--logger-log-level', 'load_balancer=debug',
+        '--logger-log-level', 'debug_error_injection=debug',
+    ]
+    server = await manager.server_add(cmdline=cmdline, config=cfg)
+
+    logger.info(f'server_id = {server.server_id}')
+
+    cql = manager.get_cql()
+
+    await manager.api.disable_tablet_balancing(server.ip_addr)
+
+    initial_tablets = 32
+
+    async with new_test_keyspace(manager, f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int) WITH tablets = {{'min_tablet_count': {initial_tablets}}};")
+
+        await manager.api.disable_autocompaction(server.ip_addr, ks, 'test')
+
+        # insert data
+        pks = range(initial_tablets)
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});") for k in pks])
+
+        # flush the table
+        await manager.api.flush_keyspace(server.ip_addr, ks)
+
+        await manager.api.enable_injection(server.ip_addr, "merge_completion_fiber", one_shot=True)
+
+        # force merge on the test table
+        expected_tablet_count = initial_tablets // 2
+        await cql.run_async(f"ALTER TABLE {ks}.test WITH tablets = {{'min_tablet_count': {expected_tablet_count}}}")
+
+        s0_log = await manager.server_open_log(server.server_id)
+        s0_mark = await s0_log.mark()
+
+        await manager.api.enable_tablet_balancing(server.ip_addr)
+
+        # wait for merge to complete
+        actual_tablet_count = 0
+        started = time.time()
+        while expected_tablet_count != actual_tablet_count:
+            actual_tablet_count = await get_tablet_count(manager, server, ks, 'test')
+            logger.debug(f'actual/expected tablet count: {actual_tablet_count}/{expected_tablet_count}')
+
+            assert time.time() - started < 120, 'Timeout while waiting for tablet merge'
+
+            await asyncio.sleep(.1)
+
+        await s0_log.wait_for('merge_completion_fiber: waiting', from_mark=s0_mark)
+        await manager.api.enable_injection(server.ip_addr, "compaction_group_stop_wait", one_shot=True)
+        await manager.api.message_injection(server.ip_addr, "merge_completion_fiber")
+        await s0_log.wait_for('compaction_group_stop_wait: waiting', from_mark=s0_mark)
+
+        drop_table_fut = cql.run_async(f"drop table {ks}.test")
+        await asyncio.sleep(0.1)
+        await manager.api.message_injection(server.ip_addr, "compaction_group_stop_wait")
+        await drop_table_fut

@@ -27,19 +27,26 @@ target_sources(db
     extensions.cc
     heat_load_balance.cc
     large_data_handler.cc
+    corrupt_data_handler.cc
     marshal/type_parser.cc
     batchlog_manager.cc
     tags/utils.cc
     view/view.cc
     view/view_update_generator.cc
     view/row_locking.cc
-    sstables-format-selector.cc
+    view/view_building_state.cc
+    view/view_consumer.cc
+    view/view_building_worker.cc
+    view/view_building_coordinator.cc
+    view/view_building_task_mutation_builder.cc
     snapshot-ctl.cc
     snapshot/backup_task.cc
     rate_limiter.cc
     per_partition_rate_limit_options.cc
     row_cache.cc
-    tablet_options.cc)
+    tablet_options.cc
+    object_storage_endpoint_param.cc
+    )
 target_include_directories(db
   PUBLIC
     ${CMAKE_SOURCE_DIR})

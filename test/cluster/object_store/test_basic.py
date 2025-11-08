@@ -5,26 +5,28 @@ import os
 import pytest
 import shutil
 import logging
+import json
 
 from test.pylib.minio_server import MinioServer
 from cassandra.protocol import ConfigurationException
 from test.pylib.manager_client import ManagerClient
 from test.cluster.util import reconnect_driver
-from test.cluster.object_store.conftest import get_s3_resource, format_tuples
+from test.cluster.object_store.conftest import format_tuples
 from test.cqlpy.rest_api import scylla_inject_error
+from test.cluster.test_config import wait_for_config
 
 logger = logging.getLogger(__name__)
 
 
-def create_ks_and_cf(cql, s3_server):
+def create_ks_and_cf(cql, object_storage):
     ks = 'test_ks'
     cf = 'test_cf'
 
     replication_opts = format_tuples({'class': 'NetworkTopologyStrategy',
                                       'replication_factor': '1'})
-    storage_opts = format_tuples(type='S3',
-                                 endpoint=s3_server.address,
-                                 bucket=s3_server.bucket_name)
+    storage_opts = format_tuples(type=f'{object_storage.type}',
+                                 endpoint=object_storage.address,
+                                 bucket=object_storage.bucket_name)
 
     cql.execute((f"CREATE KEYSPACE {ks} WITH"
                   f" REPLICATION = {replication_opts} AND STORAGE = {storage_opts};"))
@@ -42,11 +44,12 @@ def create_ks_and_cf(cql, s3_server):
 
 @pytest.mark.parametrize('mode', ['normal', 'encrypted'])
 @pytest.mark.asyncio
-async def test_basic(manager: ManagerClient, s3_server, tmp_path, mode):
-    '''verify ownership table is updated, and tables written to S3 can be read after scylla restarts'''
+async def test_basic(manager: ManagerClient, object_storage, tmp_path, mode):
+    '''verify ownership table is updated, and tables written to object storage can be read after scylla restarts'''
 
+    objconf = object_storage.create_endpoint_conf()
     cfg = {'enable_user_defined_functions': False,
-           'object_storage_config_file': str(s3_server.config_file),
+           'object_storage_endpoints': objconf,
            'experimental_features': ['keyspace-storage-options']}
     if mode == 'encrypted':
         d = tmp_path / "system_keys"
@@ -59,17 +62,17 @@ async def test_basic(manager: ManagerClient, s3_server, tmp_path, mode):
 
     cql = manager.get_cql()
     workdir = await manager.server_get_workdir(server.server_id)
-    print(f'Create keyspace (minio listening at {s3_server.address})')
-    ks, cf = create_ks_and_cf(cql, s3_server)
+    print(f'Create keyspace (storage server listening at {object_storage.address})')
+    ks, cf = create_ks_and_cf(cql, object_storage)
 
-    assert not os.path.exists(os.path.join(workdir, f'data/{ks}')), "S3-backed keyspace has local directory created"
+    assert not os.path.exists(os.path.join(workdir, f'data/{ks}')), "object storage backed keyspace has local directory created"
     # Sanity check that the path is constructed correctly
     assert os.path.exists(os.path.join(workdir, 'data/system')), "Datadir is elsewhere"
 
     desc = cql.execute(f"DESCRIBE KEYSPACE {ks}").one().create_statement
     # The storage_opts wraps options with '{ <options> }' while the DESCRIBE
     # does it like '{<options>}' so strip the corner branches and spaces for check
-    assert f"{{'type': 'S3', 'bucket': '{s3_server.bucket_name}', 'endpoint': '{s3_server.address}'}}" in desc, "DESCRIBE generates unexpected storage options"
+    assert f"{{'type': '{object_storage.type}', 'bucket': '{object_storage.bucket_name}', 'endpoint': '{object_storage.address}'}}" in desc, "DESCRIBE generates unexpected storage options"
 
     res = cql.execute(f"SELECT * FROM {ks}.{cf};")
     rows = {x.name: x.value for x in res}
@@ -90,7 +93,7 @@ async def test_basic(manager: ManagerClient, s3_server, tmp_path, mode):
     cql = await reconnect_driver(manager)
 
     # Shouldn't be recreated by populator code
-    assert not os.path.exists(os.path.join(workdir, f'data/{ks}')), "S3-backed keyspace has local directory resurrected"
+    assert not os.path.exists(os.path.join(workdir, f'data/{ks}')), "object storage backed keyspace has local directory resurrected"
 
     res = cql.execute(f"SELECT * FROM {ks}.{cf};")
     have_res = {x.name: x.value for x in res}
@@ -104,20 +107,21 @@ async def test_basic(manager: ManagerClient, s3_server, tmp_path, mode):
     assert not rows, 'Unexpected entries in registry'
 
 @pytest.mark.asyncio
-async def test_garbage_collect(manager: ManagerClient, s3_server):
+async def test_garbage_collect(manager: ManagerClient, object_storage):
     '''verify ownership table is garbage-collected on boot'''
 
     sstable_entries = []
 
+    objconf = object_storage.create_endpoint_conf()
     cfg = {'enable_user_defined_functions': False,
-           'object_storage_config_file': str(s3_server.config_file),
+           'object_storage_endpoints': objconf,
            'experimental_features': ['keyspace-storage-options']}
     server = await manager.server_add(config=cfg)
 
     cql = manager.get_cql()
 
-    print(f'Create keyspace (minio listening at {s3_server.address})')
-    ks, cf = create_ks_and_cf(cql, s3_server)
+    print(f'Create keyspace (storage server listening at {object_storage.address})')
+    ks, cf = create_ks_and_cf(cql, object_storage)
 
     await manager.api.flush_keyspace(server.ip_addr, ks)
     # Mark the sstables as "removing" to simulate the problem
@@ -138,7 +142,7 @@ async def test_garbage_collect(manager: ManagerClient, s3_server):
     # Must be empty as no sstables should have been picked up
     assert not have_res, f'Sstables not cleaned, got {have_res}'
     # Make sure objects also disappeared
-    objects = get_s3_resource(s3_server).Bucket(s3_server.bucket_name).objects.all()
+    objects = object_storage.get_resource().Bucket(object_storage.bucket_name).objects.all()
     print(f'Found objects: {[ objects ]}')
     for o in objects:
         for ent in sstable_entries:
@@ -146,18 +150,19 @@ async def test_garbage_collect(manager: ManagerClient, s3_server):
 
 
 @pytest.mark.asyncio
-async def test_populate_from_quarantine(manager: ManagerClient, s3_server):
+async def test_populate_from_quarantine(manager: ManagerClient, object_storage):
     '''verify sstables are populated from quarantine state'''
 
+    objconf = object_storage.create_endpoint_conf()
     cfg = {'enable_user_defined_functions': False,
-           'object_storage_config_file': str(s3_server.config_file),
+           'object_storage_endpoints': objconf,
            'experimental_features': ['keyspace-storage-options']}
     server = await manager.server_add(config=cfg)
 
     cql = manager.get_cql()
 
-    print(f'Create keyspace (minio listening at {s3_server.address})')
-    ks, cf = create_ks_and_cf(cql, s3_server)
+    print(f'Create keyspace (storage server listening at {object_storage.address})')
+    ks, cf = create_ks_and_cf(cql, object_storage)
 
     res = cql.execute(f"SELECT * FROM {ks}.{cf};")
     rows = {x.name: x.value for x in res}
@@ -182,21 +187,22 @@ async def test_populate_from_quarantine(manager: ManagerClient, s3_server):
 
 
 @pytest.mark.asyncio
-async def test_misconfigured_storage(manager: ManagerClient, s3_server):
+async def test_misconfigured_storage(manager: ManagerClient, object_storage):
     '''creating keyspace with unknown endpoint is not allowed'''
     # scylladb/scylladb#15074
+    objconf = object_storage.create_endpoint_conf()
     cfg = {'enable_user_defined_functions': False,
-           'object_storage_config_file': str(s3_server.config_file),
+           'object_storage_endpoints': objconf,
            'experimental_features': ['keyspace-storage-options']}
     server = await manager.server_add(config=cfg)
 
     cql = manager.get_cql()
-    print(f'Create keyspace (minio listening at {s3_server.address})')
+    print(f'Create keyspace (storage server listening at {object_storage.address})')
     replication_opts = format_tuples({'class': 'NetworkTopologyStrategy',
                                       'replication_factor': '1'})
-    storage_opts = format_tuples(type='S3',
+    storage_opts = format_tuples(type=f'{object_storage.type}',
                                  endpoint='unknown_endpoint',
-                                 bucket=s3_server.bucket_name)
+                                 bucket=object_storage.bucket_name)
 
     with pytest.raises(ConfigurationException):
         cql.execute((f"CREATE KEYSPACE test_ks WITH"
@@ -204,25 +210,21 @@ async def test_misconfigured_storage(manager: ManagerClient, s3_server):
 
 
 @pytest.mark.asyncio
-async def test_memtable_flush_retries(manager: ManagerClient, tmpdir, s3_server):
+async def test_memtable_flush_retries(manager: ManagerClient, tmpdir, object_storage):
     '''verify that memtable flush doesn't crash in case storage access keys are incorrect'''
 
     print('Spoof the object-store config')
-    local_config = tmpdir / 'object_storage.yaml'
-    MinioServer.create_conf_file(s3_server.address, s3_server.port, 'bad_key', 'bad_secret', 'bad_region', local_config)
-
-    orig_config = s3_server.config_file
-    s3_server.config_file = local_config
+    objconf = object_storage.create_endpoint_conf()
 
     cfg = {'enable_user_defined_functions': False,
-           'object_storage_config_file': str(s3_server.config_file),
+           'object_storage_endpoints': objconf,
            'experimental_features': ['keyspace-storage-options']}
     server = await manager.server_add(config=cfg)
 
     cql = manager.get_cql()
-    print(f'Create keyspace (minio listening at {s3_server.address})')
+    print(f'Create keyspace (storage server listening at {object_storage.address})')
 
-    ks, cf = create_ks_and_cf(cql, s3_server)
+    ks, cf = create_ks_and_cf(cql, object_storage)
     res = cql.execute(f"SELECT * FROM {ks}.{cf};")
     rows = {x.name: x.value for x in res}
 
@@ -247,3 +249,50 @@ async def test_memtable_flush_retries(manager: ManagerClient, tmpdir, s3_server)
     res = cql.execute(f"SELECT * FROM {ks}.{cf};")
     have_res = { x.name: x.value for x in res }
     assert have_res == dict(rows), f'Unexpected table content: {have_res}'
+
+@pytest.mark.asyncio
+async def test_get_object_store_endpoints(manager: ManagerClient, object_storage):
+    objconf = object_storage.create_endpoint_conf()
+    badconf = MinioServer.create_conf('a', 123, 'bad_region')
+    cfg = {'object_storage_endpoints': objconf + badconf}
+
+    print('Scylla returns the object storage endpoints')
+    server = await manager.server_add(config=cfg)
+    endpoints = await manager.api.get_config(server.ip_addr, 'object_storage_endpoints')
+
+    print('Also check the returned string is valid JSON')
+    del objconf[0]['name']
+    del badconf[0]['name']
+    assert json.loads(endpoints[object_storage.address]) == objconf[0]
+    assert json.loads(endpoints['a']) == badconf[0]
+
+    print('Check that system.config contains the object storage endpoints')
+    cql = manager.get_cql()
+    res = json.loads(cql.execute("SELECT value FROM system.config WHERE name = 'object_storage_endpoints';").one().value)
+    assert object_storage.address in res and 'a' in res
+    assert json.loads(res[object_storage.address]) == objconf[0]
+    assert json.loads(res['a']) == badconf[0]
+
+    print('Update config with a new endpoint and SIGHUP Scylla to reload configuration')
+    new_endpoint = MinioServer.create_conf('b', 456, 'good_region')
+    await manager.server_update_config(server.server_id, 'object_storage_endpoints', new_endpoint)
+    await wait_for_config(manager, server, 'object_storage_endpoints', {'b': '{ "port": 456, "use_https": false, "aws_region": "good_region", "iam_role_arn": "" }'})
+
+    print('Trying to create a keyspace with an endpoint not configured in object_storage_endpoints should trip storage_manager::is_known_endpoint()')
+    replication_opts = format_tuples({'class': 'NetworkTopologyStrategy',
+                                      'replication_factor': '1'})
+    storage_opts = format_tuples(type=f'{object_storage.type}',
+                                 endpoint='a',
+                                 bucket=object_storage.bucket_name)
+    with pytest.raises(ConfigurationException):
+        cql.execute((f'CREATE KEYSPACE random_ks WITH'
+                      f' REPLICATION = {replication_opts} AND STORAGE = {storage_opts};'))
+
+    print('Passing a known endpoint will make the CREATE KEYSPACE stmt to succeed')
+    storage_opts = format_tuples(type=f'{object_storage.type}',
+                                 endpoint='b',
+                                 bucket=object_storage.bucket_name)
+    cql.execute((f'CREATE KEYSPACE random_ks WITH'
+                    f' REPLICATION = {replication_opts} AND STORAGE = {storage_opts};'))
+    
+

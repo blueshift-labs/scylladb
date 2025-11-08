@@ -14,24 +14,34 @@
 #include "tasks/task_handler.hh"
 #include "tasks/virtual_task_hint.hh"
 #include "utils/error_injection.hh"
+#include <variant>
+#include "utils/overloaded_functor.hh"
 
 using namespace std::chrono_literals;
 
 namespace node_ops {
 
-static sstring request_type_to_task_type(const std::optional<service::topology_request>& request_type) {
-    return request_type.transform([] (auto type) -> sstring {
-        switch (type) {
-            case service::topology_request::join:
-                return "bootstrap";
-            case service::topology_request::remove:
-                return "remove node";
-            case service::topology_request::leave:
-                return "decommission";
-            default:
-                return fmt::to_string(type);
+static sstring request_type_to_task_type(const std::variant<std::monostate, service::topology_request, service::global_topology_request>& request_type) {
+    return std::visit(overloaded_functor {
+        [] (const service::topology_request& type) -> sstring {
+            switch (type) {
+                case service::topology_request::join:
+                    return "bootstrap";
+                case service::topology_request::remove:
+                    return "remove node";
+                case service::topology_request::leave:
+                    return "decommission";
+                default:
+                    return fmt::to_string(type);
+            }
+        },
+        [] (const service::global_topology_request type) -> sstring {
+            return fmt::to_string(type);
+        },
+        [] (const std::monostate type) -> sstring {
+            return "";
         }
-    }).value_or("");
+    }, request_type);
 }
 
 static tasks::task_manager::task_state get_state(const db::system_keyspace::topology_requests_entry& entry) {
@@ -91,7 +101,7 @@ future<std::optional<tasks::task_status>> node_ops_virtual_task::get_status_help
         .entity = "",
         .progress_units = "",
         .progress = tasks::task_manager::task::progress{},
-        .children = started ? co_await get_children(get_module(), id) : std::vector<tasks::task_identity>{}
+        .children = started ? co_await get_children(get_module(), id, std::bind_front(&gms::gossiper::is_alive, &_ss.gossiper())) : utils::chunked_vector<tasks::task_identity>{}
     };
 }
 
@@ -114,7 +124,7 @@ future<std::optional<tasks::virtual_task_hint>> node_ops_virtual_task::contains(
     }
 
     auto entry = co_await _ss._sys_ks.local().get_topology_request_entry(task_id.uuid(), false);
-    co_return bool(entry.id) && entry.request_type ? empty_hint : std::nullopt;
+    co_return bool(entry.id) && std::holds_alternative<service::topology_request>(entry.request_type) ? empty_hint : std::nullopt;
 }
 
 future<tasks::is_abortable> node_ops_virtual_task::is_abortable(tasks::virtual_task_hint) const {

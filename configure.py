@@ -274,8 +274,8 @@ def generate_compdb(compdb, ninja, buildfile, modes):
             mode_out = outdir + '/' + mode
             submodule_compdbs = [mode_out + '/' + submodule + '/' + compdb for submodule in ['seastar', 'abseil']]
             with open(mode_out + '/' + compdb, 'w+b') as combined_mode_specific_compdb:
-                subprocess.run(['./scripts/merge-compdb.py', outdir + '/' + mode,
-                                ninja_compdb.name] + submodule_compdbs, stdout=combined_mode_specific_compdb)
+                subprocess.run(['./scripts/merge-compdb.py', ninja_compdb.name + ':' + mode_out] + submodule_compdbs, 
+                               stdout=combined_mode_specific_compdb)
 
     # sort modes by supposed indexing speed
     for mode in ['dev', 'debug', 'release', 'sanitize']:
@@ -384,7 +384,7 @@ modes = {
     },
     'release': {
         'cxxflags': '-ffunction-sections -fdata-sections ',
-        'cxx_ld_flags': '-Wl,--gc-sections',
+        'cxx_ld_flags': '-Wl,--gc-sections -Wl,--no-lto-pgo-warn-mismatch',
         'stack-usage-threshold': 1024*13,
         'optimization-level': '3',
         'per_src_extra_cxxflags': {},
@@ -469,6 +469,7 @@ scylla_tests = set([
     'test/boost/chunked_vector_test',
     'test/boost/clustering_ranges_walker_test',
     'test/boost/compaction_group_test',
+    'test/boost/comparable_bytes_test',
     'test/boost/compound_test',
     'test/boost/compress_test',
     'test/boost/config_test',
@@ -514,6 +515,7 @@ scylla_tests = set([
     'test/boost/log_heap_test',
     'test/boost/logalloc_standard_allocator_segment_pool_backend_test',
     'test/boost/logalloc_test',
+    'test/boost/lru_string_map_test',
     'test/boost/managed_bytes_test',
     'test/boost/managed_vector_test',
     'test/boost/map_difference_test',
@@ -524,6 +526,7 @@ scylla_tests = set([
     'test/boost/mutation_test',
     'test/boost/mvcc_test',
     'test/boost/nonwrapping_interval_test',
+    'test/boost/object_storage_upload_test',
     'test/boost/observable_test',
     'test/boost/partitioner_test',
     'test/boost/pretty_printers_test',
@@ -533,9 +536,11 @@ scylla_tests = set([
     'test/boost/recent_entries_map_test',
     'test/boost/reservoir_sampling_test',
     'test/boost/result_utils_test',
+    'test/boost/rest_client_test',
     'test/boost/reusable_buffer_test',
     'test/boost/rust_test',
     'test/boost/s3_test',
+    'test/boost/gcp_object_storage_test',
     'test/boost/aws_errors_test',
     'test/boost/aws_error_injection_test',
     'test/boost/schema_changes_test',
@@ -550,6 +555,7 @@ scylla_tests = set([
     'test/boost/sstable_conforms_to_mutation_source_test',
     'test/boost/sstable_datafile_test',
     'test/boost/sstable_generation_test',
+    'test/boost/sstable_inexact_index_test',
     'test/boost/sstable_move_test',
     'test/boost/sstable_mutation_test',
     'test/boost/sstable_partition_index_cache_test',
@@ -563,6 +569,11 @@ scylla_tests = set([
     'test/boost/token_metadata_test',
     'test/boost/top_k_test',
     'test/boost/transport_test',
+    'test/boost/bti_index_test',
+    'test/boost/bti_key_translation_test',
+    'test/boost/bti_node_sink_test',
+    'test/boost/trie_traversal_test',
+    'test/boost/trie_writer_test',
     'test/boost/symmetric_key_test',
     'test/boost/types_test',
     'test/boost/utf8_test',
@@ -572,6 +583,7 @@ scylla_tests = set([
     'test/boost/wasm_test',
     'test/boost/wrapping_interval_test',
     'test/boost/unique_view_test',
+    'test/boost/scoped_item_list_test',
     'test/manual/ec2_snitch_test',
     'test/manual/enormous_table_scan_test',
     'test/manual/gce_snitch_test',
@@ -581,6 +593,7 @@ scylla_tests = set([
     'test/manual/partition_data_test',
     'test/manual/row_locker_test',
     'test/manual/streaming_histogram_test',
+    'test/manual/bti_cassandra_compatibility_test',
     'test/manual/sstable_scan_footprint_test',
     'test/perf/memory_footprint_test',
     'test/perf/perf_cache_eviction',
@@ -607,7 +620,12 @@ perf_tests = set([
     'test/perf/perf_idl',
     'test/perf/perf_vint',
     'test/perf/perf_big_decimal',
+    'test/perf/perf_bti_key_translation',
     'test/perf/perf_sort_by_proximity',
+])
+
+perf_standalone_tests = set([
+     'test/perf/perf_generic_server',
 ])
 
 raft_tests = set([
@@ -620,6 +638,11 @@ raft_tests = set([
     'test/raft/raft_sys_table_storage_test',
     'test/raft/discovery_test',
     'test/raft/failure_detector_test',
+])
+
+vector_search_tests = set([
+    'test/vector_search/vector_store_client_test',
+    'test/vector_search/load_balancer_test'
 ])
 
 wasms = set([
@@ -640,17 +663,22 @@ apps = set([
     'scylla',
 ])
 
+# apps that only need to be build with C++, no additional libraries
+cpp_apps = set([
+    'patchelf',
+])
+
 lto_binaries = set([
     'scylla'
 ])
 
-tests = scylla_tests | perf_tests | raft_tests
+tests = scylla_tests | perf_tests | perf_standalone_tests | raft_tests | vector_search_tests
 
 other = set([
     'iotune',
 ])
 
-all_artifacts = apps | tests | other | wasms
+all_artifacts = apps | cpp_apps | tests | other | wasms
 
 arg_parser = argparse.ArgumentParser('Configure scylla', add_help=False, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 arg_parser.add_argument('--out', dest='buildfile', action='store', default='build.ninja',
@@ -763,14 +791,20 @@ scylla_raft_core = [
 ]
 
 scylla_core = (['message/messaging_service.cc',
+                'message/advanced_rpc_compressor.cc',
+                'message/stream_compressor.cc',
+                'message/dict_trainer.cc',
                 'replica/database.cc',
+                'replica/schema_describe_helper.cc',
                 'replica/table.cc',
                 'replica/tablets.cc',
                 'replica/distributed_loader.cc',
                 'replica/memtable.cc',
                 'replica/exceptions.cc',
                 'replica/dirty_memory_manager.cc',
+                'replica/multishard_query.cc',
                 'replica/mutation_dump.cc',
+                'replica/querier.cc',
                 'mutation/atomic_cell.cc',
                 'mutation/canonical_mutation.cc',
                 'mutation/frozen_mutation.cc',
@@ -786,17 +820,17 @@ scylla_core = (['message/messaging_service.cc',
                 'mutation/range_tombstone_list.cc',
                 'mutation/async_utils.cc',
                 'absl-flat_hash_map.cc',
-                'collection_mutation.cc',
+                'mutation/collection_mutation.cc',
                 'client_data.cc',
                 'debug.cc',
                 'schema/caching_options.cc',
                 'schema/schema.cc',
                 'schema/schema_registry.cc',
-                'frozen_schema.cc',
+                'schema/frozen_schema.cc',
                 'bytes.cc',
                 'timeout_config.cc',
-                'schema_mutations.cc',
-                'generic_server.cc',
+                'schema/schema_mutations.cc',
+                'transport/generic_server.cc',
                 'utils/alien_worker.cc',
                 'utils/array-search.cc',
                 'utils/base64.cc',
@@ -805,7 +839,6 @@ scylla_core = (['message/messaging_service.cc',
                 'utils/buffer_input_stream.cc',
                 'utils/limiting_data_source.cc',
                 'utils/updateable_value.cc',
-                'utils/dict_trainer.cc',
                 'message/dictionary_service.cc',
                 'utils/directories.cc',
                 'gms/generation-number.cc',
@@ -815,18 +848,16 @@ scylla_core = (['message/messaging_service.cc',
                 'utils/io-wrappers.cc',
                 'utils/on_internal_error.cc',
                 'utils/pretty_printers.cc',
-                'utils/stream_compressor.cc',
                 'utils/labels.cc',
-                'converting_mutation_partition_applier.cc',
+                'mutation/converting_mutation_partition_applier.cc',
                 'readers/combined.cc',
                 'readers/multishard.cc',
                 'readers/mutation_reader.cc',
                 'readers/mutation_readers.cc',
                 'mutation_query.cc',
-                'keys.cc',
-                'counters.cc',
-                'compress.cc',
-                'zstd.cc',
+                'keys/keys.cc',
+                'mutation/counters.cc',
+                'sstable_dict_autotrainer.cc',
                 'sstables/sstables.cc',
                 'sstables/sstables_manager.cc',
                 'sstables/sstable_set.cc',
@@ -837,6 +868,7 @@ scylla_core = (['message/messaging_service.cc',
                 'sstables/kl/reader.cc',
                 'sstables/sstable_version.cc',
                 'sstables/compress.cc',
+                'sstables/compressor.cc',
                 'sstables/checksummed_data_source.cc',
                 'sstables/sstable_mutation_reader.cc',
                 'compaction/compaction.cc',
@@ -849,12 +881,20 @@ scylla_core = (['message/messaging_service.cc',
                 'compaction/incremental_compaction_strategy.cc',
                 'compaction/incremental_backlog_tracker.cc',
                 'sstables/integrity_checked_file_impl.cc',
+                'sstables/object_storage_client.cc',
                 'sstables/prepended_input_stream.cc',
                 'sstables/m_format_read_helpers.cc',
                 'sstables/sstable_directory.cc',
                 'sstables/random_access_reader.cc',
                 'sstables/metadata_collector.cc',
                 'sstables/writer.cc',
+                'sstables/trie/bti_key_translation.cc',
+                'sstables/trie/bti_index_reader.cc',
+                'sstables/trie/bti_node_reader.cc',
+                'sstables/trie/bti_node_sink.cc',
+                'sstables/trie/bti_partition_index_writer.cc',
+                'sstables/trie/bti_row_index_writer.cc',
+                'sstables/trie/trie_writer.cc',
                 'transport/cql_protocol_extension.cc',
                 'transport/event.cc',
                 'transport/event_notifier.cc',
@@ -866,7 +906,6 @@ scylla_core = (['message/messaging_service.cc',
                 'cdc/split.cc',
                 'cdc/generation.cc',
                 'cdc/metadata.cc',
-                'cql3/type_json.cc',
                 'cql3/attributes.cc',
                 'cql3/cf_name.cc',
                 'cql3/cql3_type.cc',
@@ -952,6 +991,8 @@ scylla_core = (['message/messaging_service.cc',
                 'utils/murmur_hash.cc',
                 'utils/uuid.cc',
                 'utils/big_decimal.cc',
+                'types/comparable_bytes.cc',
+                'types/json_utils.cc',
                 'types/types.cc',
                 'validation.cc',
                 'service/migration_manager.cc',
@@ -977,6 +1018,7 @@ scylla_core = (['message/messaging_service.cc',
                 'cql3/result_set.cc',
                 'cql3/prepare_context.cc',
                 'db/batchlog_manager.cc',
+                'db/corrupt_data_handler.cc',
                 'db/commitlog/commitlog.cc',
                 'db/commitlog/commitlog_entry.cc',
                 'db/commitlog/commitlog_replayer.cc',
@@ -1005,18 +1047,24 @@ scylla_core = (['message/messaging_service.cc',
                 'db/size_estimates_virtual_reader.cc',
                 'db/snapshot-ctl.cc',
                 'db/snapshot/backup_task.cc',
-                'db/sstables-format-selector.cc',
                 'db/system_distributed_keyspace.cc',
                 'db/system_keyspace.cc',
                 'db/tags/utils.cc',
                 'db/view/row_locking.cc',
                 'db/view/view.cc',
                 'db/view/view_update_generator.cc',
+                'db/view/view_building_state.cc',
+                'db/view/view_consumer.cc',
+                'db/view/view_building_worker.cc',
+                'db/view/view_building_coordinator.cc',
+                'db/view/view_building_task_mutation_builder.cc',
                 'db/virtual_table.cc',
                 'db/virtual_tables.cc',
                 'db/tablet_options.cc',
+                'db/object_storage_endpoint_param.cc',
                 'index/secondary_index_manager.cc',
                 'index/secondary_index.cc',
+                'index/vector_index.cc',
                 'utils/UUID_gen.cc',
                 'utils/i_filter.cc',
                 'utils/bloom_filter.cc',
@@ -1030,18 +1078,24 @@ scylla_core = (['message/messaging_service.cc',
                 'utils/multiprecision_int.cc',
                 'utils/gz/crc_combine.cc',
                 'utils/gz/crc_combine_table.cc',
+                'utils/http.cc',
+                'utils/rest/client.cc',
                 'utils/s3/aws_error.cc',
                 'utils/s3/client.cc',
-                'utils/s3/retryable_http_client.cc',
-                'utils/s3/retry_strategy.cc',
-                'utils/s3/s3_retry_strategy.cc',
+                'utils/s3/default_aws_retry_strategy.cc',
                 'utils/s3/credentials_providers/aws_credentials_provider.cc',
                 'utils/s3/credentials_providers/environment_aws_credentials_provider.cc',
                 'utils/s3/credentials_providers/instance_profile_credentials_provider.cc',
                 'utils/s3/credentials_providers/sts_assume_role_credentials_provider.cc',
                 'utils/s3/credentials_providers/aws_credentials_provider_chain.cc',
                 'utils/s3/utils/manip_s3.cc',
-                'utils/advanced_rpc_compressor.cc',
+                'utils/azure/identity/credentials.cc',
+                'utils/azure/identity/service_principal_credentials.cc',
+                'utils/azure/identity/managed_identity_credentials.cc',
+                'utils/azure/identity/azure_cli_credentials.cc',
+                'utils/azure/identity/default_credentials.cc',
+                'utils/gcp/gcp_credentials.cc',
+                'utils/gcp/object_storage.cc',
                 'gms/version_generator.cc',
                 'gms/versioned_value.cc',
                 'gms/gossiper.cc',
@@ -1058,8 +1112,8 @@ scylla_core = (['message/messaging_service.cc',
                 'dht/boot_strapper.cc',
                 'dht/range_streamer.cc',
                 'unimplemented.cc',
-                'query.cc',
-                'query-result-set.cc',
+                'query/query.cc',
+                'query/query-result-set.cc',
                 'locator/abstract_replication_strategy.cc',
                 'locator/tablets.cc',
                 'locator/azure_snitch.cc',
@@ -1110,6 +1164,7 @@ scylla_core = (['message/messaging_service.cc',
                 'utils/lister.cc',
                 'repair/repair.cc',
                 'repair/row_level.cc',
+                'repair/incremental.cc',
                 'streaming/table_check.cc',
                 'exceptions/exceptions.cc',
                 'auth/allow_all_authenticator.cc',
@@ -1146,10 +1201,8 @@ scylla_core = (['message/messaging_service.cc',
                 'utils/disk-error-handler.cc',
                 'utils/hashers.cc',
                 'utils/aws_sigv4.cc',
-                'duration.cc',
+                'types/duration.cc',
                 'vint-serialization.cc',
-                'utils/arch/powerpc/crc32-vpmsum/crc32_wrapper.cc',
-                'querier.cc',
                 'mutation_writer/multishard_writer.cc',
                 'ent/encryption/encryption_config.cc',
                 'ent/encryption/encryption.cc',
@@ -1164,8 +1217,10 @@ scylla_core = (['message/messaging_service.cc',
                 'ent/encryption/kms_key_provider.cc',
                 'ent/encryption/gcp_host.cc',
                 'ent/encryption/gcp_key_provider.cc',
+                'ent/encryption/utils.cc',
+                'ent/encryption/azure_host.cc',
+                'ent/encryption/azure_key_provider.cc',
                 'ent/ldap/ldap_connection.cc',
-                'multishard_mutation_query.cc',
                 'reader_concurrency_semaphore.cc',
                 'sstables_loader.cc',
                 'utils/utf8.cc',
@@ -1186,6 +1241,7 @@ scylla_core = (['message/messaging_service.cc',
                 'service/raft/group0_state_id_handler.cc',
                 'service/raft/group0_state_machine.cc',
                 'service/raft/group0_state_machine_merger.cc',
+                'service/raft/group0_voter_handler.cc',
                 'service/raft/raft_sys_table_storage.cc',
                 'serializer.cc',
                 'release.cc',
@@ -1193,7 +1249,7 @@ scylla_core = (['message/messaging_service.cc',
                 'service/raft/raft_group_registry.cc',
                 'service/raft/discovery.cc',
                 'service/raft/raft_group0.cc',
-                'direct_failure_detector/failure_detector.cc',
+                'service/direct_failure_detector/failure_detector.cc',
                 'service/raft/raft_group0_client.cc',
                 'service/broadcast_tables/experimental/lang.cc',
                 'tasks/task_handler.cc',
@@ -1207,6 +1263,8 @@ scylla_core = (['message/messaging_service.cc',
                 'node_ops/task_manager_module.cc',
                 'reader_concurrency_semaphore_group.cc',
                 'utils/disk_space_monitor.cc',
+                'vector_search/vector_store_client.cc',
+                'vector_search/dns.cc',
                 ] + [Antlr3Grammar('cql3/Cql.g')] \
                   + scylla_raft_core
                )
@@ -1273,28 +1331,13 @@ alternator = [
        'alternator/serialization.cc',
        'alternator/expressions.cc',
        Antlr3Grammar('alternator/expressions.g'),
+       'alternator/parsed_expression_cache.cc',
        'alternator/conditions.cc',
        'alternator/consumed_capacity.cc',
        'alternator/auth.cc',
        'alternator/streams.cc',
        'alternator/ttl.cc',
 ]
-
-redis = [
-        'redis/controller.cc',
-        'redis/server.cc',
-        'redis/query_processor.cc',
-        'redis/protocol_parser.rl',
-        'redis/keyspace_utils.cc',
-        'redis/options.cc',
-        'redis/stats.cc',
-        'redis/mutation_utils.cc',
-        'redis/query_utils.cc',
-        'redis/abstract_command.cc',
-        'redis/command_factory.cc',
-        'redis/commands.cc',
-        'redis/lolwut.cc',
-        ]
 
 idls = ['idl/gossip_digest.idl.hh',
         'idl/uuid.idl.hh',
@@ -1332,6 +1375,7 @@ idls = ['idl/gossip_digest.idl.hh',
         'idl/replica_exception.idl.hh',
         'idl/per_partition_rate_limit_info.idl.hh',
         'idl/position_in_partition.idl.hh',
+        'idl/full_position.idl.hh',
         'idl/experimental/broadcast_tables_lang.idl.hh',
         'idl/storage_service.idl.hh',
         'idl/join_node.idl.hh',
@@ -1362,6 +1406,8 @@ scylla_tests_dependencies = scylla_core + alternator + idls + scylla_tests_gener
     'test/lib/exception_utils.cc',
     'test/lib/random_schema.cc',
     'test/lib/key_utils.cc',
+    'test/lib/proc_utils.cc',
+    'test/lib/gcs_fixture.cc',
 ]
 
 scylla_raft_dependencies = scylla_raft_core + ['utils/uuid.cc', 'utils/error_injection.cc', 'utils/exceptions.cc']
@@ -1371,6 +1417,7 @@ scylla_tools = ['tools/scylla-local-file-key-generator.cc',
                 'tools/scylla-types.cc',
                 'tools/scylla-sstable.cc',
                 'tools/scylla-nodetool.cc',
+                'tools/json_mutation_stream_parser.cc',
                 'tools/schema_loader.cc',
                 'tools/load_system_tablets.cc',
                 'tools/utils.cc',
@@ -1383,7 +1430,6 @@ scylla_perfs = ['test/perf/perf_alternator.cc',
                 'test/perf/perf_tablets.cc',
                 'test/perf/tablet_load_balancing.cc',
                 'test/perf/perf.cc',
-                'test/lib/alternator_test_env.cc',
                 'test/lib/cql_test_env.cc',
                 'test/lib/log.cc',
                 'test/lib/test_services.cc',
@@ -1396,7 +1442,8 @@ scylla_perfs = ['test/perf/perf_alternator.cc',
                 'seastar/tests/perf/linux_perf_event.cc']
 
 deps = {
-    'scylla': idls + ['main.cc'] + scylla_core + api + alternator + redis + scylla_tools + scylla_perfs,
+    'scylla': idls + ['main.cc'] + scylla_core + api + alternator + scylla_tools + scylla_perfs,
+    'patchelf': ['tools/patchelf.cc'],
 }
 
 pure_boost_tests = set([
@@ -1420,6 +1467,7 @@ pure_boost_tests = set([
     'test/boost/keys_test',
     'test/boost/like_matcher_test',
     'test/boost/linearizing_input_stream_test',
+    'test/boost/lru_string_map_test',
     'test/boost/map_difference_test',
     'test/boost/nonwrapping_interval_test',
     'test/boost/observable_test',
@@ -1436,7 +1484,6 @@ pure_boost_tests = set([
 ])
 
 tests_not_using_seastar_test_framework = set([
-    'test/boost/alternator_unit_test',
     'test/boost/small_vector_test',
     'test/manual/gossip',
     'test/manual/message',
@@ -1474,13 +1521,16 @@ for t in sorted(scylla_tests):
     else:
         deps[t] += scylla_core + alternator + idls + scylla_tests_generic_dependencies
 
+for t in sorted(perf_tests | perf_standalone_tests):
+    deps[t] = [t + '.cc'] + scylla_tests_dependencies
+    deps[t] += ['test/perf/perf.cc', 'seastar/tests/perf/linux_perf_event.cc']
+
 perf_tests_seastar_deps = [
     'seastar/tests/perf/perf_tests.cc'
 ]
 
 for t in sorted(perf_tests):
-    deps[t] = [t + '.cc'] + scylla_tests_dependencies + perf_tests_seastar_deps
-    deps[t] += ['test/perf/perf.cc', 'seastar/tests/perf/linux_perf_event.cc']
+    deps[t] += perf_tests_seastar_deps
 
 deps['test/boost/combined_tests'] += [
     'test/boost/aggregate_fcts_test.cc',
@@ -1500,18 +1550,20 @@ deps['test/boost/combined_tests'] += [
     'test/boost/cql_query_test.cc',
     'test/boost/database_test.cc',
     'test/boost/data_listeners_test.cc',
+    'test/boost/disk_space_monitor_test.cc',
     'test/boost/error_injection_test.cc',
     'test/boost/extensions_test.cc',
     'test/boost/filtering_test.cc',
     'test/boost/group0_cmd_merge_test.cc',
     'test/boost/group0_test.cc',
+    'test/boost/group0_voter_calculator_test.cc',
     'test/boost/index_with_paging_test.cc',
     'test/boost/json_cql_query_test.cc',
     'test/boost/large_paging_state_test.cc',
     'test/boost/loading_cache_test.cc',
     'test/boost/memtable_test.cc',
     'test/boost/multishard_combining_reader_as_mutation_source_test.cc',
-    'test/boost/multishard_mutation_query_test.cc',
+    'test/boost/multishard_query_test.cc',
     'test/boost/mutation_reader_test.cc',
     'test/boost/mutation_writer_test.cc',
     'test/boost/network_topology_strategy_test.cc',
@@ -1529,6 +1581,8 @@ deps['test/boost/combined_tests'] += [
     'test/boost/secondary_index_test.cc',
     'test/boost/sessions_test.cc',
     'test/boost/sstable_compaction_test.cc',
+    'test/boost/sstable_compressor_factory_test.cc',
+    'test/boost/sstable_compression_config_test.cc',
     'test/boost/sstable_directory_test.cc',
     'test/boost/sstable_set_test.cc',
     'test/boost/statement_restrictions_test.cc',
@@ -1591,8 +1645,8 @@ deps['test/boost/rust_test'] += ['rust/inc/src/lib.rs']
 
 deps['test/raft/replication_test'] = ['test/raft/replication_test.cc', 'test/raft/replication.cc', 'test/raft/helpers.cc', 'test/lib/eventually.cc'] + scylla_raft_dependencies
 deps['test/raft/raft_server_test'] = ['test/raft/raft_server_test.cc', 'test/raft/replication.cc', 'test/raft/helpers.cc', 'test/lib/eventually.cc'] + scylla_raft_dependencies
-deps['test/raft/randomized_nemesis_test'] = ['test/raft/randomized_nemesis_test.cc', 'direct_failure_detector/failure_detector.cc', 'test/raft/helpers.cc'] + scylla_raft_dependencies
-deps['test/raft/failure_detector_test'] = ['test/raft/failure_detector_test.cc', 'direct_failure_detector/failure_detector.cc', 'test/raft/helpers.cc'] + scylla_raft_dependencies
+deps['test/raft/randomized_nemesis_test'] = ['test/raft/randomized_nemesis_test.cc', 'service/direct_failure_detector/failure_detector.cc', 'test/raft/helpers.cc'] + scylla_raft_dependencies
+deps['test/raft/failure_detector_test'] = ['test/raft/failure_detector_test.cc', 'service/direct_failure_detector/failure_detector.cc', 'test/raft/helpers.cc'] + scylla_raft_dependencies
 deps['test/raft/many_test'] = ['test/raft/many_test.cc', 'test/raft/replication.cc', 'test/raft/helpers.cc', 'test/lib/eventually.cc'] + scylla_raft_dependencies
 deps['test/raft/fsm_test'] =  ['test/raft/fsm_test.cc', 'test/raft/helpers.cc', 'test/lib/log.cc'] + scylla_raft_dependencies
 deps['test/raft/etcd_test'] =  ['test/raft/etcd_test.cc', 'test/raft/helpers.cc', 'test/lib/log.cc'] + scylla_raft_dependencies
@@ -1603,6 +1657,9 @@ deps['test/raft/discovery_test'] =  ['test/raft/discovery_test.cc',
                                      'test/raft/helpers.cc',
                                      'test/lib/log.cc',
                                      'service/raft/discovery.cc'] + scylla_raft_dependencies
+
+deps['test/vector_search/vector_store_client_test'] =  ['test/vector_search/vector_store_client_test.cc'] + scylla_tests_dependencies
+deps['test/vector_search/load_balancer_test'] = ['test/vector_search/load_balancer_test.cc'] + scylla_tests_dependencies
 
 wasm_deps = {}
 
@@ -1757,6 +1814,9 @@ user_cflags = args.user_cflags + f" -ffile-prefix-map={curdir}=."
 # Since gcc 13, libgcc doesn't need the exception workaround
 user_cflags += ' -DSEASTAR_NO_EXCEPTION_HACK'
 
+# https://github.com/llvm/llvm-project/issues/163007
+user_cflags += ' -fextend-variable-liveness=none'
+
 if args.target != '':
     user_cflags += ' -march=' + args.target
 
@@ -1764,7 +1824,7 @@ for mode in modes:
     # Those flags are passed not only to Scylla objects, but also to libraries
     # that we compile ourselves.
     modes[mode]['lib_cflags'] = user_cflags
-    modes[mode]['lib_ldflags'] = user_ldflags + linker_flags
+    modes[mode]['lib_ldflags'] = user_ldflags + ' ' + linker_flags
 
 
 def prepare_advanced_optimizations(*, modes, build_modes, args):
@@ -1872,9 +1932,8 @@ def prepare_advanced_optimizations(*, modes, build_modes, args):
                 submode['profile_target'] = profile_target
             submode['lib_cflags'] += f" -f{it}profile-generate={os.path.realpath(outdir)}/{submode_name} {conservative_opts}"
             submode['cxx_ld_flags'] += f" -f{it}profile-generate={os.path.realpath(outdir)}/{submode_name} {conservative_opts}"
-            # Profile collection depends on java tools because we use cassandra-stress as the load.
             submode['profile_recipe'] = textwrap.dedent(f"""\
-                build $builddir/{submode_name}/profiles/prof.profdata: train $builddir/{submode_name}/scylla | dist-tools-tar
+                build $builddir/{submode_name}/profiles/prof.profdata: train $builddir/{submode_name}/scylla
                 build $builddir/{submode_name}/profiles/merged.profdata: merge_profdata $builddir/{submode_name}/profiles/prof.profdata {profile_target or str()}
                 """)
             submode['is_profile'] = True
@@ -1945,11 +2004,11 @@ def configure_seastar(build_dir, mode, mode_config):
         '-DCMAKE_CXX_EXTENSIONS=ON',
         '-DSeastar_CXX_FLAGS=SHELL:{}'.format(mode_config['lib_cflags'] + extra_file_prefix_map),
         '-DSeastar_LD_FLAGS={}'.format(semicolon_separated(mode_config['lib_ldflags'], seastar_cxx_ld_flags)),
-        '-DSeastar_API_LEVEL=7',
+        '-DSeastar_API_LEVEL=9',
         '-DSeastar_DEPRECATED_OSTREAM_FORMATTERS=OFF',
         '-DSeastar_UNUSED_RESULT_ERROR=ON',
         '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
-        '-DSeastar_SCHEDULING_GROUPS_COUNT=19',
+        '-DSeastar_SCHEDULING_GROUPS_COUNT=21',
         '-DSeastar_IO_URING=ON',
     ]
 
@@ -2079,7 +2138,7 @@ libs = ' '.join([maybe_static(args.staticyamlcpp, '-lyaml-cpp'), '-latomic', '-l
                  '-ldeflate',
                 ])
 
-args.user_cflags += " " + pkg_config('p11-kit-1', '--cflags')
+user_cflags += " " + pkg_config('p11-kit-1', '--cflags')
 
 if not args.staticboost:
     user_cflags += ' -DBOOST_ALL_DYN_LINK'
@@ -2087,8 +2146,8 @@ if not args.staticboost:
 for pkg in pkgs:
     user_cflags += ' ' + pkg_config(pkg, '--cflags')
     libs += ' ' + pkg_config(pkg, '--libs')
-user_cflags += ' -fvisibility=hidden'
-user_ldflags += ' -fvisibility=hidden'
+user_cflags += ' -fvisibility-inlines-hidden'
+user_ldflags += ' -fvisibility-inlines-hidden'
 if args.staticcxx:
     user_ldflags += " -static-libstdc++"
 
@@ -2114,7 +2173,6 @@ def kmip_arch():
 
 kmipc_dir = f'kmipc/kmipc-2.1.0t-{kmiplib()}_{kmip_arch()}'
 kmipc_lib = f'{kmipc_dir}/lib/libkmip.a'
-libs += ' -lboost_filesystem'
 if os.path.exists(kmipc_lib):
     libs += f' {kmipc_lib}'
     user_cflags += f' -I{kmipc_dir}/include -DHAVE_KMIP'
@@ -2390,7 +2448,6 @@ def write_build_file(f,
             objs = ['$builddir/' + mode + '/' + src.replace('.cc', '.o')
                     for src in srcs
                     if src.endswith('.cc')]
-            objs.append('$builddir/../utils/arch/powerpc/crc32-vpmsum/crc32.S')
             has_rust = False
             for dep in deps[binary]:
                 if isinstance(dep, Antlr3Grammar):
@@ -2405,6 +2462,22 @@ def write_build_file(f,
             if has_rust:
                 parent_mode = modes[mode].get('parent_mode', mode)
                 objs.append(f'$builddir/{parent_mode}/rust-{parent_mode}/librust_combined.a')
+            if binary in cpp_apps:
+                # binary only needs the C++ standard library, no additional
+                # libraries.
+                f.write('build $builddir/{}/{}: {}.{} {}\n'.format(mode, binary, regular_link_rule, mode, str.join(' ', objs)))
+                # In debug/sanitize modes, we compile with fsanitizers,
+                # so must use the same options during the link:
+                if '-DSANITIZE' in modes[mode]['cxxflags']:
+                    f.write('   libs = -fsanitize=address -fsanitize=undefined\n')
+                else:
+                    f.write('   libs =\n')
+                f.write(f'build $builddir/{mode}/{binary}.stripped: strip $builddir/{mode}/{binary}\n')
+                f.write(f'build $builddir/{mode}/{binary}.debug: phony $builddir/{mode}/{binary}.stripped\n')
+                for src in srcs:
+                    obj = '$builddir/' + mode + '/' + src.replace('.cc', '.o')
+                    compiles[obj] = src
+                continue
 
             do_lto = modes[mode]['has_lto'] and binary in lto_binaries
             seastar_dep = f'$builddir/{mode}/seastar/libseastar.{seastar_lib_ext}'
@@ -2602,8 +2675,8 @@ def write_build_file(f,
             include_scylla_and_iotune_stripped = ''
             include_scylla_and_iotune_debug = ''
         else:
-            include_scylla_and_iotune = f'$builddir/{mode}/scylla $builddir/{mode}/iotune'
-            include_scylla_and_iotune_stripped = f'$builddir/{mode}/scylla.stripped $builddir/{mode}/iotune.stripped'
+            include_scylla_and_iotune = f'$builddir/{mode}/scylla $builddir/{mode}/iotune $builddir/{mode}/patchelf'
+            include_scylla_and_iotune_stripped = f'$builddir/{mode}/scylla.stripped $builddir/{mode}/iotune.stripped $builddir/{mode}/patchelf.stripped'
             include_scylla_and_iotune_debug = f'$builddir/{mode}/scylla.debug $builddir/{mode}/iotune.debug'
         f.write('build $builddir/{mode}/dist/tar/{scylla_product}-unstripped-{scylla_version}-{scylla_release}.{arch}.tar.gz: package {include_scylla_and_iotune} $builddir/SCYLLA-RELEASE-FILE $builddir/SCYLLA-VERSION-FILE $builddir/debian/debian $builddir/node_exporter/node_exporter | always\n'.format(**locals()))
         f.write('  mode = {mode}\n'.format(**locals()))
@@ -2622,11 +2695,10 @@ def write_build_file(f,
         f.write(f'  mode = {mode}\n')
         f.write(f'build dist-server-{mode}: phony $builddir/dist/{mode}/redhat $builddir/dist/{mode}/debian\n')
         f.write(f'build dist-server-debuginfo-{mode}: phony $builddir/{mode}/dist/tar/{scylla_product}-debuginfo-{scylla_version}-{scylla_release}.{arch}.tar.gz\n')
-        f.write(f'build dist-tools-{mode}: phony $builddir/{mode}/dist/tar/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz dist-tools-rpm dist-tools-deb\n')
         f.write(f'build dist-cqlsh-{mode}: phony $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz dist-cqlsh-rpm dist-cqlsh-deb\n')
         f.write(f'build dist-python3-{mode}: phony dist-python3-tar dist-python3-rpm dist-python3-deb\n')
         f.write(f'build dist-unified-{mode}: phony $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz\n')
-        f.write(f'build $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz: unified $builddir/{mode}/dist/tar/{scylla_product}-{scylla_version}-{scylla_release}.{arch}.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz | always\n')
+        f.write(f'build $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz: unified $builddir/{mode}/dist/tar/{scylla_product}-{scylla_version}-{scylla_release}.{arch}.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz | always\n')
         f.write(f'  mode = {mode}\n')
         f.write(f'build $builddir/{mode}/dist/tar/{scylla_product}-unified-package-{scylla_version}-{scylla_release}.tar.gz: copy $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz\n')
         f.write(f'build $builddir/{mode}/dist/tar/{scylla_product}-unified-{arch}-package-{scylla_version}-{scylla_release}.tar.gz: copy $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz\n')
@@ -2667,17 +2739,6 @@ def write_build_file(f,
         rule build-submodule-deb
           command = cd $dir && ./reloc/build_deb.sh --reloc-pkg $artifact
 
-        build tools/java/build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz: build-submodule-reloc | $builddir/SCYLLA-PRODUCT-FILE $builddir/SCYLLA-VERSION-FILE $builddir/SCYLLA-RELEASE-FILE
-          reloc_dir = tools/java
-        build dist-tools-rpm: build-submodule-rpm tools/java/build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz
-          dir = tools/java
-          artifact = build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz
-        build dist-tools-deb: build-submodule-deb tools/java/build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz
-          dir = tools/java
-          artifact = build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz
-        build dist-tools-tar: phony {' '.join(['$builddir/{mode}/dist/tar/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz'.format(mode=mode, scylla_product=scylla_product, scylla_version=scylla_version, scylla_release=scylla_release) for mode in default_modes])}
-        build dist-tools: phony dist-tools-tar dist-tools-rpm dist-tools-deb
-
         build tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz: build-submodule-reloc | $builddir/SCYLLA-PRODUCT-FILE $builddir/SCYLLA-VERSION-FILE $builddir/SCYLLA-RELEASE-FILE
           reloc_dir = tools/cqlsh
         build dist-cqlsh-rpm: build-submodule-rpm tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz
@@ -2700,11 +2761,11 @@ def write_build_file(f,
           artifact = build/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz
         build dist-python3-tar: phony {' '.join(['$builddir/{mode}/dist/tar/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz'.format(mode=mode, scylla_product=scylla_product, arch=arch, scylla_version=scylla_version, scylla_release=scylla_release) for mode in default_modes])}
         build dist-python3: phony dist-python3-tar dist-python3-rpm dist-python3-deb
-        build dist-deb: phony dist-server-deb dist-python3-deb dist-tools-deb dist-cqlsh-deb
-        build dist-rpm: phony dist-server-rpm dist-python3-rpm dist-tools-rpm dist-cqlsh-rpm
-        build dist-tar: phony dist-unified-tar dist-server-tar dist-python3-tar dist-tools-tar dist-cqlsh-tar
+        build dist-deb: phony dist-server-deb dist-python3-deb dist-cqlsh-deb
+        build dist-rpm: phony dist-server-rpm dist-python3-rpm dist-cqlsh-rpm
+        build dist-tar: phony dist-unified-tar dist-server-tar dist-python3-tar dist-cqlsh-tar
 
-        build dist: phony dist-unified dist-server dist-python3 dist-tools dist-cqlsh
+        build dist: phony dist-unified dist-server dist-python3 dist-cqlsh
         '''))
 
     f.write(textwrap.dedent(f'''\
@@ -2717,12 +2778,10 @@ def write_build_file(f,
         build $builddir/{mode}/dist/tar/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz: copy tools/python3/build/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz
         build $builddir/{mode}/dist/tar/{scylla_product}-python3-package.tar.gz: copy tools/python3/build/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz
         build $builddir/{mode}/dist/tar/{scylla_product}-python3-{arch}-package.tar.gz: copy tools/python3/build/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz
-        build $builddir/{mode}/dist/tar/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz: copy tools/java/build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz
-        build $builddir/{mode}/dist/tar/{scylla_product}-tools-package.tar.gz: copy tools/java/build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz
         build $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz: copy tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz
         build $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-package.tar.gz: copy tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz
 
-        build {mode}-dist: phony dist-server-{mode} dist-server-debuginfo-{mode} dist-python3-{mode} dist-tools-{mode} dist-unified-{mode} dist-cqlsh-{mode}
+        build {mode}-dist: phony dist-server-{mode} dist-server-debuginfo-{mode} dist-python3-{mode} dist-unified-{mode} dist-cqlsh-{mode}
         build dist-{mode}: phony {mode}-dist
         build dist-check-{mode}: dist-check
           mode = {mode}
@@ -2812,6 +2871,12 @@ def create_build_system(args):
         mode_config.update(query_seastar_flags(f'{outdir}/{mode}/seastar/seastar.pc',
                                                mode_config['build_seastar_shared_libs'],
                                                args.staticcxx))
+    # If Scylla is compiled without -g, strip the debug symbols from
+    # the result in case one of the linked static libraries happens to
+    ## have some debug symbols. See issue #23834.
+    for mode, mode_config in build_modes.items():
+        if '-g' not in user_cflags.split() + mode_config['cxxflags'].split():
+            mode_config['cxx_ld_flags'] += ' -Wl,--strip-debug'
 
     ninja = find_ninja()
     with open(args.buildfile, 'w') as f:
@@ -2845,13 +2910,7 @@ def generate_compdb_for_cmake_build(source_dir, build_dir):
     assert seastar_compdb_path, "Seasetar's building system is not configured yet."
     # if the file exists, just overwrite it so we can keep it updated
     with open(os.path.join(source_dir, compdb), 'w+b') as merged_compdb:
-        # "merge-compdb.py" considers all object files under the "--prefix"
-        # directory as relevant. Since CMake generates .o files in
-        # "CMakeFiles" directories, we preserve the compilation rules for
-        # these generated files.
-        prefix = ""
         subprocess.run([os.path.join(source_dir, 'scripts/merge-compdb.py'),
-                        prefix,
                         scylla_compdb_path,
                         seastar_compdb_path],
                        stdout=merged_compdb,
@@ -2877,13 +2936,14 @@ def configure_using_cmake(args):
         'CMAKE_C_COMPILER': args.cc,
         'CMAKE_CXX_COMPILER': args.cxx,
         'CMAKE_CXX_FLAGS': args.user_cflags,
-        'CMAKE_EXE_LINKER_FLAGS': semicolon_separated(args.user_ldflags),
+        'CMAKE_EXE_LINKER_FLAGS': args.user_ldflags,
         'CMAKE_EXPORT_COMPILE_COMMANDS': 'ON',
         'Scylla_CHECK_HEADERS': 'ON',
         'Scylla_DIST': 'ON' if args.enable_dist in (None, True) else 'OFF',
         'Scylla_TEST_TIMEOUT': args.test_timeout,
         'Scylla_TEST_REPEAT': args.test_repeat,
         'Scylla_ENABLE_LTO': 'ON' if args.lto else 'OFF',
+        'Scylla_WITH_DEBUG_INFO' : 'ON' if args.debuginfo else 'OFF',
     }
     if args.date_stamp:
         settings['Scylla_DATE_STAMP'] = args.date_stamp

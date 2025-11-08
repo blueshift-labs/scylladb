@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #include "service/raft/group0_state_machine.hh"
+#include "db/schema_tables.hh"
 #include "mutation/atomic_cell.hh"
 #include "cql3/selection/selection.hh"
 #include "dht/i_partitioner.hh"
@@ -17,8 +18,8 @@
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include "service/broadcast_tables/experimental/query_result.hh"
-#include "schema_mutations.hh"
-#include "frozen_schema.hh"
+#include "schema/schema_mutations.hh"
+#include "schema/frozen_schema.hh"
 #include "serialization_visitors.hh"
 #include "serializer.hh"
 #include "serializer_impl.hh"
@@ -36,8 +37,7 @@
 #include "db/system_keyspace.hh"
 #include "service/storage_proxy.hh"
 #include "service/raft/raft_group0_client.hh"
-#include "partition_slice_builder.hh"
-#include "timestamp.hh"
+#include "mutation/timestamp.hh"
 #include "utils/overloaded_functor.hh"
 #include "utils/to_string.hh"
 #include <optional>
@@ -54,10 +54,13 @@ namespace service {
 static logging::logger slogger("group0_raft_sm");
 
 group0_state_machine::group0_state_machine(raft_group0_client& client, migration_manager& mm, storage_proxy& sp, storage_service& ss,
-        group0_server_accessor server_accessor, gms::gossiper& gossiper, gms::feature_service& feat,
+        gms::gossiper& gossiper, gms::feature_service& feat,
         bool topology_change_enabled)
-    : _client(client), _mm(mm), _sp(sp), _ss(ss), _topology_change_enabled(topology_change_enabled)
-    , _state_id_handler(sp.local_db(), gossiper, server_accessor), _feature_service(feat)
+    : _client(client), _mm(mm), _sp(sp), _ss(ss)
+    , _gate("group0_state_machine")
+    , _topology_change_enabled(topology_change_enabled)
+    , _state_id_handler(ss._topology_state_machine, sp.local_db(), gossiper)
+    , _feature_service(feat)
     , _topology_on_raft_support_listener(feat.supports_consistent_topology_changes.when_enabled([this] () noexcept {
         // Using features to decide whether to start fetching topology snapshots
         // or not is technically not correct because we also use features to guard
@@ -79,7 +82,7 @@ group0_state_machine::group0_state_machine(raft_group0_client& client, migration
     _state_id_handler.run();
 }
 
-static mutation extract_history_mutation(std::vector<canonical_mutation>& muts, const data_dictionary::database db) {
+static mutation extract_history_mutation(utils::chunked_vector<canonical_mutation>& muts, const data_dictionary::database db) {
     auto s = db.find_schema(db::system_keyspace::NAME, db::system_keyspace::GROUP0_HISTORY);
     auto it = std::find_if(muts.begin(), muts.end(), [history_table_id = s->id()]
             (canonical_mutation& m) { return m.column_family_id() == history_table_id; });
@@ -120,8 +123,8 @@ bool should_flush_system_topology_after_applying(const mutation& mut, const data
     return false;
 }
 
-future<> write_mutations_to_database(storage_proxy& proxy, gms::inet_address from, std::vector<canonical_mutation> cms) {
-    std::vector<frozen_mutation_and_schema> mutations;
+future<> write_mutations_to_database(storage_proxy& proxy, gms::inet_address from, utils::chunked_vector<canonical_mutation> cms) {
+    utils::chunked_vector<frozen_mutation_and_schema> mutations;
     mutations.reserve(cms.size());
     bool need_system_topology_flush = false;
     try {
@@ -145,31 +148,66 @@ future<> write_mutations_to_database(storage_proxy& proxy, gms::inet_address fro
     }
 }
 
-group0_state_machine::modules_to_reload group0_state_machine::get_modules_to_reload(const std::vector<canonical_mutation>& mutations) {
+group0_state_machine::modules_to_reload group0_state_machine::get_modules_to_reload(const utils::chunked_vector<canonical_mutation>& mutations) {
     modules_to_reload modules;
 
     for (auto& mut: mutations) {
-        auto id = mut.column_family_id();
-
-        if (id == db::system_keyspace::service_levels_v2()->id()) {
-            modules.service_levels_cache = true;
-        } else if (id == db::system_keyspace::role_members()->id() || id == db::system_keyspace::role_attributes()->id()) {
-            modules.service_levels_effective_cache = true;
-        }
-        if (mut.column_family_id() == db::system_keyspace::dicts()->id()) {
-            modules.compression_dictionary = true;
-        }
+        modules.entries.push_back({.pk = mut.key(), .table = mut.column_family_id()});
     }
 
     return modules;
 }
 
+// Defines set of table_ids, which should reload view building state if any of the table is changed.
+static const std::unordered_set<table_id>& get_view_building_state_tables() {
+    static const std::unordered_set<table_id> ids {
+        db::system_keyspace::view_building_tasks()->id(),
+        db::schema_tables::v3::views()->id(),
+        db::system_keyspace::view_build_status_v2()->id(),
+        db::system_keyspace::tablets()->id(),
+    };
+    return ids;
+}
+
 future<> group0_state_machine::reload_modules(modules_to_reload modules) {
-    if (modules.service_levels_cache || modules.service_levels_effective_cache) { // this also updates SL effective cache
-        co_await _ss.update_service_levels_cache(qos::update_both_cache_levels(modules.service_levels_cache), qos::query_context::group0);
+    bool update_service_levels_cache = false;
+    bool update_service_levels_effective_cache = false;
+    bool make_view_building_state_transition = false;
+    std::unordered_set<table_id> update_cdc_streams;
+
+    for (const auto& m : modules.entries) {
+        if (m.table == db::system_keyspace::service_levels_v2()->id()) {
+            update_service_levels_cache = true;
+        } else if (m.table == db::system_keyspace::role_members()->id() || m.table == db::system_keyspace::role_attributes()->id()) {
+            update_service_levels_effective_cache = true;
+        } else if (m.table == db::system_keyspace::dicts()->id()) {
+            auto pk_type = db::system_keyspace::dicts()->partition_key_type();
+            auto name_value = pk_type->deserialize_value(m.pk.representation());
+            auto name_string = value_cast<sstring>(pk_type->types().front()->deserialize(name_value.front()));
+            co_await _ss.compression_dictionary_updated_callback(name_string);
+        } else if (get_view_building_state_tables().contains(m.table)) {
+            make_view_building_state_transition = true;
+        } else if (m.table == db::system_keyspace::v3::scylla_local()->id()) {
+            make_view_building_state_transition = true;
+        } else if (m.table == db::system_keyspace::cdc_streams_state()->id()) {
+            const auto elements = m.pk.explode(*db::system_keyspace::cdc_streams_state());
+            auto cdc_log_table_id = table_id(value_cast<utils::UUID>(uuid_type->deserialize_value(elements.front())));
+            update_cdc_streams.insert(cdc_log_table_id);
+        } else if (m.table == db::system_keyspace::cdc_streams_history()->id()) {
+            const auto elements = m.pk.explode(*db::system_keyspace::cdc_streams_history());
+            auto cdc_log_table_id = table_id(value_cast<utils::UUID>(uuid_type->deserialize_value(elements.front())));
+            update_cdc_streams.insert(cdc_log_table_id);
+        }
     }
-    if (modules.compression_dictionary) {
-        co_await _ss.compression_dictionary_updated_callback();
+    
+    if (update_service_levels_cache || update_service_levels_effective_cache) { // this also updates SL effective cache
+        co_await _ss.update_service_levels_cache(qos::update_both_cache_levels(update_service_levels_cache), qos::query_context::group0);
+    }
+    if (make_view_building_state_transition) {
+        co_await _ss.view_building_transition();
+    }
+    if (update_cdc_streams.size()) {
+        co_await _ss.load_cdc_streams(std::move(update_cdc_streams));
     }
 }
 
@@ -191,21 +229,26 @@ future<> group0_state_machine::merge_and_apply(group0_state_machine_merger& merg
 
     co_await std::visit(make_visitor(
     [&] (schema_change& chng) -> future<> {
-        return _mm.merge_schema_from(locator::host_id{cmd.creator_id.uuid()}, std::move(chng.mutations));
+        auto modules_to_reload = get_modules_to_reload(chng.mutations);
+        co_await _mm.merge_schema_from(locator::host_id{cmd.creator_id.uuid()}, std::move(chng.mutations));
+        co_await reload_modules(std::move(modules_to_reload));
     },
     [&] (broadcast_table_query& query) -> future<> {
         auto result = co_await service::broadcast_tables::execute_broadcast_table_query(_sp, query.query, cmd.new_state_id);
         _client.set_query_result(cmd.new_state_id, std::move(result));
     },
     [&] (topology_change& chng) -> future<> {
+        auto modules_to_reload = get_modules_to_reload(chng.mutations);
         auto tablet_keys = replica::get_tablet_metadata_change_hint(chng.mutations);
         co_await write_mutations_to_database(_sp, cmd.creator_addr, std::move(chng.mutations));
         co_await _ss.topology_transition({.tablets_hint = std::move(tablet_keys)});
+        co_await reload_modules(std::move(modules_to_reload));
     },
     [&] (mixed_change& chng) -> future<> {
+        auto modules_to_reload = get_modules_to_reload(chng.mutations);
         co_await _mm.merge_schema_from(locator::host_id{cmd.creator_id.uuid()}, std::move(chng.mutations));
         co_await _ss.topology_transition();
-        co_return;
+        co_await reload_modules(std::move(modules_to_reload));
     },
     [&] (write_mutations& muts) -> future<> {
         auto modules_to_reload = get_modules_to_reload(muts.mutations);
@@ -219,7 +262,7 @@ future<> group0_state_machine::merge_and_apply(group0_state_machine_merger& merg
 
 #ifndef SCYLLA_BUILD_MODE_RELEASE
 static void ensure_group0_schema(const group0_command& cmd, const replica::database& db) {
-    auto validate_schema = [&db](const std::vector<canonical_mutation>& mutations) {
+    auto validate_schema = [&db](const utils::chunked_vector<canonical_mutation>& mutations) {
         for (const auto& mut : mutations) {
             // Get the schema for the column family
             auto schema = db.find_schema(mut.column_family_id());
@@ -324,10 +367,16 @@ future<> group0_state_machine::load_snapshot(raft::snapshot_id id) {
     // memory and thus needs to be protected with apply mutex
     auto read_apply_mutex_holder = co_await _client.hold_read_apply_mutex(_abort_source);
     co_await _ss.topology_state_load();
+    co_await _ss.view_building_state_load();
     if (_feature_service.compression_dicts) {
-        co_await _ss.compression_dictionary_updated_callback();
+        co_await _ss.compression_dictionary_updated_callback_all();
+    }
+    co_await _ss.update_service_levels_cache(qos::update_both_cache_levels::yes, qos::query_context::group0);
+    if (_feature_service.cdc_with_tablets) {
+        co_await _ss.load_cdc_streams();
     }
     _ss._topology_state_machine.event.broadcast();
+    _ss._view_building_state_machine.event.broadcast();
 }
 
 future<> group0_state_machine::transfer_snapshot(raft::server_id from_id, raft::snapshot_descriptor snp) {

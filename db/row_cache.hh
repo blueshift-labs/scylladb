@@ -18,8 +18,9 @@
 #include "mutation/partition_version.hh"
 #include "utils/double-decker.hh"
 #include "db/cache_tracker.hh"
-#include "readers/empty_v2.hh"
+#include "readers/empty.hh"
 #include "readers/mutation_source.hh"
+#include "compaction/compaction_garbage_collector.hh"
 
 class row_cache;
 class cache_tracker;
@@ -131,6 +132,8 @@ public:
 
     bool is_dummy_entry() const noexcept { return _flags._dummy_entry; }
 };
+
+using cache_invalidation_filter = std::function<bool(const dht::decorated_key&)>;
 
 //
 // A data source which wraps another data source such that data obtained from the underlying data source
@@ -370,11 +373,12 @@ public:
                                      tracing::trace_state_ptr trace_state = nullptr,
                                      streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
                                      mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::no,
-                                     const tombstone_gc_state* gc_state = nullptr) {
-        if (auto reader_opt = make_reader_opt(s, permit, range, slice, gc_state, std::move(trace_state), fwd, fwd_mr)) {
+                                     const tombstone_gc_state* gc_state = nullptr,
+                                     max_purgeable_fn get_max_purgeable = can_never_purge) {
+        if (auto reader_opt = make_reader_opt(s, permit, range, slice, gc_state, std::move(get_max_purgeable), std::move(trace_state), fwd, fwd_mr)) {
             return std::move(*reader_opt);
         }
-        [[unlikely]] return make_empty_flat_reader_v2(std::move(s), std::move(permit));
+        [[unlikely]] return make_empty_mutation_reader(std::move(s), std::move(permit));
     }
     // Same as make_reader, but returns an empty optional instead of a no-op reader when there is nothing to
     // read. This is an optimization.
@@ -383,6 +387,7 @@ public:
                                      const dht::partition_range&,
                                      const query::partition_slice&,
                                      const tombstone_gc_state*,
+                                     max_purgeable_fn get_max_purgeable,
                                      tracing::trace_state_ptr trace_state = nullptr,
                                      streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
                                      mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::no);
@@ -390,10 +395,11 @@ public:
     mutation_reader make_reader(schema_ptr s,
                                     reader_permit permit,
                                     const dht::partition_range& range = query::full_partition_range,
-                                    const tombstone_gc_state* gc_state = nullptr) {
+                                    const tombstone_gc_state* gc_state = nullptr,
+                                    max_purgeable_fn get_max_purgeable = can_never_purge) {
         auto& full_slice = s->full_slice();
         return make_reader(std::move(s), std::move(permit), range, full_slice, nullptr,
-                streamed_mutation::forwarding::no, mutation_reader::forwarding::no, gc_state);
+                streamed_mutation::forwarding::no, mutation_reader::forwarding::no, gc_state, std::move(get_max_purgeable));
     }
 
     // Only reads what is in the cache, doesn't populate.
@@ -450,8 +456,8 @@ public:
     // completes will see all writes from the underlying
     // mutation source made prior to the call to invalidate().
     future<> invalidate(external_updater, const dht::decorated_key&);
-    future<> invalidate(external_updater, const dht::partition_range& = query::full_partition_range);
-    future<> invalidate(external_updater, dht::partition_range_vector&&);
+    future<> invalidate(external_updater, const dht::partition_range& = query::full_partition_range, cache_invalidation_filter filter = [] (const auto&) { return true; });
+    future<> invalidate(external_updater, dht::partition_range_vector&&, cache_invalidation_filter filter = [] (const auto&) { return true; });
 
     // Evicts entries from cache.
     //

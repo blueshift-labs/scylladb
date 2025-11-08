@@ -112,7 +112,7 @@ future<> modification_statement::check_access(query_processor& qp, const service
     return f;
 }
 
-future<std::vector<mutation>>
+future<utils::chunked_vector<mutation>>
 modification_statement::get_mutations(query_processor& qp, const query_options& options, db::timeout_clock::time_point timeout, bool local, int64_t now, service::query_state& qs, json_cache_opt& json_cache, std::vector<dht::partition_range> keys) const {
     auto cl = options.get_consistency();
     auto ranges = create_clustering_ranges(options, json_cache);
@@ -142,9 +142,9 @@ modification_statement::get_mutations(query_processor& qp, const query_options& 
         update_parameters params(s, options, this->get_timestamp(now, options),
                 this->get_time_to_live(options), std::move(rows));
 
-        std::vector<mutation> mutations = apply_updates(keys, ranges, params, json_cache);
+        utils::chunked_vector<mutation> mutations = apply_updates(keys, ranges, params, json_cache);
 
-        return make_ready_future<std::vector<mutation>>(std::move(mutations));
+        return make_ready_future<utils::chunked_vector<mutation>>(std::move(mutations));
     });
 }
 
@@ -191,13 +191,13 @@ bool modification_statement::applies_to(const selection::selection* selection,
     return expr::evaluate(_condition, inputs) == true_value;
 }
 
-std::vector<mutation> modification_statement::apply_updates(
+utils::chunked_vector<mutation> modification_statement::apply_updates(
         const std::vector<dht::partition_range>& keys,
         const std::vector<query::clustering_range>& ranges,
         const update_parameters& params,
         const json_cache_opt& json_cache) const {
 
-    std::vector<mutation> mutations;
+    utils::chunked_vector<mutation> mutations;
     mutations.reserve(keys.size());
     for (auto key : keys) {
         // We know key.start() must be defined since we only allow EQ relations on the partition key.
@@ -306,12 +306,14 @@ future<coordinator_result<>>
 modification_statement::execute_without_condition(query_processor& qp, service::query_state& qs, const query_options& options, json_cache_opt& json_cache, std::vector<dht::partition_range> keys) const {
     auto cl = options.get_consistency();
     auto timeout = db::timeout_clock::now() + get_timeout(qs.get_client_state(), options);
-    return get_mutations(qp, options, timeout, false, options.get_timestamp(qs), qs, json_cache, std::move(keys)).then([this, cl, timeout, &qp, &qs] (auto mutations) {
+    return get_mutations(qp, options, timeout, false, options.get_timestamp(qs), qs, json_cache, std::move(keys)).then([this, cl, timeout, &qp, &qs, &options] (auto mutations) {
         if (mutations.empty()) {
             return make_ready_future<coordinator_result<>>(bo::success());
         }
-        
-        return qp.proxy().mutate_with_triggers(std::move(mutations), cl, timeout, false, qs.get_trace_state(), qs.get_permit(), db::allow_per_partition_rate_limit::yes, this->is_raw_counter_shard_write());
+
+        return qp.proxy().mutate_with_triggers(std::move(mutations), cl, timeout, false, qs.get_trace_state(), qs.get_permit(), db::allow_per_partition_rate_limit::yes, this->is_raw_counter_shard_write(), {
+            .node_local_only = options.get_specific_options().node_local_only
+        });
     });
 }
 
@@ -375,7 +377,10 @@ future<::shared_ptr<cql_transport::messages::result_message>>
 modification_statement::execute_with_condition(query_processor& qp, service::query_state& qs, const query_options& options) const {
 
     auto cl_for_learn = options.get_consistency();
-    auto cl_for_paxos = options.check_serial_consistency();
+    utils::result_with_exception_ptr<db::consistency_level> cl_for_paxos = options.check_serial_consistency();
+    if (!cl_for_paxos) [[unlikely]] {
+        return make_exception_future<shared_ptr<cql_transport::messages::result_message>>(std::move(cl_for_paxos).assume_error());
+    }
     db::timeout_clock::time_point now = db::timeout_clock::now();
     const timeout_config& cfg = qs.get_client_state().get_timeout_config();
 
@@ -403,15 +408,14 @@ modification_statement::execute_with_condition(query_processor& qp, service::que
 
     auto token = request->key()[0].start()->value().as_decorated_key().token();
 
-    auto shard = service::storage_proxy::cas_shard(*s, token);
+    auto cas_shard = service::cas_shard(*s, token);
 
     if (utils::get_local_injector().is_enabled("forced_bounce_to_shard_counter")) {
-        return process_forced_rebounce(shard, qp, options);
+        return process_forced_rebounce(cas_shard.shard(), qp, options);
     }
-
-    if (shard != this_shard_id()) {
+    if (!cas_shard.this_shard()) {
         return make_ready_future<shared_ptr<cql_transport::messages::result_message>>(
-                qp.bounce_to_shard(shard, std::move(const_cast<cql3::query_options&>(options).take_cached_pk_function_calls()))
+                qp.bounce_to_shard(cas_shard.shard(), std::move(const_cast<cql3::query_options&>(options).take_cached_pk_function_calls()))
             );
     }
 
@@ -423,9 +427,9 @@ modification_statement::execute_with_condition(query_processor& qp, service::que
         tablet_info = erm->check_locality(token);
     }
 
-    return qp.proxy().cas(s, request, request->read_command(qp), request->key(),
+    return qp.proxy().cas(s, std::move(cas_shard), request, request->read_command(qp), request->key(),
             {read_timeout, qs.get_permit(), qs.get_client_state(), qs.get_trace_state()},
-            cl_for_paxos, cl_for_learn, statement_timeout, cas_timeout).then([this, request, tablet_replicas = std::move(tablet_info->tablet_replicas), token_range = tablet_info->token_range] (bool is_applied) {
+            std::move(cl_for_paxos).assume_value(), cl_for_learn, statement_timeout, cas_timeout).then([this, request, tablet_replicas = std::move(tablet_info->tablet_replicas), token_range = tablet_info->token_range] (bool is_applied) {
         auto result = request->build_cas_result_set(_metadata, _columns_of_cas_result_set, is_applied);
         result->add_tablet_info(tablet_replicas, token_range);
         return result;

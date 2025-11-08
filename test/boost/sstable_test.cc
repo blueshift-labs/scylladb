@@ -25,7 +25,7 @@
 #include "test/lib/scylla_test_case.hh"
 #include "test/lib/test_utils.hh"
 #include "schema/schema.hh"
-#include "compress.hh"
+#include "sstables/compressor.hh"
 #include "replica/database.hh"
 #include "test/boost/sstable_test.hh"
 #include "test/lib/tmpdir.hh"
@@ -162,25 +162,29 @@ SEASTAR_TEST_CASE(missing_summary_first_last_sane) {
     });
 }
 
-static future<sstable_ptr> do_write_sst(test_env& env, schema_ptr schema, sstring load_dir, sstring write_dir, sstables::generation_type generation) {
+static future<std::pair<sstable_ptr, sstable_ptr>> do_write_sst(test_env& env, schema_ptr schema, sstring load_dir, sstring write_dir, sstables::generation_type generation) {
     auto sst = co_await env.reusable_sst(std::move(schema), load_dir, generation);
-    sstable_generation_generator gen(generation.as_int());
-    co_await sstables::test(sst).store(write_dir, gen());
-    co_return sst;
+    sstable_generation_generator gen;
+    auto sst2 = co_await sstables::test(sst).store(write_dir, gen());
+    co_return std::make_pair(sst, sst2);
 }
 
-static future<> write_sst_info(schema_ptr schema, sstring load_dir, sstring write_dir, sstables::generation_type generation) {
-    return test_env::do_with_async([schema = std::move(schema), load_dir = std::move(load_dir), write_dir = std::move(write_dir),
-                                    generation = std::move(generation)] (test_env& env) {
-        (void)do_write_sst(env, std::move(schema), std::move(load_dir), std::move(write_dir), std::move(generation)).get();
+static future<std::pair<sstables::generation_type, sstables::generation_type>> write_sst_info(schema_ptr schema, sstring load_dir, sstring write_dir, sstables::generation_type generation) {
+    std::pair<sstables::generation_type, sstables::generation_type> ret;
+    co_await test_env::do_with_async([schema = std::move(schema), load_dir = std::move(load_dir), write_dir = std::move(write_dir),
+                                    generation = std::move(generation), &ret] (test_env& env) {
+        auto [sst1, sst2] = do_write_sst(env, std::move(schema), std::move(load_dir), std::move(write_dir), std::move(generation)).get();
+        ret = std::make_pair(sst1->generation(), sst2->generation());
     });
+    co_return ret;
 }
 
 static future<> check_component_integrity(component_type component) {
     tmpdir tmp;
-    co_await write_sst_info(make_schema_for_compressed_sstable(), "test/resource/sstables/compressed", tmp.path().string(), sstables::generation_type(1));
-    auto file_path_a = sstable::filename("test/resource/sstables/compressed", "ks", "cf", la, sstables::generation_type(1), big, component);
-    auto file_path_b = sstable::filename(tmp.path().string(), "ks", "cf", la, sstables::generation_type(2), big, component);
+    auto load_gen = sstables::generation_type(1);
+    auto [gen1, gen2] = co_await write_sst_info(make_schema_for_compressed_sstable(), "test/resource/sstables/compressed", tmp.path().string(), load_gen);
+    auto file_path_a = sstable::filename("test/resource/sstables/compressed", "ks", "cf", la, load_gen, big, component);
+    auto file_path_b = sstable::filename(tmp.path().string(), "ks", "cf", la, gen2, big, component);
     auto eq = co_await tests::compare_files(file_path_a, file_path_b);
     BOOST_REQUIRE(eq);
 }
@@ -190,17 +194,16 @@ SEASTAR_TEST_CASE(check_compressed_info_func) {
 }
 
 future<>
-write_and_validate_sst(schema_ptr s, sstring dir, noncopyable_function<void (shared_sstable sst1, shared_sstable sst2)> func) {
-    return test_env::do_with_async([s = std::move(s), dir = std::move(dir), func = std::move(func)] (test_env& env) mutable {
-        auto sst1 = do_write_sst(env, s, dir, env.tempdir().path().native(), env.new_generation()).get();
-        auto sst2 = env.make_sstable(s, sst1->get_version());
+write_and_validate_sst(schema_ptr s, sstring dir, sstables::generation_type load_gen, noncopyable_function<void (shared_sstable sst1, shared_sstable sst2)> func) {
+    return test_env::do_with_async([s = std::move(s), dir = std::move(dir), load_gen, func = std::move(func)] (test_env& env) mutable {
+        auto [sst1, sst2] = do_write_sst(env, s, dir, env.tempdir().path().native(), load_gen).get();
         func(std::move(sst1), std::move(sst2));
-    }, test_env_config{ .use_uuid = false });
+    });
 }
 
 SEASTAR_TEST_CASE(check_summary_func) {
     auto s = make_schema_for_compressed_sstable();
-    return write_and_validate_sst(std::move(s), "test/resource/sstables/compressed", [] (shared_sstable sst1, shared_sstable sst2) {
+    return write_and_validate_sst(std::move(s), "test/resource/sstables/compressed", sstables::generation_type(1), [] (shared_sstable sst1, shared_sstable sst2) {
         sstables::test(sst2).read_summary().get();
 
         const summary& sst1_s = sst1->get_summary();
@@ -220,7 +223,7 @@ SEASTAR_TEST_CASE(check_filter_func) {
 
 SEASTAR_TEST_CASE(check_statistics_func) {
     auto s = make_schema_for_compressed_sstable();
-    return write_and_validate_sst(std::move(s), "test/resource/sstables/compressed", [] (shared_sstable sst1, shared_sstable sst2) {
+    return write_and_validate_sst(std::move(s), "test/resource/sstables/compressed", sstables::generation_type(1), [] (shared_sstable sst1, shared_sstable sst2) {
         sstables::test(sst2).read_statistics().get();
         const auto& sst1_s = sst1->get_statistics();
         const auto& sst2_s = sst2->get_statistics();
@@ -237,8 +240,8 @@ SEASTAR_TEST_CASE(check_statistics_func) {
 
 SEASTAR_TEST_CASE(check_toc_func) {
     auto s = make_schema_for_compressed_sstable();
-    return write_and_validate_sst(std::move(s), "test/resource/sstables/compressed", [] (shared_sstable sst1, shared_sstable sst2) {
-        sst2->read_toc().get();
+    return write_and_validate_sst(std::move(s), "test/resource/sstables/compressed", sstables::generation_type(1), [] (shared_sstable sst1, shared_sstable sst2) {
+        sstables::test(sst2).read_toc().get();
         auto& sst1_c = sstables::test(sst1).get_components();
         auto& sst2_c = sstables::test(sst2).get_components();
 
@@ -444,6 +447,10 @@ static future<shared_sstable> load_large_partition_sst(test_env& env, const ssta
 // search for anything.
 SEASTAR_TEST_CASE(promoted_index_read) {
   return for_each_sstable_version([] (const sstables::sstable::version_types version) {
+    if (!has_summary_and_index(version)) {
+        // This test is so basic that updating it to support `ms` sstables is not worth the effort.
+        return make_ready_future<>();
+    }
     return test_env::do_with_async([version] (test_env& env) {
         auto sstp = load_large_partition_sst(env, version).get();
         std::vector<sstables::test::index_entry> vec = sstables::test(sstp).read_indexes(env.make_reader_permit()).get();
@@ -649,7 +656,7 @@ SEASTAR_TEST_CASE(test_skipping_in_compressed_stream) {
         sstables::compression c;
         // this initializes "c"
         auto os = make_file_output_stream(f, file_output_stream_options()).get();
-        auto out = make_compressed_file_m_format_output_stream(std::move(os), &c, cp);
+        auto out = make_compressed_file_m_format_output_stream(std::move(os), &c, cp, make_lz4_sstable_compressor_for_tests());
 
         // Make sure that amount of written data is a multiple of chunk_len so that we hit #2143.
         temporary_buffer<char> buf1(c.uncompressed_chunk_length());
@@ -669,7 +676,10 @@ SEASTAR_TEST_CASE(test_skipping_in_compressed_stream) {
 
         auto make_is = [&] {
             f = open_file_dma(file_path, open_flags::ro).get();
-            return make_compressed_file_m_format_input_stream(f, &c, 0, uncompressed_size, opts, semaphore.make_permit(), std::nullopt);
+            auto stream_creator = [f](uint64_t pos, uint64_t len, file_input_stream_options options)->future<input_stream<char>> {
+                co_return input_stream<char>(make_file_data_source(std::move(f), pos, len, std::move(options)));
+            };
+            return make_compressed_file_m_format_input_stream(stream_creator, &c, 0, uncompressed_size, opts, semaphore.make_permit(), std::nullopt);
         };
 
         auto expect = [] (input_stream<char>& in, const temporary_buffer<char>& buf) {
@@ -682,36 +692,48 @@ SEASTAR_TEST_CASE(test_skipping_in_compressed_stream) {
             BOOST_REQUIRE(b.empty());
         };
 
+      {
         auto in = make_is();
         expect(in, buf1);
         expect(in, buf2);
         expect_eof(in);
+      }
 
-        in = make_is();
+      {
+        auto in = make_is();
         in.skip(0).get();
         expect(in, buf1);
         expect(in, buf2);
         expect_eof(in);
+      }
 
-        in = make_is();
+      {
+        auto in = make_is();
         expect(in, buf1);
         in.skip(0).get();
         expect(in, buf2);
         expect_eof(in);
+      }
 
-        in = make_is();
+      {
+        auto in = make_is();
         expect(in, buf1);
         in.skip(opts.buffer_size).get();
         expect_eof(in);
+      }
 
-        in = make_is();
+      {
+        auto in = make_is();
         in.skip(opts.buffer_size * 2).get();
         expect_eof(in);
+      }
 
-        in = make_is();
+      {
+        auto in = make_is();
         in.skip(opts.buffer_size).get();
         in.skip(opts.buffer_size).get();
         expect_eof(in);
+      }
     });
 }
 

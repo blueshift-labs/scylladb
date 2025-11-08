@@ -8,6 +8,7 @@ import logging
 import time
 import pytest
 
+from test.pylib.internal_types import ServerInfo
 from test.pylib.manager_client import ManagerClient
 from test.pylib.rest_client import get_host_api_address, read_barrier
 from test.pylib.util import wait_for_cql_and_get_hosts
@@ -18,7 +19,7 @@ from test.cluster.test_group0_schema_versioning import get_group0_schema_version
 
 
 @pytest.mark.asyncio
-async def test_raft_recovery_entry_lose(manager: ManagerClient):
+async def test_raft_recovery_entry_loss(manager: ManagerClient):
     """
     Test that the Raft-based recovery procedure works correctly if some committed group 0 entry has been permanently
     lost (it has been committed only by dead nodes).
@@ -38,6 +39,9 @@ async def test_raft_recovery_entry_lose(manager: ManagerClient):
     5. Check that node 1 has moved its group 0 state to v2.
     6. Remove nodes 3-5 from topology using the standard removenode procedure.
     7. Add a new node (a sanity check verifying that the cluster is functioning properly).
+
+    Additionally, verify that no schema pulls take place during the recovery procedure at the end of the test. This is
+    a regression test for https://github.com/scylladb/scylladb/issues/26569.
     """
     logging.info('Adding initial servers')
     servers = await manager.servers_add(5)
@@ -78,12 +82,10 @@ async def test_raft_recovery_entry_lose(manager: ManagerClient):
     logging.info(f'Found group 0 schema version {v_group0}')
 
     logging.info(f'Killing {dead_servers}')
-    for srv in dead_servers:
-        await manager.server_stop(server_id=srv.server_id)
+    await asyncio.gather(*(manager.server_stop(server_id=srv.server_id) for srv in dead_servers))
 
     logging.info(f'Starting {live_servers}')
-    for srv in live_servers:
-        await manager.server_start(srv.server_id)
+    await asyncio.gather(*(manager.server_start(server_id=srv.server_id) for srv in live_servers))
 
     cql = await reconnect_driver(manager)
     hosts = await wait_for_cql_and_get_hosts(cql, live_servers, time.time() + 60)
@@ -99,6 +101,9 @@ async def test_raft_recovery_entry_lose(manager: ManagerClient):
     logging.info(f'Restarting {live_servers}')
     await manager.rolling_restart(live_servers)
 
+    await reconnect_driver(manager)
+    cql, _ = await manager.get_ready_cql(live_servers)
+
     logging.info(f'Deleting the persistent discovery state and group 0 ID on {live_servers}')
     for h in hosts:
         await delete_discovery_state_and_group0_id(cql, h)
@@ -106,15 +111,17 @@ async def test_raft_recovery_entry_lose(manager: ManagerClient):
     # FIXME: check that the way to identify the leader works when it's implemented (whatever it will be).
 
     recovery_leader_id = await manager.get_host_id(live_servers[1].server_id)
-    logging.info(f'Setting recovery leader to {live_servers[1].server_id} on {live_servers}')
-    for srv in live_servers:
+
+    async def set_recovery_leader(srv: ServerInfo):
         await manager.server_update_config(srv.server_id, 'recovery_leader', recovery_leader_id)
 
-    # Restart twice to check that noninitial restarts with recovery_leader work. Noninitial restarts should not break
+    logging.info(f'Restarting {live_servers[::-1]} with recovery leader {live_servers[1].server_id}')
+    await manager.rolling_restart(live_servers[::-1], with_down=set_recovery_leader)
+
+    # Restart again to check that noninitial restarts with recovery_leader work. Noninitial restarts should not break
     # the recovery procedure. Note that nodes join the new group 0 only during the first restart with
     # recovery_leader, so the following restarts have a different execution path.
-    logging.info(f'Restarting {live_servers[::-1]} twice')
-    await manager.rolling_restart(live_servers[::-1])
+    logging.info(f'Restarting {live_servers[::-1]} again')
     await manager.rolling_restart(live_servers[::-1])
 
     cql = await reconnect_driver(manager)
@@ -136,7 +143,7 @@ async def test_raft_recovery_entry_lose(manager: ManagerClient):
 
     logging.info(f'Unsetting the recovery_leader config option on {live_servers}')
     for srv in live_servers:
-        await manager.server_update_config(srv.server_id, 'recovery_leader', '')
+        await manager.server_remove_config_option(srv.server_id, 'recovery_leader')
 
     cql = await reconnect_driver(manager)
     hosts = await wait_for_cql_and_get_hosts(cql, live_servers, time.time() + 60)
@@ -152,10 +159,17 @@ async def test_raft_recovery_entry_lose(manager: ManagerClient):
 
     logging.info('Adding a new server')
     new_server = await manager.server_add()
+    live_servers.append(new_server)
 
-    hosts = await wait_for_cql_and_get_hosts(cql, live_servers + [new_server], time.time() + 60)
+    hosts = await wait_for_cql_and_get_hosts(cql, live_servers, time.time() + 60)
 
     logging.info(f'Performing consistency checks after adding {new_server}')
     await wait_for_cdc_generations_publishing(cql, hosts, time.time() + 60)
     await check_token_ring_and_group0_consistency(manager)
     await check_system_topology_and_cdc_generations_v3_consistency(manager, hosts, ignored_hosts=dead_hosts)
+
+    logging.info(f'Checking that there were no schema pulls on {live_servers}')
+    log_files = await asyncio.gather(*[manager.server_open_log(srv.server_id) for srv in live_servers])
+    for log_file in log_files:
+        matches = await log_file.grep('Requesting schema pull') + await log_file.grep('Pulling schema')
+        assert not matches

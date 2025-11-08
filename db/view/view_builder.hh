@@ -8,7 +8,7 @@
 
 #pragma once
 
-#include "query-request.hh"
+#include "query/query-request.hh"
 #include "service/migration_listener.hh"
 #include "service/raft/raft_group0_client.hh"
 #include "utils/serialized_action.hh"
@@ -114,6 +114,16 @@ class view_builder final : public service::migration_listener::only_view_notific
         std::optional<dht::token> next_token;
     };
 
+    /**
+     * view build progress status that is loaded from the table and used during initialization.
+     * similar to view_build_status except it may have null first_token if the shard didn't register itself yet.
+     */
+    struct view_build_init_status final {
+        view_ptr view;
+        std::optional<dht::token> first_token;
+        std::optional<dht::token> next_token;
+    };
+
     struct stats {
         uint64_t steps_performed = 0;
         uint64_t steps_failed = 0;
@@ -180,7 +190,7 @@ class view_builder final : public service::migration_listener::only_view_notific
 
     struct view_builder_init_state {
         std::vector<future<>> bookkeeping_ops;
-        std::vector<std::vector<view_build_status>> status_per_shard;
+        std::vector<std::vector<view_build_init_status>> status_per_shard;
         std::unordered_set<table_id> built_views;
     };
 
@@ -195,6 +205,7 @@ public:
     static constexpr size_t batch_memory_max = 1024*1024;
 
     replica::database& get_db() noexcept { return _db; }
+    db::system_keyspace& get_sys_ks() noexcept { return _sys_ks; }
 
 public:
     view_builder(replica::database&, db::system_keyspace&, db::system_distributed_keyspace&, service::migration_notifier&, view_update_generator& vug,
@@ -218,7 +229,7 @@ public:
      */
     future<> stop();
 
-    static future<> generate_mutations_on_node_left(replica::database& db, db::system_keyspace& sys_ks, api::timestamp_type timestamp, locator::host_id host_id, std::vector<canonical_mutation>& muts);
+    static future<> generate_mutations_on_node_left(replica::database& db, db::system_keyspace& sys_ks, api::timestamp_type timestamp, locator::host_id host_id, utils::chunked_vector<canonical_mutation>& muts);
 
     static future<> migrate_to_v1_5(locator::token_metadata_ptr tmptr, db::system_keyspace& sys_ks, cql3::query_processor& qp, service::raft_group0_client& group0_client, abort_source& as, service::group0_guard guard);
     static future<> migrate_to_v2(locator::token_metadata_ptr tmptr, db::system_keyspace& sys_ks, cql3::query_processor& qp, service::raft_group0_client& group0_client, abort_source& as, service::group0_guard guard);
@@ -245,8 +256,8 @@ public:
 private:
     build_step& get_or_create_build_step(table_id);
     future<> initialize_reader_at_current_token(build_step&);
-    void load_view_status(view_build_status, std::unordered_set<table_id>&);
-    void reshard(std::vector<std::vector<view_build_status>>, std::unordered_set<table_id>&);
+    void load_view_status(view_build_init_status, std::unordered_set<table_id>&);
+    void reshard(std::vector<std::vector<view_build_init_status>>, std::unordered_set<table_id>&);
     void setup_shard_build_step(view_builder_init_state& vbi, std::vector<system_keyspace_view_name>, std::vector<system_keyspace_view_build_progress>);
     future<> calculate_shard_build_step(view_builder_init_state& vbi);
     future<> add_new_view(view_ptr, build_step&);

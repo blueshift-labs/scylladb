@@ -12,6 +12,7 @@
 
 #include <seastar/core/metrics_registration.hh>
 #include "utils/histogram.hh"
+#include "utils/estimated_histogram.hh"
 #include "cql3/stats.hh"
 
 namespace alternator {
@@ -21,7 +22,6 @@ namespace alternator {
 // visible by the metrics REST API, with the "alternator" prefix.
 class stats {
 public:
-    stats();
     // Count of DynamoDB API operations by types
     struct {
         uint64_t batch_get_item = 0;
@@ -75,7 +75,47 @@ public:
         utils::timed_rate_moving_average_summary_and_histogram batch_write_item_latency;
         utils::timed_rate_moving_average_summary_and_histogram batch_get_item_latency;
         utils::timed_rate_moving_average_summary_and_histogram get_records_latency;
+
+        utils::estimated_histogram batch_get_item_histogram{22}; // a histogram that covers the range 1 - 100
+        utils::estimated_histogram batch_write_item_histogram{22}; // a histogram that covers the range 1 - 100
     } api_operations;
+    // Operation size metrics
+    struct {
+        // Item size statistics collected per table and aggregated per node.
+        // Each histogram covers the range 0 - 446. Resolves #25143.
+        // A size is the retrieved item's size.
+        utils::estimated_histogram get_item_op_size_kb{30};
+        // A size is the maximum of the new item's size and the old item's size.
+        utils::estimated_histogram put_item_op_size_kb{30};
+        // A size is the deleted item's size. If the deleted item's size is
+        // unknown (i.e. read-before-write wasn't necessary and it wasn't
+        // forced by a configuration option), it won't be recorded on the
+        // histogram.
+        utils::estimated_histogram delete_item_op_size_kb{30};
+        // A size is the maximum of existing item's size and the estimated size
+        // of the update. This will be changed to the maximum of the existing item's
+        // size and the new item's size in a subsequent PR.
+        utils::estimated_histogram update_item_op_size_kb{30};
+
+        // A size is the sum of the sizes of all items per table. This means
+        // that a single BatchGetItem / BatchWriteItem updates the histogram
+        // for each table that it has items in.
+        // The sizes are the retrieved items' sizes grouped per table.
+        utils::estimated_histogram batch_get_item_op_size_kb{30};
+        // The sizes are the the written items' sizes grouped per table.
+        utils::estimated_histogram batch_write_item_op_size_kb{30};
+    } operation_sizes;
+    // Count of authentication and authorization failures, counted if either
+    // alternator_enforce_authorization or alternator_warn_authorization are
+    // set to true. If both are false, no authentication or authorization
+    // checks are performed, so failures are not recognized or counted.
+    // "authentication" failure means the request was not signed with a valid
+    // user and key combination. "authorization" failure means the request was
+    // authenticated to a valid user - but this user did not have permissions
+    // to perform the operation (considering RBAC settings and the user's
+    // superuser status).
+    uint64_t authentication_failures = 0;
+    uint64_t authorization_failures = 0;
     // Miscellaneous event counters
     uint64_t total_operations = 0;
     uint64_t unsupported_operations = 0;
@@ -84,7 +124,7 @@ public:
     uint64_t shard_bounce_for_lwt = 0;
     uint64_t requests_blocked_memory = 0;
     uint64_t requests_shed = 0;
-    uint64_t rcu_total = 0;
+    uint64_t rcu_half_units_total = 0;
     // wcu can results from put, update, delete and index
     // Index related will be done on top of the operation it comes with
     enum wcu_types {
@@ -98,10 +138,33 @@ public:
     uint64_t wcu_total[NUM_TYPES] = {0};
     // CQL-derived stats
     cql3::cql_stats cql_stats;
-private:
-    // The metric_groups object holds this stat object's metrics registered
-    // as long as the stats object is alive.
-    seastar::metrics::metric_groups _metrics;
+
+    // Enumeration of expression types only for stats
+    // if needed it can be extended e.g. per operation 
+    enum expression_types {
+        UPDATE_EXPRESSION,
+        CONDITION_EXPRESSION,
+        PROJECTION_EXPRESSION,
+        NUM_EXPRESSION_TYPES
+    };
+    struct {
+        struct {
+            uint64_t hits = 0;
+            uint64_t misses = 0;
+        } requests[NUM_EXPRESSION_TYPES];
+        uint64_t evictions = 0;
+    } expression_cache;
 };
+
+struct table_stats {
+    table_stats(const sstring& ks, const sstring& table);
+    seastar::metrics::metric_groups _metrics;
+    lw_shared_ptr<stats> _stats;
+};
+void register_metrics(seastar::metrics::metric_groups& metrics, const stats& stats);
+
+inline uint64_t bytes_to_kb_ceil(uint64_t bytes) {
+    return (bytes + 1023) / 1024;
+}
 
 }

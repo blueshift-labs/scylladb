@@ -66,17 +66,51 @@ isolation policy for a specific table can be overridden by tagging the table
     and will likely be removed in the future.
 
 ## Accessing system tables from Scylla
- * Scylla exposes lots of useful information via its internal system tables,
-   which can be found in system keyspaces: 'system', 'system\_auth', etc.
-   In order to access to these tables via alternator interface,
-   Scan and Query requests can use a special table name:
-   .scylla.alternator.KEYSPACE\_NAME.TABLE\_NAME
-   which will return results fetched from corresponding Scylla table.
-   This interface can be used only to fetch data from system tables.
-   Attempts to read regular tables via the virtual interface will result
-   in an error.
-   Example: in order to query the contents of Scylla's system.large_rows,
-   pass TableName='.scylla.alternator.system.large_rows' to a Query/Scan request.
+Scylla exposes lots of useful information via its internal system tables,
+which can be found in system keyspaces: 'system', 'system\_auth', etc.
+In order to access to these tables via alternator interface,
+Scan and Query requests can use a special table name:
+`.scylla.alternator.KEYSPACE_NAME.TABLE_NAME`
+which will return results fetched from corresponding Scylla table.
+
+This interface can be used only to fetch data from system tables.
+Attempts to read regular tables via the virtual interface will result
+in an error.
+
+Example: in order to query the contents of Scylla's `system.large_rows`,
+pass `TableName='.scylla.alternator.system.large_rows'` to a Query/Scan
+request.
+
+Note that currently only `Scan` and `Query` on system tables is supported -
+`GetItem` is not (so use `Query` even to read a single item).
+
+If the `alternator_allow_system_table_write` configuration option is set to
+true (by default, it is false), system tables can also be written to. This
+can be useful for, for example, modifying configuration options. Even when
+writing system tables is enabled, the role sending the command must be a
+superuser or the write will be denied.
+
+### Listing ongoing requests
+One useful system table to read is `.scylla.alternator.system.clients`,
+which lists the currently active Alternator clients. Reading from this
+virtual table produces an item for each request currently being handled.
+Each item has the following attributes:
+
+  * `client_type` is always `alternator` for Alternator requests.
+  * `address` and `port` say where the request came from.
+  * `ssl_enabled` is `true` for an HTTPS request, `false` for HTTP.
+  * `shard_id` is the shard (CPU core) handling this request on the server.
+  * `driver_name` is the User-Agent HTTP header sent by the driver.
+     This string usually begins with the driver's name and version, such
+     as `Boto3/1.38.46`, `aws-sdk-java/1.11.919` or `aws-sdk-java/2.25.31`,
+     and followed by additional information sent by the driver.
+  * `username` is the username used to sign this request.
+  * `scheduling_group` is the scheduling group handling this request.
+
+The same system table also lists CQL connections if there are any - those
+have `client_type` set to CQL. Note that for CQL, each item describes a
+connection (either active or idle), not necessarily an active request as
+in Alternator.
 
 ## Service discovery
 As explained in [Scylla Alternator for DynamoDB users](compatibility.md),
@@ -173,17 +207,6 @@ a new table with CreateTable - changing it later has no effect.
 Because the tablets support is incomplete, when tablets are enabled for an
 Alternator table, the following features will not work for this table:
 
-* The table must have one of the write isolation modes which does not
-  not use LWT, because it's not supported with tablets. The allowed write
-  isolation modes are `forbid_rmw` or `unsafe_rmw`.
-  Setting the isolation mode to `always_use_lwt` will succeed, but the writes
-  themselves will fail with an InternalServerError. At that point you can
-  still change the write isolation mode of the table to a supported mode.
-  See <https://github.com/scylladb/scylladb/issues/18068>.
-
-* Enabling TTL with UpdateTableToLive doesn't work (results in an error).
-  See <https://github.com/scylladb/scylla/issues/16567>.
-
 * Enabling Streams with CreateTable or UpdateTable doesn't work
   (results in an error).
-  See <https://github.com/scylladb/scylla/issues/16317>.
+  See <https://github.com/scylladb/scylla/issues/23838>.

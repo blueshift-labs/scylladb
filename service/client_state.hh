@@ -13,7 +13,7 @@
 #include "auth/service.hh"
 #include "exceptions/exceptions.hh"
 #include "timeout_config.hh"
-#include "timestamp.hh"
+#include "mutation/timestamp.hh"
 #include "replica/database_fwd.hh"
 #include "auth/authenticated_user.hh"
 #include "auth/authenticator.hh"
@@ -105,6 +105,7 @@ private:
     std::optional<sstring> _driver_name, _driver_version;
 
     auth_state _auth_state = auth_state::UNINITIALIZED;
+    bool _control_connection = false;
 
     // isInternal is used to mark ClientState as used by some internal component
     // that should have an ability to modify system keyspace.
@@ -140,6 +141,14 @@ public:
 
     void set_auth_state(auth_state new_state) noexcept {
         _auth_state = new_state;
+    }
+
+    bool is_control_connection() const noexcept {
+        return _control_connection;
+    }
+
+    bool set_control_connection() noexcept {
+        return _control_connection = true;
     }
 
     std::optional<sstring> get_driver_name() const {
@@ -332,7 +341,7 @@ public:
     future<> has_all_keyspaces_access(auth::permission) const;
     future<> has_keyspace_access(const sstring&, auth::permission) const;
     future<> has_column_family_access(const sstring&, const sstring&, auth::permission,
-                                      auth::command_desc::type = auth::command_desc::type::OTHER) const;
+                                      auth::command_desc::type = auth::command_desc::type::OTHER, std::optional<bool> is_vector_indexed = std::nullopt) const;
     future<> has_schema_access(const schema& s, auth::permission p) const;
     future<> has_schema_access(const sstring&, const sstring&, auth::permission p) const;
 
@@ -340,11 +349,14 @@ public:
     future<> has_functions_access(const sstring& ks, auth::permission p) const;
     future<> has_function_access(const sstring& ks, const sstring& function_signature, auth::permission p) const;
 private:
-    future<> has_access(const sstring& keyspace, auth::command_desc) const;
+    future<> check_internal_table_permissions(std::string_view ks, std::string_view table_name, const auth::command_desc& cmd) const;
+    future<> has_access(const sstring& keyspace, auth::command_desc, std::optional<bool> is_vector_indexed = std::nullopt) const;
+    sstring generate_authorization_error_msg(const auth::command_desc&) const;
+    sstring generate_authorization_error_msg(const auth::command_desc_with_permission_set&) const;
 
 public:
-    future<bool> check_has_permission(auth::command_desc) const;
-    future<> ensure_has_permission(auth::command_desc) const;
+    template<typename Cmd = auth::command_desc> future<bool> check_has_permission(Cmd) const;
+    template<typename Cmd = auth::command_desc> future<> ensure_has_permission(Cmd) const;
     future<> maybe_update_per_service_level_params();
     void update_per_service_level_params(qos::service_level_options& slo);
 

@@ -91,6 +91,18 @@ options {
         throw expressions_syntax_error(format("{} at char {}", err,
             ex->get_charPositionInLine()));
     }
+
+    // ANTLR3 tries to recover missing tokens - it tries to finish parsing
+    // and create valid objects, as if the missing token was there.
+    // But it has a bug and leaks these tokens.
+    // We override offending method and handle abandoned pointers.
+    std::vector<std::unique_ptr<TokenType>> _missing_tokens;
+    TokenType* getMissingSymbol(IntStreamType* istream, ExceptionBaseType* e,
+                                ANTLR_UINT32 expectedTokenType, BitsetListType* follow) {
+        auto token = BaseType::getMissingSymbol(istream, e, expectedTokenType, follow);
+        _missing_tokens.emplace_back(token);
+        return token;
+    }
 }
 @lexer::context {
     void displayRecognitionError(ANTLR_UINT8** token_names, ExceptionBaseType* ex) {
@@ -184,7 +196,13 @@ path_component: NAME | NAMEREF;
 path returns [parsed::path p]:
     root=path_component           { $p.set_root($root.text); }
     (   '.' name=path_component   { $p.add_dot($name.text); }
-      | '[' INTEGER ']'           { $p.add_index(std::stoi($INTEGER.text)); }
+      | '[' INTEGER ']'           {
+                try {
+                    $p.add_index(std::stoi($INTEGER.text));
+                } catch(std::out_of_range&) {
+                    throw expressions_syntax_error("list index out of integer range");
+                }
+            }
     )*;
 
 /* See comment above why the "depth" counter was needed here */
@@ -230,7 +248,7 @@ update_expression_clause returns [parsed::update_expression e]:
 // Note the "EOF" token at the end of the update expression. We want to the
 //  parser to match the entire string given to it - not just its beginning!
 update_expression returns [parsed::update_expression e]:
-    (update_expression_clause { e.append($update_expression_clause.e); })* EOF;
+    (update_expression_clause { e.append($update_expression_clause.e); })+ EOF;
 
 projection_expression returns [std::vector<parsed::path> v]:
     p=path      { $v.push_back(std::move($p.p)); }
@@ -257,6 +275,13 @@ primitive_condition returns [parsed::primitive_condition c]:
          (',' v=value[0] { $c.add_value(std::move($v.v)); })*
          ')'
       )?
+      {
+          // Post-parse check to reject non-function single values
+          if ($c._op == parsed::primitive_condition::type::VALUE &&
+              !$c._values.front().is_func()) {
+              throw expressions_syntax_error("Single value must be a function");
+          }
+      }
     ;
 
 // The following rules for parsing boolean expressions are verbose and

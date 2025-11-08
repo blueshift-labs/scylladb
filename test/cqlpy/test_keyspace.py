@@ -10,10 +10,51 @@ import pytest
 from cassandra.protocol import SyntaxException, AlreadyExists, InvalidRequest, ConfigurationException
 from threading import Thread
 
+from test.cluster.util import parse_replication_options, get_replication, get_replica_count
+
+
 # A basic tests for successful CREATE KEYSPACE and DROP KEYSPACE
 def test_create_and_drop_keyspace(cql, this_dc):
     cql.execute("CREATE KEYSPACE test_create_and_drop_keyspace WITH REPLICATION = { 'class' : 'NetworkTopologyStrategy', '" + this_dc + "' : 1 }")
     cql.execute("DROP KEYSPACE test_create_and_drop_keyspace")
+
+def assert_keyspace(cql, keyspace, expected_class, rf_key):
+    rep = get_replication(cql, keyspace)
+    assert rep["class"] == expected_class
+    assert get_replica_count(rep[rf_key]) == 1
+
+# Trying to create a keyspace specifying replication options without replication strategy
+# should result in NetworkTopologyStrategy being set by default.
+def test_create_and_drop_keyspace_with_default_replication_class(cql, this_dc):
+    with new_test_keyspace(cql, "WITH REPLICATION = { 'replication_factor' : '1' }") as keyspace:
+        assert_keyspace(cql, keyspace, "org.apache.cassandra.locator.NetworkTopologyStrategy", this_dc)
+
+# Trying to create a keyspace specifying replication options without replication factor
+# should fail since SimpleStrategy does not support default replication factor
+def test_create_and_drop_keyspace_simple_strategy_with_default_replication_factor(cql, this_dc):
+    # create and drop a keyspace with SimpleStrategy and default replication factor
+    with pytest.raises(ConfigurationException):
+        with new_test_keyspace(cql, "WITH REPLICATION = { 'class' : 'SimpleStrategy' }") as keyspace:
+            pass
+
+# Trying to create a keyspace specifying replication options without replication factor
+# should result in a replication factor of 1 being set by default.
+def test_create_and_drop_keyspace_network_topology_strategy_with_default_replication_factor(cql, this_dc):
+    with new_test_keyspace(cql, "WITH REPLICATION = { 'class' : 'NetworkTopologyStrategy' }") as keyspace:
+        assert_keyspace(cql, keyspace, "org.apache.cassandra.locator.NetworkTopologyStrategy", this_dc)
+
+# Trying to create a keyspace specifying empty replication options
+# should result in NetworkTopologyStrategy and replication factor of 1 being set by default.
+def test_create_and_drop_keyspace_with_default_replication_options(cql, this_dc):
+    with new_test_keyspace(cql, "WITH REPLICATION = {}") as keyspace:
+        assert_keyspace(cql, keyspace, "org.apache.cassandra.locator.NetworkTopologyStrategy", this_dc)
+
+# The "WITH REPLICATION" part of CREATE KEYSPACE may be omitted.
+# Trying to create a keyspace with no replication options at all
+# should result in NetworkTopologyStrategy and replication factor of 1 being set by default.
+def test_create_and_drop_keyspace_with_no_replication_options(cql, this_dc):
+    with new_test_keyspace(cql, "") as keyspace:
+        assert_keyspace(cql, keyspace, "org.apache.cassandra.locator.NetworkTopologyStrategy", this_dc)
 
 # Trying to create the same keyspace - even if with identical parameters -
 # should result in an AlreadyExists error.
@@ -30,23 +71,36 @@ def test_create_keyspace_if_not_exists(cql, this_dc):
     cql.execute("CREATE KEYSPACE IF NOT EXISTS test_create_keyspace_if_not_exists WITH REPLICATION = { 'class' : 'NetworkTopologyStrategy', '" + this_dc + "' : 1 }")
     # It doesn't matter if the second invocation has different parameters,
     # they are ignored.
-    cql.execute("CREATE KEYSPACE IF NOT EXISTS test_create_keyspace_if_not_exists WITH REPLICATION = { 'class' : 'NetworkTopologyStrategy', '" + this_dc + "' : 2 }")
+    cql.execute("CREATE KEYSPACE IF NOT EXISTS test_create_keyspace_if_not_exists WITH REPLICATION = { 'class' : 'SimpleStrategy', 'replication_factor' : 2 }")
     cql.execute("DROP KEYSPACE test_create_keyspace_if_not_exists")
 
-# The "WITH REPLICATION" part of CREATE KEYSPACE may not be omitted - trying
-# to do so should result in a syntax error:
-def test_create_keyspace_missing_with(cql):
-    with pytest.raises(SyntaxException):
-        cql.execute("CREATE KEYSPACE test_create_and_drop_keyspace")
+# We treat ALTER to numeric RF of same count as no-op.
+def test_alter_rack_list_to_same_count_numeric_rf(cql, this_dc, scylla_only):
+    with new_test_keyspace(cql, f"WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', '{this_dc}': ['rack1'] }}") as keyspace:
+        cql.execute(f"ALTER KEYSPACE {keyspace} WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', '{this_dc}': 1 }}")
+        assert get_replication(cql, keyspace)[this_dc] == ['rack1']
+        cql.execute(f"ALTER KEYSPACE {keyspace} WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', '{this_dc}': ['rack1'] }}")
 
-# The documentation states that "Keyspace names can have up to 48 alpha-
+def test_empty_rack_list_is_accepted(cql, this_dc, scylla_only):
+    with new_test_keyspace(cql, f"WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', '{this_dc}': ['rack1'] }}") as keyspace:
+        cql.execute(f"ALTER KEYSPACE {keyspace} WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', '{this_dc}': [] }}")
+        assert this_dc not in get_replication(cql, keyspace)
+
+def test_can_alter_rack_list_to_0(cql, this_dc, scylla_only):
+    with new_test_keyspace(cql, f"WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', '{this_dc}': ['rack1'] }}") as keyspace:
+        cql.execute(f"ALTER KEYSPACE {keyspace} WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', '{this_dc}': 0 }}")
+
+def test_can_alter_to_rack_list_from_0(cql, this_dc, scylla_only):
+    with new_test_keyspace(cql, f"WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', '{this_dc}': 0 }}") as keyspace:
+        cql.execute(f"ALTER KEYSPACE {keyspace} WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', '{this_dc}': ['rack1'] }}")
+        assert get_replication(cql, keyspace)[this_dc] == ['rack1']
+
+# The documentation states that "Keyspace names can have alpha-
 # numeric characters and contain underscores; only letters and numbers are
 # supported as the first character.". This is not accurate. Test what is actually
 # enforced:
 def test_create_keyspace_invalid_name(cql, this_dc):
     rep = " WITH REPLICATION = { 'class' : 'NetworkTopologyStrategy', '" + this_dc + "' : 1 }"
-    with pytest.raises(InvalidRequest, match='48'):
-        cql.execute('CREATE KEYSPACE ' + 'x'*49 + rep)
     # The name xyz!123, unquoted, is a syntax error. With quotes it's valid
     # syntax, but an illegal name.
     with pytest.raises(SyntaxException):
@@ -101,11 +155,11 @@ def test_create_keyspace_double_with(cql):
 def test_create_keyspace_with_case_sensitive_replication_factor_tag(cql):
     ks = unique_name()
     # lowercase 'replication_factor' should be accepted
-    with new_test_keyspace(cql, "WITH REPLICATION = { 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 3 }"):
+    with new_test_keyspace(cql, "WITH REPLICATION = { 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1 }"):
         pass
     # 'replication_factor' in any other case than the lowercase should be rejected
     with pytest.raises(ConfigurationException):
-        cql.execute(f"CREATE KEYSPACE {ks} WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', 'Replication_factor' : 3 }}")
+        cql.execute(f"CREATE KEYSPACE {ks} WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', 'Replication_factor' : 1 }}")
 
 # Test trying a non-existent keyspace - with or without the IF EXISTS flag.
 # This test demonstrates a change of the exception produced between Cassandra 4.0
@@ -120,20 +174,23 @@ def test_drop_keyspace_nonexistent(cql):
         cql.execute('DROP KEYSPACE nonexistent_keyspace')
 
 # Test trying to ALTER a keyspace.
-def test_alter_keyspace(cql, this_dc):
+# The test is marked as Scylla-only because Cassandra doesn't allow for RF=0 in ALL of DCs,
+# which is the case here. We must use it because changing the RF in this test to any other value
+# would result in an error since the keyspace would stop being RF-rack-valid.
+def test_alter_keyspace(cql, this_dc, scylla_only):
     with new_test_keyspace(cql, "WITH REPLICATION = { 'class' : 'NetworkTopologyStrategy', '" + this_dc + "' : 1 }") as keyspace:
-        cql.execute(f"ALTER KEYSPACE {keyspace} WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', '{this_dc}' : 2 }} AND DURABLE_WRITES = false")
+        cql.execute(f"ALTER KEYSPACE {keyspace} WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', '{this_dc}' : 0 }} AND DURABLE_WRITES = false")
 
 # Test trying to ALTER RF of tablets-enabled KS by more than 1 at a time
 def test_alter_keyspace_rf_by_more_than_1(cql, this_dc):
     with new_test_keyspace(cql, "WITH REPLICATION = { 'class' : 'NetworkTopologyStrategy', '" + this_dc + "' : 1 }") as keyspace:
-        with pytest.raises(InvalidRequest):
+        with pytest.raises((InvalidRequest, ConfigurationException)):
             cql.execute(f"ALTER KEYSPACE {keyspace} WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', '{this_dc}' : 3 }} AND DURABLE_WRITES = false")
 
 # Test trying to ALTER a tablets-enabled KS by providing the 'replication_factor' tag
 def test_alter_keyspace_with_replication_factor_tag(cql):
     with new_test_keyspace(cql, "WITH REPLICATION = { 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1 }") as keyspace:
-        with pytest.raises(InvalidRequest):
+        with pytest.raises((InvalidRequest, ConfigurationException)):
             cql.execute(f"ALTER KEYSPACE {keyspace} WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 2 }}")
 
 # Test trying to ALTER a keyspace with invalid options.
@@ -317,33 +374,28 @@ def test_alter_keyspace_preserves_udt(cql):
         cql.execute(f"DROP TABLE IF EXISTS {ks}.tab")
         cql.execute(f"DROP KEYSPACE {ks}")
 
-# As requested in issue #16807, as long as there are any ScyllaDB features
-# not supported in tables with tablets, a CREATE KEYSPACE should print a
-# warning about the unsupported features - telling the user they may want
-# to consider creating the keyspace without tablets. This test checks that
-# the warning appears (and that it doesn't appear if a table is created
-# with tablets disabled).
-def test_create_keyspace_warn_tablets(cql, scylla_only, skip_without_tablets):
+# Previously, CREATE KEYSPACE warned about unsupported features with tablets, telling
+# the user they may want to consider creating the keyspace without tablets.
+# Now that there are no unsupported features, check that no warning is produced.
+def test_create_keyspace_no_warn_tablets(cql, scylla_only, skip_without_tablets):
     keyspace = unique_name()
     try:
         # When this test isn't skipped, creating a keyspace without any
-        # tablet parameters uses tablets by default - and should produce a
+        # tablet parameters uses tablets by default - and should not produce a
         # warning:
         f = cql.execute_async("CREATE KEYSPACE " + keyspace + " WITH REPLICATION = { 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1 }")
         f.result() # results must be consumed before fetching warnings
-        warnings = '\n'.join(f.warnings)
-        assert 'tablets' in warnings
+        assert not f.warnings or 'tablets' not in '\n'.join(f.warnings)
         cql.execute(f"DROP KEYSPACE {keyspace}")
-        # If we explicitly ask for tablets, we also get the warning:
+        # If we explicitly ask for tablets, we also don't get a warning:
         f = cql.execute_async("CREATE KEYSPACE " + keyspace + " WITH REPLICATION = { 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1 } AND TABLETS = { 'enabled': true }")
         f.result()
-        warnings = '\n'.join(f.warnings)
-        assert 'tablets' in warnings
+        assert not f.warnings or 'tablets' not in '\n'.join(f.warnings)
         cql.execute(f"DROP KEYSPACE {keyspace}")
         # If we explicitly ask to disable tablets, no warning:
         f = cql.execute_async("CREATE KEYSPACE " + keyspace + " WITH REPLICATION = { 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1 } AND TABLETS = { 'enabled': false }")
         f.result()
-        assert not f.warnings or not 'tablets' in '\n'.join(f.warnings)
+        assert not f.warnings or 'tablets' not in '\n'.join(f.warnings)
         cql.execute(f"DROP KEYSPACE {keyspace}")
     finally:
         cql.execute(f"DROP KEYSPACE IF EXISTS {keyspace}")

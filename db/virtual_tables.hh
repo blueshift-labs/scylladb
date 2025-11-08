@@ -9,7 +9,7 @@
 
 #pragma once
 
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include <map>
 #include "schema/schema_fwd.hh"
 
@@ -20,10 +20,15 @@ class database;
 namespace service {
 class storage_service;
 class raft_group_registry;
+class tablet_allocator;
 }
 
 namespace gms {
 class gossiper;
+}
+
+namespace netw {
+class messaging_service;
 }
 
 namespace db {
@@ -32,11 +37,13 @@ class config;
 class system_keyspace;
 
 future<> initialize_virtual_tables(
-    distributed<replica::database>&,
-    distributed<service::storage_service>&,
+    sharded<replica::database>&,
+    sharded<service::storage_service>&,
     sharded<gms::gossiper>&,
     sharded<service::raft_group_registry>&,
-    sharded<db::system_keyspace>& sys_ks,
+    sharded<db::system_keyspace>&,
+    sharded<service::tablet_allocator>&,
+    sharded<netw::messaging_service>&,
     db::config&);
 
 

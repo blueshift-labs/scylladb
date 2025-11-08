@@ -9,11 +9,12 @@
 
 set -e
 
+shopt -s extglob
+
 trap 'echo "error $? in $0 line $LINENO"' ERR
 
 gh_hosts=~/.config/gh/hosts.yml
 jenkins_url="https://jenkins.scylladb.com"
-FORCE=$2
 ORANGE='\033[0;33m'
 NC='\033[0m'
 
@@ -30,17 +31,74 @@ if [[ -z "$JENKINS_USERNAME" || -z "$JENKINS_API_TOKEN" ]]; then
   exit 1
 fi
 
-if [ -z "$1" ]; then
-	echo Please provide a github pull request number
-	exit 1
-fi
-
 for required in jq curl; do
 	if ! type $required >& /dev/null; then
 		echo Please install $required first
 		exit 1
 	fi
 done
+
+FORCE=0
+ALLOW_SUBMODULE=0
+
+function print_usage {
+cat << EOF
+Usage: ${0} [options] PR_NUMBER
+
+Script for pulling and merging a pull request.
+
+Fetches the PR locally and merges it into current branch. The branch must be named next*.
+
+PR with a single commit in it is cherry-picked and thus the merge commit is not created and
+the PR description is lost.
+
+By default, doesn't merge PR that contains a submodule update, use --allow-submodule option
+to proceed.
+
+Options:
+
+-h
+    Print this help message and exit.
+
+--force
+    Do not check current branch to be next*
+    Do not check jenkins job status
+
+--allow-submodule
+    Allow a PR to update a submudule
+EOF
+}
+
+while [[ $# -gt 0 ]]
+do
+    case $1 in
+        "--force"|"-f")
+            FORCE=1
+            shift 1
+            ;;
+        --allow-submodule)
+            ALLOW_SUBMODULE=1
+            shift
+            ;;
+        +([0-9]))
+            PR_NUM=$1
+            shift 1
+            ;;
+        "-h")
+            print_usage
+            exit 0
+            ;;
+        *)
+            echo "error: unrecognized option: $1, see $0 -h for usage" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [ -z "$PR_NUM" ]; then
+	echo Please provide a github pull request number
+	exit 1
+fi
 
 curl() {
     local opts=()
@@ -75,10 +133,11 @@ check_jenkins_job_status() {
 
   lastCompletedJobName="$jenkins_url/job/$jenkins_job/lastCompletedBuild"
   getBuildResult=$(curl -s --user $JENKINS_USERNAME:$JENKINS_API_TOKEN $lastCompletedJobName/api/json?tree=result)
-  if [[ "$getBuildResult" == "*Unauthorized*" ]]; then
-      echo -e "${ORANGE}WARNING:${NC} Failed to authenticate with Jenkins. please check your JENKINS_USERNAME and JENKINS_API_TOKEN setting"
+  if [[ $getBuildResult =~ (Access Denied|401 Unauthorized) ]]; then
+      echo -e "${ORANGE}WARNING:${NC} Access Denied to $lastCompletedJobName. \nPlease check your JENKINS_USERNAME and JENKINS_API_TOKEN setting"
       exit 1
   fi
+
   lastCompleted=$(echo "$getBuildResult" | jq -r '.result')
 
   if [[ "$lastCompleted" == "SUCCESS" ]]; then
@@ -88,13 +147,12 @@ check_jenkins_job_status() {
   fi
 }
 
-if [[ "$FORCE" != "--force" ]]; then
+if [[ $FORCE -eq 0 ]]; then
   check_jenkins_job_status
 fi
 
 NL=$'\n'
 
-PR_NUM=$1
 # convert full repo URL to its project/repo part, in case of failure default to origin/master:
 REMOTE_SLASH_BRANCH="$(git rev-parse --abbrev-ref --symbolic-full-name  @{upstream} \
      || git rev-parse --abbrev-ref --symbolic-full-name master@{upstream} \
@@ -116,7 +174,7 @@ fi
 PR_TITLE=$(jq -r .title <<< $PR_DATA)
 echo "    $PR_TITLE"
 PR_DESCR=$(jq -r .body <<< $PR_DATA)
-PR_LOGIN=$(jq -r .head.user.login <<< $PR_DATA)
+PR_LOGIN=$(jq -r .user.login <<< $PR_DATA)
 echo -n "Fetching full name of author $PR_LOGIN... "
 USER_NAME=$(curl -s "https://api.github.com/users/$PR_LOGIN" | jq -r .name)
 echo "$USER_NAME"
@@ -126,6 +184,10 @@ git fetch "$REMOTE" pull/$PR_NUM/head
 nr_commits=$(git log --pretty=oneline HEAD..FETCH_HEAD | wc -l)
 
 closes="${NL}${NL}Closes ${PROJECT}#${PR_NUM}${NL}"
+
+if [[ "$PR_TITLE" = *submodule* ]]; then
+    ALLOW_SUBMODULE=1
+fi
 
 if [[ $nr_commits == 1 ]]; then
 	commit=$(git log --pretty=oneline HEAD..FETCH_HEAD | awk '{print $1}')
@@ -144,6 +206,29 @@ if [[ $nr_commits == 1 ]]; then
 else
 	git merge --no-ff --log=1000 FETCH_HEAD -m "Merge '$PR_TITLE' from $USER_NAME" -m "${PR_DESCR}${closes}"
 fi
+
+mapfile -t files_changed < <(git diff --name-only HEAD~1 HEAD)
+mapfile -t submodules < <(git show HEAD~1:.gitmodules | sed -n 's/.*path = //p')
+
+submodules+=(.gitmodules)
+
+# Check if any changed files are in submodule directories
+has_submodule_changes=0
+for submodule in "${submodules[@]}"; do
+    for file in "${files_changed[@]}"; do
+        if [[ "$file" == "$submodule" ]]; then
+            has_submodule_changes=1
+            echo "Found submodule change: $file"
+        fi
+    done
+done
+
+if (( has_submodule_changes && ! ALLOW_SUBMODULE )); then
+    echo "ERROR: This pull request includes submodule changes but --allow-submodule flag was not provided"
+    echo "NOTE:  The bad commit was left in the tree, do not push it."
+    exit 1
+fi
+
 git commit --amend # for a manual double-check
 
 # Check PR tests status

@@ -139,7 +139,7 @@ timestamp_generator default_timestamp_generator();
 /// Use this to generate mutations that cannot be compacted
 ///
 /// Tombstones will not cover lower level tombstones, or data.
-timestamp_generator uncompactible_timestamp_generator(uint32_t seed);
+timestamp_generator uncompactible_timestamp_generator(uint32_t seed, api::timestamp_type min_timestamp = api::min_timestamp);
 
 struct expiry_info {
     gc_clock::duration ttl;
@@ -177,6 +177,12 @@ public:
     /// guarantee rests on the spec, which, if a custom one is used, should
     /// make sure to honor this guarantee.
     random_schema(uint32_t seed, random_schema_specification& spec);
+
+    /// Create random schema object from an existing schema.
+    ///
+    /// Allows using random data generation facilities on an existing schema.
+    random_schema(schema_ptr schema) : _schema(std::move(schema)) {
+    }
 
     schema_ptr schema() const {
         return _schema;
@@ -256,7 +262,7 @@ public:
 /// ignored if the schema has no clustering columns.
 /// Mutations are returned in ring order. Does not contain duplicate partitions.
 /// Futurized to avoid stalls.
-future<std::vector<mutation>> generate_random_mutations(
+future<utils::chunked_vector<mutation>> generate_random_mutations(
         uint32_t seed,
         tests::random_schema& random_schema,
         timestamp_generator ts_gen = default_timestamp_generator(),
@@ -265,7 +271,7 @@ future<std::vector<mutation>> generate_random_mutations(
         std::uniform_int_distribution<size_t> clustering_row_count_dist = std::uniform_int_distribution<size_t>(16, 128),
         std::uniform_int_distribution<size_t> range_tombstone_count_dist = std::uniform_int_distribution<size_t>(4, 16));
 
-future<std::vector<mutation>> generate_random_mutations(
+future<utils::chunked_vector<mutation>> generate_random_mutations(
         tests::random_schema& random_schema,
         timestamp_generator ts_gen = default_timestamp_generator(),
         expiry_generator exp_gen = no_expiry_expiry_generator(),
@@ -274,6 +280,6 @@ future<std::vector<mutation>> generate_random_mutations(
         std::uniform_int_distribution<size_t> range_tombstone_count_dist = std::uniform_int_distribution<size_t>(4, 16));
 
 /// Generate exactly partition_count partitions. See the more general overload above.
-future<std::vector<mutation>> generate_random_mutations(tests::random_schema& random_schema, size_t partition_count);
+future<utils::chunked_vector<mutation>> generate_random_mutations(tests::random_schema& random_schema, size_t partition_count);
 
 } // namespace tests

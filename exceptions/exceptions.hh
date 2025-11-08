@@ -15,6 +15,7 @@
 #include "db/operation_type.hh"
 #include <stdexcept>
 #include <seastar/core/sstring.hh>
+#include <seastar/core/lowres_clock.hh>
 #include "bytes_fwd.hh"
 
 namespace exceptions {
@@ -133,6 +134,7 @@ public:
     int32_t block_for;
 
     read_write_timeout_exception(exception_code code, const sstring& ks, const sstring& cf, db::consistency_level consistency, int32_t received, int32_t block_for) noexcept;
+    read_write_timeout_exception(exception_code code, sstring message, db::consistency_level consistency, int32_t received, int32_t block_for) noexcept;
 };
 
 class read_timeout_exception : public read_write_timeout_exception {
@@ -143,12 +145,21 @@ public:
         : read_write_timeout_exception{exception_code::READ_TIMEOUT, ks, cf, consistency, received, block_for}
         , data_present{data_present}
     { }
+
+    read_timeout_exception(sstring message, db::consistency_level consistency, int32_t received, int32_t block_for, bool data_present) noexcept
+        : read_write_timeout_exception{exception_code::READ_TIMEOUT, std::move(message), consistency, received, block_for}
+        , data_present{data_present}
+    { }
 };
 
 struct mutation_write_timeout_exception : public read_write_timeout_exception {
     db::write_type type;
     mutation_write_timeout_exception(const sstring& ks, const sstring& cf, db::consistency_level consistency, int32_t received, int32_t block_for, db::write_type type) noexcept :
         read_write_timeout_exception(exception_code::WRITE_TIMEOUT, ks, cf, consistency, received, block_for)
+        , type{std::move(type)}
+    { }
+    mutation_write_timeout_exception(sstring message, db::consistency_level consistency, int32_t received, int32_t block_for, db::write_type type) noexcept :
+        read_write_timeout_exception(exception_code::WRITE_TIMEOUT, std::move(message), consistency, received, block_for)
         , type{std::move(type)}
     { }
 };
@@ -163,8 +174,8 @@ public:
 protected:
     request_failure_exception(exception_code code, const sstring& ks, const sstring& cf, db::consistency_level consistency_, int32_t received_, int32_t failures_, int32_t block_for_) noexcept;
 
-    request_failure_exception(exception_code code, const sstring& msg, db::consistency_level consistency_, int32_t received_, int32_t failures_, int32_t block_for_) noexcept
-        : cassandra_exception{code, msg}
+    request_failure_exception(exception_code code, sstring msg, db::consistency_level consistency_, int32_t received_, int32_t failures_, int32_t block_for_) noexcept
+        : cassandra_exception{code, std::move(msg)}
         , consistency{consistency_}
         , received{received_}
         , failures{failures_}
@@ -179,8 +190,8 @@ struct mutation_write_failure_exception : public request_failure_exception {
         , type{std::move(type_)}
     { }
 
-    mutation_write_failure_exception(const sstring& msg, db::consistency_level consistency_, int32_t received_, int32_t failures_, int32_t block_for_, db::write_type type_) noexcept :
-        request_failure_exception(exception_code::WRITE_FAILURE, msg, consistency_, received_, failures_, block_for_)
+    mutation_write_failure_exception(sstring msg, db::consistency_level consistency_, int32_t received_, int32_t failures_, int32_t block_for_, db::write_type type_) noexcept :
+        request_failure_exception(exception_code::WRITE_FAILURE, std::move(msg), consistency_, received_, failures_, block_for_)
         , type{std::move(type_)}
     { }
 };
@@ -193,9 +204,20 @@ struct read_failure_exception : public request_failure_exception {
         , data_present{data_present_}
     { }
 
-    read_failure_exception(const sstring& msg, db::consistency_level consistency_, int32_t received_, int32_t failures_, int32_t block_for_, bool data_present_) noexcept
-        : request_failure_exception{exception_code::READ_FAILURE, msg, consistency_, received_, failures_, block_for_}
+    read_failure_exception(sstring msg, db::consistency_level consistency_, int32_t received_, int32_t failures_, int32_t block_for_, bool data_present_) noexcept
+        : request_failure_exception{exception_code::READ_FAILURE, std::move(msg), consistency_, received_, failures_, block_for_}
         , data_present{data_present_}
+    { }
+};
+
+struct read_failure_exception_with_timeout : public read_failure_exception {
+    const seastar::lowres_clock::time_point _timeout;
+    read_timeout_exception _timeout_exception;
+
+    read_failure_exception_with_timeout(const sstring& ks, const sstring& cf, db::consistency_level consistency_, int32_t received_, int32_t failures_, int32_t block_for_, bool data_present_, seastar::lowres_clock::time_point timeout_) noexcept
+        : read_failure_exception{ks, cf, consistency_, received_, failures_, block_for_, data_present_}
+        , _timeout(timeout_)
+        , _timeout_exception(ks, cf, consistency_, received_, block_for_, data_present_)
     { }
 };
 
@@ -289,8 +311,11 @@ public:
     const sstring ks_name;
     const sstring cf_name;
 private:
-    already_exists_exception(sstring ks_name_, sstring cf_name_, sstring msg)
-        : configuration_exception{exception_code::ALREADY_EXISTS, msg}
+    // Take ks_name and cf_name by rvalue reference so the public constructors
+    // can compute the message from the original objects before
+    // they transition to 'moved-from' state.
+    already_exists_exception(sstring&& ks_name_, sstring&& cf_name_, sstring msg)
+        : configuration_exception{exception_code::ALREADY_EXISTS, std::move(msg)}
         , ks_name{ks_name_}
         , cf_name{cf_name_}
     { }

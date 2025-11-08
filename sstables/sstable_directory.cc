@@ -12,10 +12,12 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/util/file.hh>
+#include <seastar/util/lazy.hh>
 #include <boost/algorithm/string.hpp>
 #include "sstables/sstable_directory.hh"
 #include "sstables/sstables.hh"
 #include "sstables/sstables_manager.hh"
+#include "sstables/exceptions.hh"
 #include "compaction/compaction_manager.hh"
 #include "utils/log.hh"
 #include "sstable_directory.hh"
@@ -46,7 +48,7 @@ sstable_directory::filesystem_components_lister::filesystem_components_lister(st
 {
 }
 
-sstable_directory::filesystem_components_lister::filesystem_components_lister(std::filesystem::path dir, sstables_manager& mgr, const data_dictionary::storage_options::s3& os)
+sstable_directory::filesystem_components_lister::filesystem_components_lister(std::filesystem::path dir, sstables_manager& mgr, const data_dictionary::storage_options::object_storage& os)
         : _directory(dir)
         , _state(std::make_unique<scan_state>())
         , _client(mgr.get_endpoint_client(os.endpoint))
@@ -75,17 +77,17 @@ sstable_directory::make_components_lister() {
             }
             return std::make_unique<sstable_directory::filesystem_components_lister>(make_path(loc.dir.native(), _state));
         },
-        [this] (const data_dictionary::storage_options::s3& os) mutable -> std::unique_ptr<sstable_directory::components_lister> {
+        [this] (const data_dictionary::storage_options::object_storage& os) mutable -> std::unique_ptr<sstable_directory::components_lister> {
             return std::visit(overloaded_functor {
                 [this, &os] (const sstring& prefix) -> std::unique_ptr<sstable_directory::components_lister> {
                     if (prefix.empty()) {
-                        on_internal_error(sstlog, "S3 storage options is missing 'prefix'");
+                        on_internal_error(sstlog, fmt::format("{} storage options is missing 'prefix'", os.type));
                     }
                     return std::make_unique<sstable_directory::filesystem_components_lister>(fs::path(prefix), _manager, os);
                 },
-                [this] (const table_id& owner) -> std::unique_ptr<sstable_directory::components_lister> {
+                [this, &os] (const table_id& owner) -> std::unique_ptr<sstable_directory::components_lister> {
                     if (owner.id.is_null()) {
-                        on_internal_error(sstlog, "S3 storage options is missing 'owner'");
+                        on_internal_error(sstlog, fmt::format("{} storage options is missing 'owner'", os.type));
                     }
                     return std::make_unique<sstable_directory::sstables_registry_components_lister>(_manager.sstables_registry(), owner);
                 }
@@ -182,7 +184,7 @@ void sstable_directory::filesystem_components_lister::handle(sstables::entry_des
     }
 
     dirlog.trace("for SSTable directory, scanning {}", filename);
-    _state->generations_found.emplace(desc.generation, filename);
+    auto generations_found_it = _state->generations_found.emplace(desc.generation, filename);
 
     switch (desc.component) {
     case component_type::TemporaryStatistics:
@@ -190,6 +192,17 @@ void sstable_directory::filesystem_components_lister::handle(sstables::entry_des
         // for instance on mutate_level. We should delete it - so we mark it for deletion
         // here, but just the component. The old statistics file should still be there
         // and we'll go with it.
+        _state->files_for_removal.insert(filename.native());
+        break;
+    case component_type::TemporaryHashes:
+        // We generate TemporaryHashes when writing the sstable,
+        // and it's removed before the sstable is sealed.
+        // If it's present, then it's a leftover from a partially-written sstable,
+        // and should be removed.
+        // This file isn't included in the TOC, so we can't remove on the "usual"
+        // mechanism for partially-written components, and instead we have to explicitly
+        // mark it for removal here.
+        _state->generations_found.erase(generations_found_it);
         _state->files_for_removal.insert(filename.native());
         break;
     case component_type::TOC:
@@ -225,7 +238,7 @@ void sstable_directory::validate(sstables::shared_sstable sst, process_flags fla
 
 future<sstables::shared_sstable> sstable_directory::load_sstable(sstables::entry_descriptor desc,
         const data_dictionary::storage_options& storage_opts, sstables::sstable_open_config cfg) const {
-    shared_sstable sst = _manager.make_sstable(_schema, storage_opts, desc.generation, _state, desc.version, desc.format, gc_clock::now(), _error_handler_gen);
+    shared_sstable sst = _manager.make_sstable(_schema, storage_opts, desc.generation, _state, desc.version, desc.format, db_clock::now(), _error_handler_gen);
     co_await sst->load(_sharder, cfg);
     co_return sst;
 }
@@ -242,6 +255,10 @@ sstable_directory::process_descriptor(sstables::entry_descriptor desc,
     auto shards = co_await get_shards_for_this_sstable(desc, storage_opts, flags);
     if (flags.sort_sstables_according_to_owner && shards.size() == 1 && shards[0] != this_shard_id()) {
         // identified a remote unshared sstable
+        dirlog.trace("{} identified as a remote unshared SSTable, shard={}", seastar::value_of([this, &desc] {
+                return sstable::component_basename(_schema->ks_name(), _schema->cf_name(),
+                        desc.version, desc.generation, desc.format, component_type::Data);
+            }), shards[0]);
         _unshared_remote_sstables[shards[0]].push_back(std::move(desc));
         co_return;
     }
@@ -266,11 +283,6 @@ sstable_directory::process_descriptor(sstables::entry_descriptor desc,
         dirlog.debug("Added {} to unsorted sstables list", sst->get_filename());
         _unsorted_sstables.push_back(std::move(sst));
     }
-}
-
-generation_type
-sstable_directory::highest_generation_seen() const {
-    return _max_generation_seen;
 }
 
 sstables::sstable_version_types
@@ -352,7 +364,7 @@ future<> sstable_directory::filesystem_components_lister::process(sstable_direct
 
     auto lister = !_client ?
             abstract_lister::make<directory_lister>(_directory, lister::dir_entry_types::of<directory_entry_type::regular>(), &manifest_json_filter) :
-            abstract_lister::make<s3::client::bucket_lister>(_client, _bucket, _directory.native() + "/", &manifest_json_filter);
+            _client->make_object_lister(_bucket, _directory.native() + "/", &manifest_json_filter);
 
     co_await with_closeable(std::move(lister), coroutine::lambda([this, &directory] (abstract_lister& lister) -> future<> {
         while (auto de = co_await lister.get()) {
@@ -378,18 +390,6 @@ future<> sstable_directory::filesystem_components_lister::process(sstable_direct
 
     auto msg = format("After {} scanned, {} descriptors found, {} different files found",
             _directory, _state->descriptors.size(), _state->generations_found.size());
-
-    if (!_state->generations_found.empty()) {
-        directory._max_generation_seen = std::ranges::fold_left(_state->generations_found | std::views::keys, sstables::generation_type{}, [] (generation_type a, generation_type b) {
-            return std::max<generation_type>(a, b);
-        });
-
-        msg = format("{}, highest generation seen: {}", msg, directory._max_generation_seen);
-    } else {
-        msg = format("{}, no numeric generation was seen", msg);
-    }
-
-    dirlog.debug("{}", msg);
 
     // _descriptors is everything with a TOC. So after we remove this, what's left is
     // SSTables for which a TOC was not found.
@@ -447,7 +447,7 @@ future<> sstable_directory::restore_components_lister::process(sstable_directory
         co_await directory.process_descriptor(
             std::move(desc), flags,
             [&directory, prefix=sst_path.parent_path().native()] {
-                return directory._storage_opts->append_to_s3_prefix(prefix);
+                return directory._storage_opts->append_to_object_storage_prefix(prefix);
             });
     });
 }
@@ -497,13 +497,13 @@ sstable_directory::move_foreign_sstables(sharded<sstable_directory>& source_dire
         }
         // Should be empty, since an SSTable that belongs to this shard is not remote.
         SCYLLA_ASSERT(shard_id != this_shard_id());
-        dirlog.debug("Moving {} unshared SSTables to shard {} ", info_vec.size(), shard_id);
+        dirlog.debug("Moving {} unshared SSTables of {}.{} to shard {} ", info_vec.size(), _schema->ks_name(), _schema->cf_name(), shard_id);
         return source_directory.invoke_on(shard_id, &sstables::sstable_directory::load_foreign_sstables, std::move(info_vec));
     });
 }
 
 future<shared_sstable> sstable_directory::load_foreign_sstable(foreign_sstable_open_info& info) {
-    auto sst = _manager.make_sstable(_schema, *_storage_opts, info.generation, _state, info.version, info.format, gc_clock::now(), _error_handler_gen);
+    auto sst = _manager.make_sstable(_schema, *_storage_opts, info.generation, _state, info.version, info.format, db_clock::now(), _error_handler_gen);
     co_await sst->load(std::move(info));
     co_return sst;
 }
@@ -520,7 +520,7 @@ sstable_directory::load_foreign_sstables(sstable_entry_descriptor_vector info_ve
 
 future<std::vector<shard_id>> sstable_directory::get_shards_for_this_sstable(
         const sstables::entry_descriptor& desc, const data_dictionary::storage_options& storage_opts, process_flags flags) const {
-    auto sst = _manager.make_sstable(_schema, storage_opts, desc.generation, _state, desc.version, desc.format, gc_clock::now(), _error_handler_gen);
+    auto sst = _manager.make_sstable(_schema, storage_opts, desc.generation, _state, desc.version, desc.format, db_clock::now(), _error_handler_gen);
     co_await sst->load_owner_shards(_sharder);
     validate(sst, flags);
     co_return sst->get_shards_for_this_sstable();
@@ -758,16 +758,6 @@ future<> sstable_directory::filesystem_components_lister::handle_sstables_pendin
     }));
 
     co_await when_all_succeed(futures.begin(), futures.end()).discard_result();
-}
-
-future<sstables::generation_type>
-highest_generation_seen(sharded<sstables::sstable_directory>& directory) {
-    co_return co_await directory.map_reduce0(
-        std::mem_fn(&sstables::sstable_directory::highest_generation_seen),
-        sstables::generation_type{},
-        [] (sstables::generation_type a, sstables::generation_type b) {
-            return std::max(a, b);
-        });
 }
 
 }

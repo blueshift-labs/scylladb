@@ -471,28 +471,46 @@ data_value generate_boolean_value(std::mt19937& engine, size_t, size_t) {
 }
 
 data_value generate_date_value(std::mt19937& engine, size_t, size_t) {
-    return data_value(date_type_native_type{db_clock::time_point(db_clock::duration(random::get_int<std::make_unsigned_t<db_clock::rep>>(engine)))});
+    using pt = db_clock::time_point;
+    // Python driver can't tolerate dates above year 9999.
+    constexpr auto max_day = std::chrono::sys_days(std::chrono::year{10000}/1/1);
+    constexpr auto max = std::chrono::sys_time<std::chrono::milliseconds>(max_day).time_since_epoch().count() - 1;
+    auto x = random::get_int<std::make_unsigned_t<db_clock::rep>>(0, max, engine);
+    return data_value(date_type_native_type{pt(pt::duration(x))});
 }
 
 data_value generate_timeuuid_value(std::mt19937&, size_t, size_t) {
-    return data_value(timeuuid_native_type{utils::UUID_gen::get_time_UUID()});
+    // FIXME: respect the passed engine.
+    auto b = tests::random::get_bytes(16);
+    b[6] = (b[6] & 0x0F) | 0x10; // version 1
+    return timeuuid_type->deserialize(b);
 }
 
 data_value generate_timestamp_value(std::mt19937& engine, size_t, size_t) {
     using pt = db_clock::time_point;
-    return data_value(pt(pt::duration(random::get_int<pt::rep>(engine))));
+    // Python driver can't tolerate dates above year 9999 or below year 1.
+    constexpr auto min_day = std::chrono::sys_days(std::chrono::year{1}/1/1);
+    constexpr auto max_day = std::chrono::sys_days(std::chrono::year{10000}/1/1);
+    constexpr auto min = std::chrono::sys_time<std::chrono::milliseconds>(min_day).time_since_epoch().count();
+    constexpr auto max = std::chrono::sys_time<std::chrono::milliseconds>(max_day).time_since_epoch().count() - 1;
+    auto x = random::get_int<pt::rep>(min, max, engine);
+    return data_value(pt(pt::duration(x)));
 }
-
+    
 data_value generate_simple_date_value(std::mt19937& engine, size_t, size_t) {
     return data_value(simple_date_native_type{random::get_int<simple_date_native_type::primary_type>(engine)});
 }
 
 data_value generate_time_value(std::mt19937& engine, size_t, size_t) {
-    return data_value(time_native_type{random::get_int<time_native_type::primary_type>(engine)});
+    // A legal `time` is smaller than the number of nanoseconds in a day.
+    auto max = std::chrono::nanoseconds(std::chrono::days(1)).count() - 1;
+    return data_value(time_native_type{random::get_int<time_native_type::primary_type>(0, max, engine)});
 }
 
 data_value generate_uuid_value(std::mt19937& engine, size_t, size_t) {
-    return data_value(utils::make_random_uuid());
+    auto b = tests::random::get_bytes(16, engine);
+    b[6] = (b[6] & 0x0F) | 0x40; // version 4
+    return data_value(uuid_type->deserialize(b));
 }
 
 data_value generate_inet_addr_value(std::mt19937& engine, size_t, size_t) {
@@ -769,7 +787,7 @@ timestamp_generator default_timestamp_generator() {
     };
 }
 
-timestamp_generator uncompactible_timestamp_generator(uint32_t seed) {
+timestamp_generator uncompactible_timestamp_generator(uint32_t seed, api::timestamp_type min_timestamp) {
     auto engine = std::mt19937(seed);
 
     const auto rank = [] (timestamp_destination dest) -> api::timestamp_type {
@@ -791,7 +809,7 @@ timestamp_generator uncompactible_timestamp_generator(uint32_t seed) {
     const auto max_rank = rank(timestamp_destination::collection_cell_timestamp);
     const auto margin = 1000;
     std::vector<api::timestamp_type> points;
-    points.push_back(api::min_timestamp);
+    points.push_back(min_timestamp);
     for (api::timestamp_type i = 0; i < max_rank; ++i) {
         const auto remaining_ranks = max_rank - i;
         const auto point = std::uniform_int_distribution<api::timestamp_type>(points.back() + margin, api::max_timestamp - (remaining_ranks * margin))(engine);
@@ -799,7 +817,7 @@ timestamp_generator uncompactible_timestamp_generator(uint32_t seed) {
     }
     points.push_back(api::max_timestamp);
 
-    return [rank, points] (std::mt19937& engine, timestamp_destination destination, api::timestamp_type min_timestamp) {
+    return [rank, points] (std::mt19937& engine, timestamp_destination destination, api::timestamp_type curr_min_ts) {
         const auto r = rank(destination);
         auto ts_dist = std::uniform_int_distribution<api::timestamp_type>(points.at(r), points.at(r + 1) - 1);
         return ts_dist(engine);
@@ -849,7 +867,7 @@ schema_ptr build_random_schema(uint32_t seed, random_schema_specification& spec)
 
 sstring udt_to_str(const user_type_impl& udt) {
     auto udt_desc = udt.describe(cql3::with_create_statement::yes);
-    return *udt_desc.create_statement;
+    return udt_desc.create_statement.value().linearize();
 }
 
 struct udt_list {
@@ -1152,17 +1170,19 @@ future<> random_schema::create_with_cql(cql_test_env& env) {
 
         auto& db = env.local_db();
 
-        replica::schema_describe_helper describe_helper{db.as_data_dictionary()};
-        auto schema_desc = _schema->describe(describe_helper, cql3::describe_option::STMTS);
+        auto schema_desc = _schema->describe(
+                replica::make_schema_describe_helper(_schema, db.as_data_dictionary()),
+                cql3::describe_option::STMTS);
 
-        env.execute_cql(*schema_desc.create_statement).get();
+        sstring create_statement = schema_desc.create_statement.value().linearize();
+        env.execute_cql(create_statement).get();
         auto& tbl = db.find_column_family(ks_name, tbl_name);
 
         _schema = tbl.schema();
     });
 }
 
-future<std::vector<mutation>> generate_random_mutations(
+future<utils::chunked_vector<mutation>> generate_random_mutations(
         uint32_t seed,
         tests::random_schema& random_schema,
         timestamp_generator ts_gen,
@@ -1173,7 +1193,7 @@ future<std::vector<mutation>> generate_random_mutations(
     auto engine = std::mt19937(seed);
     const auto schema_has_clustering_columns = random_schema.schema()->clustering_key_size() > 0;
     const auto partition_count = partition_count_dist(engine);
-    std::vector<mutation> muts;
+    utils::chunked_vector<mutation> muts;
     muts.reserve(partition_count);
     for (size_t pk = 0; pk != partition_count; ++pk) {
         auto mut = random_schema.new_mutation(pk);
@@ -1213,11 +1233,13 @@ future<std::vector<mutation>> generate_random_mutations(
     auto range = boost::unique(muts, [s = random_schema.schema()] (const mutation& a, const mutation& b) {
             return a.decorated_key().equal(*s, b.decorated_key());
             });
-    muts.erase(range.end(), muts.end());
+    while (range.end() != muts.end()) {
+        muts.pop_back();
+    }
     co_return std::move(muts);
 }
 
-future<std::vector<mutation>> generate_random_mutations(
+future<utils::chunked_vector<mutation>> generate_random_mutations(
         tests::random_schema& random_schema,
         timestamp_generator ts_gen,
         expiry_generator exp_gen,
@@ -1228,7 +1250,7 @@ future<std::vector<mutation>> generate_random_mutations(
             clustering_row_count_dist, range_tombstone_count_dist);
 }
 
-future<std::vector<mutation>> generate_random_mutations(tests::random_schema& random_schema, size_t partition_count) {
+future<utils::chunked_vector<mutation>> generate_random_mutations(tests::random_schema& random_schema, size_t partition_count) {
     return generate_random_mutations(
             random_schema,
             default_timestamp_generator(),

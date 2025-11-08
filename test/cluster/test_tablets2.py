@@ -3,15 +3,17 @@
 #
 # SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
-from cassandra.query import SimpleStatement, ConsistencyLevel
+from typing import Any
+from cassandra.query import ConsistencyLevel
 
 from test.pylib.internal_types import HostID, ServerInfo, ServerNum
 from test.pylib.manager_client import ManagerClient
 from test.pylib.rest_client import inject_error_one_shot, HTTPError, read_barrier
 from test.pylib.util import wait_for_cql_and_get_hosts, unique_name
-from test.pylib.tablets import get_tablet_replica, get_all_tablet_replicas
+from test.pylib.tablets import get_tablet_replica, get_all_tablet_replicas, get_tablet_count, TabletReplicas
 from test.cluster.conftest import skip_mode
 from test.cluster.util import reconnect_driver, create_new_test_keyspace, new_test_keyspace
+from test.cqlpy.cassandra_tests.validation.entities.secondary_index_test import dotestCreateAndDropIndex
 
 import pytest
 import asyncio
@@ -40,27 +42,6 @@ async def inject_error_on(manager, error_name, servers):
 async def disable_injection_on(manager, error_name, servers):
     errs = [manager.api.disable_injection(s.ip_addr, error_name) for s in servers]
     await asyncio.gather(*errs)
-
-async def repair_on_node(manager: ManagerClient, server: ServerInfo, servers: list[ServerInfo], keyspace, table = "test", ranges: str = ''):
-    node = server.ip_addr
-    await manager.servers_see_each_other(servers)
-    live_nodes_wanted = [s.ip_addr for s in servers]
-    live_nodes = await manager.api.get_alive_endpoints(node)
-    live_nodes_wanted.sort()
-    live_nodes.sort()
-    assert live_nodes == live_nodes_wanted
-    logger.info(f"Repair table on node {node} live_nodes={live_nodes} live_nodes_wanted={live_nodes_wanted}")
-    await manager.api.repair(node, keyspace, table, ranges)
-
-async def load_repair_history(cql, hosts):
-    all_rows = []
-    for host in hosts:
-        logging.info(f'Query hosts={host}');
-        rows = await cql.run_async("SELECT * from system.repair_history", host=host)
-        all_rows += rows
-    for row in all_rows:
-        logging.info(f"Got repair_history_entry={row}")
-    return all_rows
 
 async def safe_server_stop_gracefully(manager, server_id, timeout: float = 60, reconnect: bool = False):
     # Explicitly close the driver to avoid reconnections if scylla fails to update gossiper state on shutdown.
@@ -94,7 +75,7 @@ async def test_tablet_metadata_propagates_with_schema_changes_in_snapshot_mode(m
         '--logger-log-level', 'messaging_service=trace',
         '--logger-log-level', 'rpc=trace',
         ]
-    servers = await manager.servers_add(3, cmdline=cmdline)
+    servers = await manager.servers_add(3, cmdline=cmdline, auto_rack_dc="dc1")
 
     s0 = servers[0].server_id
     not_s0 = servers[1:]
@@ -487,238 +468,6 @@ async def test_table_dropped_during_streaming(manager: ManagerClient):
         replica = await get_tablet_replica(manager, servers[0], ks, 'test2', tablet_token)
         assert replica == (s1_host_id, 0)
 
-@pytest.mark.repair
-@pytest.mark.asyncio
-async def test_tablet_repair(manager: ManagerClient):
-    logger.info("Bootstrapping cluster")
-    cmdline = [
-        '--logger-log-level', 'repair=trace',
-        '--task-ttl-in-seconds', '3600',    # Make sure the test passes with non-zero task_ttl.
-    ]
-    servers = await manager.servers_add(3, cmdline=cmdline)
-
-    await inject_error_on(manager, "tablet_allocator_shuffle", servers)
-
-    cql = manager.get_cql()
-    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
-                  "'replication_factor': 2} AND tablets = {'initial': 32}") as ks:
-        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
-
-        logger.info("Populating table")
-
-        keys = range(256)
-
-        stmt = cql.prepare(f"INSERT INTO {ks}.test (pk, c) VALUES (?, ?)")
-        stmt.consistency_level = ConsistencyLevel.ONE
-
-        # Repair runs concurrently with tablet shuffling which exercises issues with serialization
-        # of repair and tablet migration.
-        #
-        # We do it 30 times because it's been experimentally shown to be enough to trigger the issue with high probability.
-        # Lack of proper synchronization would manifest as repair failure with the following cause:
-        #
-        #   failed_because=std::runtime_error (multishard_writer: No shards for token 7505809055260144771 of test.test)
-        #
-        # ...which indicates that repair tried to stream data to a node which is no longer a tablet replica.
-        repair_cycles = 30
-        for i in range(repair_cycles):
-            # Write concurrently with repair to increase the chance of repair having some discrepancy to resolve and send writes.
-            inserts_future = asyncio.gather(*[cql.run_async(stmt, [k, i]) for k in keys])
-
-            # Disable in the background so that repair is started with migrations in progress.
-            # We need to disable balancing so that repair which blocks on migrations eventually gets unblocked.
-            # Otherwise, shuffling would keep the topology busy forever.
-            disable_balancing_future = asyncio.create_task(manager.api.disable_tablet_balancing(servers[0].ip_addr))
-
-            await repair_on_node(manager, servers[0], servers, ks)
-
-            await inserts_future
-            await disable_balancing_future
-            await manager.api.enable_tablet_balancing(servers[0].ip_addr)
-
-        key_count = len(keys)
-        stmt = cql.prepare(f"SELECT * FROM {ks}.test;")
-        stmt.consistency_level = ConsistencyLevel.ALL
-        rows = await cql.run_async(stmt)
-        assert len(rows) == key_count
-        for r in rows:
-            assert r.c == repair_cycles - 1
-
-# Reproducer for race between split and repair: https://github.com/scylladb/scylladb/issues/19378
-# Verifies repair will not complete with sstables that still require split, causing split
-# execution to fail.
-@pytest.mark.repair
-@pytest.mark.asyncio
-@skip_mode('release', 'error injections are not supported in release mode')
-async def test_concurrent_tablet_repair_and_split(manager: ManagerClient):
-    logger.info("Bootstrapping cluster")
-    cmdline = [
-        '--logger-log-level', 'raft_topology=debug',
-        '--target-tablet-size-in-bytes', '1024',
-    ]
-    servers = await manager.servers_add(3, cmdline=cmdline, config={
-        'error_injections_at_startup': ['short_tablet_stats_refresh_interval']
-    })
-
-    await manager.api.disable_tablet_balancing(servers[0].ip_addr)
-
-    cql = manager.get_cql()
-    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
-                        "'replication_factor': 2} AND tablets = {'initial': 32}") as ks:
-        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
-
-        logger.info("Populating table")
-
-        keys = range(5000) # Enough keys to trigger repair digest mismatch with a high chance.
-        stmt = cql.prepare(f"INSERT INTO {ks}.test (pk, c) VALUES (?, ?)")
-        stmt.consistency_level = ConsistencyLevel.ONE
-
-        await inject_error_on(manager, "tablet_load_stats_refresh_before_rebalancing", servers)
-
-        s0_log = await manager.server_open_log(servers[0].server_id)
-        s0_mark = await s0_log.mark()
-
-        await asyncio.gather(*[cql.run_async(stmt, [k, -1]) for k in keys])
-
-        # split decision is sstable size based, so data must be flushed first
-        for server in servers:
-            await manager.api.flush_keyspace(server.ip_addr, ks)
-
-        await manager.api.enable_injection(servers[0].ip_addr, "tablet_split_finalization_postpone", False)
-        await manager.api.enable_tablet_balancing(servers[0].ip_addr)
-
-        logger.info("Waiting for split prepare...")
-        await s0_log.wait_for('Setting split ready sequence number to', from_mark=s0_mark)
-        s0_mark = await s0_log.mark()
-        logger.info("Waited for split prepare")
-
-        # Balancer is re-enabled later for split execution
-        await asyncio.create_task(manager.api.disable_tablet_balancing(servers[0].ip_addr))
-
-        # Write concurrently with repair to increase the chance of repair having some discrepancy to resolve and send writes.
-        inserts_future = asyncio.gather(*[cql.run_async(stmt, [k, 1]) for k in keys])
-
-        await repair_on_node(manager, servers[0], servers, ks)
-
-        await inserts_future
-
-        logger.info("Waiting for split execute...")
-        await manager.api.disable_injection(servers[0].ip_addr, "tablet_split_finalization_postpone")
-        await manager.api.enable_tablet_balancing(servers[0].ip_addr)
-        await s0_log.wait_for('Detected tablet split for table', from_mark=s0_mark)
-        await inject_error_one_shot_on(manager, "tablet_split_finalization_postpone", servers)
-        logger.info("Waited for split execute...")
-
-        key_count = len(keys)
-        stmt = cql.prepare(f"SELECT * FROM {ks}.test;")
-        stmt.consistency_level = ConsistencyLevel.ALL
-        rows = await cql.run_async(stmt)
-        assert len(rows) == key_count
-
-@pytest.mark.repair
-@pytest.mark.asyncio
-async def test_tablet_missing_data_repair(manager: ManagerClient):
-    logger.info("Bootstrapping cluster")
-    cmdline = [
-        '--hinted-handoff-enabled', 'false',
-        ]
-    servers = [await manager.server_add(cmdline=cmdline),
-               await manager.server_add(cmdline=cmdline),
-               await manager.server_add(cmdline=cmdline)]
-
-    cql = manager.get_cql()
-    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
-                  "'replication_factor': 3} AND tablets = {'initial': 32}") as ks:
-        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
-
-        keys_list = [range(0, 100), range(100, 200), range(200, 300)]
-        keys_for_server = dict([(s.server_id, keys_list[idx]) for idx, s in enumerate(servers)])
-        keys = range(0, 300)
-
-        async def insert_with_down(down_server):
-            logger.info(f"Stopped server {down_server.server_id}")
-            logger.info(f"Insert into server {down_server.server_id}")
-            await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});")
-                                for k in keys_for_server[down_server.server_id]])
-
-        cql = await safe_rolling_restart(manager, servers, with_down=insert_with_down)
-
-        await repair_on_node(manager, servers[0], servers, ks)
-
-        async def check_with_down(down_node):
-            logger.info("Checking table")
-            query = SimpleStatement(f"SELECT * FROM {ks}.test;", consistency_level=ConsistencyLevel.ONE)
-            rows = await cql.run_async(query)
-            assert len(rows) == len(keys)
-            for r in rows:
-                assert r.c == r.pk
-
-        cql = await safe_rolling_restart(manager, servers, with_down=check_with_down)
-
-
-@pytest.mark.repair
-@pytest.mark.asyncio
-async def test_tablet_repair_history(manager: ManagerClient):
-    logger.info("Bootstrapping cluster")
-    servers = [await manager.server_add(), await manager.server_add(), await manager.server_add()]
-
-    rf = 3
-    tablets = 8
-
-    cql = manager.get_cql()
-    async with new_test_keyspace(manager, f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': {rf}}} AND tablets = {{'initial': {tablets}}}") as ks:
-        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int) WITH tombstone_gc = {{'mode':'repair'}};")
-
-        logger.info("Populating table")
-
-        keys = range(256)
-        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});") for k in keys])
-
-        hosts = await wait_for_cql_and_get_hosts(cql, servers, time.time() + 60)
-        logging.info(f'Got hosts={hosts}');
-
-        await repair_on_node(manager, servers[0], servers, ks)
-
-        all_rows = await load_repair_history(cql, hosts)
-        assert len(all_rows) == rf * tablets
-
-@pytest.mark.repair
-@pytest.mark.asyncio
-async def test_tablet_repair_ranges_selection(manager: ManagerClient):
-    logger.info("Bootstrapping cluster")
-    servers = [await manager.server_add(), await manager.server_add()]
-
-    rf = 2
-    tablets = 4
-    nr_ranges = 0;
-
-    cql = manager.get_cql()
-    async with new_test_keyspace(manager, f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': {rf}}} AND tablets = {{'initial': {tablets}}}") as ks:
-        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int) WITH tombstone_gc = {{'mode':'repair'}};")
-
-        logger.info("Populating table")
-
-        keys = range(256)
-        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});") for k in keys])
-
-        hosts = await wait_for_cql_and_get_hosts(cql, servers, time.time() + 60)
-        logging.info(f'Got hosts={hosts}');
-
-        await repair_on_node(manager, servers[0], servers, ks, ranges='-4611686018427387905:-1,4611686018427387903:9223372036854775807')
-        nr_ranges = nr_ranges + 2
-        await repair_on_node(manager, servers[0], servers, ks, ranges='-2000:-1000,1000:2000')
-        nr_ranges = nr_ranges + 2
-        await repair_on_node(manager, servers[0], servers, ks, ranges='3000:-3000')
-        # The wrap around range (3000, -3000] will produce the following intersection range
-        # range=(minimum token,-4611686018427387905] ranges_specified={(3000,+inf), (-inf, -3000]} intersection_ranges=(minimum token,-4611686018427387905]
-        # range=(-4611686018427387905,-1] ranges_specified={(3000,+inf), (-inf, -3000]} intersection_ranges=(-4611686018427387905,-3000]
-        # range=(-1,4611686018427387903] ranges_specified={(3000,+inf), (-inf, -3000]} intersection_ranges=(3000,4611686018427387903]
-        # range=(4611686018427387903,9223372036854775807] ranges_specified={(3000,+inf), (-inf, -3000]} intersection_ranges=(4611686018427387903,9223372036854775807]
-        nr_ranges = nr_ranges + 4
-
-        all_rows = await load_repair_history(cql, hosts)
-        assert len(all_rows) == rf * nr_ranges;
-
 @pytest.mark.asyncio
 async def test_tablet_cleanup(manager: ManagerClient):
     cmdline = ['--smp=2', '--commitlog-sync=batch']
@@ -844,7 +593,7 @@ async def test_tablet_cleanup_failure(manager: ManagerClient):
 @pytest.mark.asyncio
 async def test_tablet_resharding(manager: ManagerClient):
     cmdline = ['--smp=3']
-    config = {'enable_tablets': True}
+    config = {'tablets_mode_for_new_keyspaces': 'enabled'}
     servers = await manager.servers_add(1, cmdline=cmdline)
     server = servers[0]
 
@@ -863,18 +612,6 @@ async def test_tablet_resharding(manager: ManagerClient):
         server.server_id,
         expected_error="Detected a tablet with invalid replica shard, reducing shard count with tablet-enabled tables is not yet supported. Replace the node instead.")
 
-async def get_tablet_count(manager: ManagerClient, server: ServerInfo, keyspace_name: str, table_name: str):
-    host = manager.cql.cluster.metadata.get_host(server.ip_addr)
-
-    # read_barrier is needed to ensure that local tablet metadata on the queried node
-    # reflects the finalized tablet movement.
-    await read_barrier(manager.api, server.ip_addr)
-
-    table_id = await manager.get_table_id(keyspace_name, table_name)
-    rows = await manager.cql.run_async(f"SELECT tablet_count FROM system.tablets where "
-                                       f"table_id = {table_id}", host=host)
-    return rows[0].tablet_count
-
 @pytest.mark.parametrize("injection_error", ["foreach_compaction_group_wait", "major_compaction_wait"])
 @pytest.mark.asyncio
 @skip_mode('release', 'error injections are not supported in release mode')
@@ -886,7 +623,7 @@ async def test_tablet_split(manager: ManagerClient, injection_error: str):
         '--target-tablet-size-in-bytes', '1024',
     ]
     servers = [await manager.server_add(config={
-        'error_injections_at_startup': ['short_tablet_stats_refresh_interval']
+        'tablet_load_stats_refresh_interval_in_seconds': 1
     }, cmdline=cmdline)]
 
     await manager.api.disable_tablet_balancing(servers[0].ip_addr)
@@ -955,7 +692,7 @@ async def test_correctness_of_tablet_split_finalization_after_restart(manager: M
         '--target-tablet-size-in-bytes', '1024',
     ]
     servers = [await manager.server_add(config={
-        'error_injections_at_startup': ['short_tablet_stats_refresh_interval'],
+        'tablet_load_stats_refresh_interval_in_seconds': 1
     }, cmdline=cmdline)]
 
     await manager.api.disable_tablet_balancing(servers[0].ip_addr)
@@ -1000,7 +737,7 @@ async def test_correctness_of_tablet_split_finalization_after_restart(manager: M
 
         # Delays refresh of tablet stats, so balancer works with whichever it got last.
         await manager.api.disable_injection(servers[0].ip_addr, "tablet_load_stats_refresh_before_rebalancing")
-        await manager.api.disable_injection(servers[0].ip_addr, "short_tablet_stats_refresh_interval")
+        await manager.server_update_config(servers[0].server_id, 'tablet_load_stats_refresh_interval_in_seconds', 60)
         time.sleep(1)
         await manager.api.disable_tablet_balancing(servers[0].ip_addr)
 
@@ -1119,7 +856,7 @@ async def assert_tablet_count_metric_value_for_shards(manager: ManagerClient, se
     metrics = await manager.metrics.query(server.ip_addr)
     for shard_id in range(0, len(expected_count_per_shard)):
         expected_tablet_count = expected_count_per_shard[shard_id]
-        tablet_count = metrics.get(name=tablet_count_metric_name, labels=None, shard=str(shard_id))
+        tablet_count = metrics.get(tablet_count_metric_name, {'shard':str(shard_id)})
         assert int(tablet_count) == expected_tablet_count
 
 async def get_tablet_tokens_from_host_on_shard(manager: ManagerClient, server: ServerInfo, keyspace_name: str, table_name: str, shard: int) -> list[int]:
@@ -1303,13 +1040,16 @@ async def test_tablet_load_and_stream(manager: ManagerClient, primary_replica_on
     def move_sstables_to_upload(table_dir: str, dst_table_dir: str):
         logger.info("Moving sstables to upload dir of destination table")
         table_upload_dir = os.path.join(dst_table_dir, "upload")
+        moved_files = []
         for sst in glob.glob(os.path.join(table_dir, "*-Data.db")):
             for src_path in glob.glob(os.path.join(table_dir, sst.removesuffix("-Data.db") + "*")):
                 dst_path = os.path.join(table_upload_dir, os.path.basename(src_path))
                 logger.info(f"Moving sstable file {src_path} to {dst_path}")
                 os.rename(src_path, dst_path)
+                moved_files.append(dst_path)
+        return moved_files
 
-    move_sstables_to_upload(table_dir, dst_table_dir)
+    moved_sstable_files = move_sstables_to_upload(table_dir, dst_table_dir)
 
     await manager.server_start(servers[0].server_id)
     cql = manager.get_cql()
@@ -1332,6 +1072,18 @@ async def test_tablet_load_and_stream(manager: ManagerClient, primary_replica_on
     time.sleep(1)
 
     await check(ks2)
+
+    logger.info("Checking that streamed SSTables are deleted from upload directory")
+    remaining_files = []
+    for file_path in moved_sstable_files:
+        if os.path.exists(file_path):
+            logger.info(f"SSTable file still exists: {file_path}")
+            remaining_files.append(file_path)
+
+    if remaining_files:
+        raise AssertionError(f"SSTable files were not deleted after load_and_stream: {remaining_files}")
+
+    logger.info("All SSTable files successfully deleted after streaming")
 
     await asyncio.gather(*[cql.run_async(f"drop keyspace {i}") for i in [ks, ks2]])
 
@@ -1413,73 +1165,6 @@ async def test_tablet_storage_freeing(manager: ManagerClient):
 
 @pytest.mark.asyncio
 @skip_mode('release', 'error injections are not supported in release mode')
-async def test_tombstone_gc_disabled_on_pending_replica(manager: ManagerClient):
-    logger.info("Bootstrapping cluster")
-    servers = [await manager.server_add()]
-
-    await manager.api.disable_tablet_balancing(servers[0].ip_addr)
-
-    cql = manager.get_cql()
-    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 4}") as ks:
-        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int) WITH gc_grace_seconds = 0;")
-
-        servers.append(await manager.server_add())
-
-        key = 7 # Whatever
-        tablet_token = 0 # Doesn't matter since there is one tablet
-        await cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({key}, 1) USING timestamp 9")
-        rows = await cql.run_async(f"SELECT pk from {ks}.test")
-        assert len(rows) == 1
-
-        replica = await get_tablet_replica(manager, servers[0], ks, 'test', tablet_token)
-
-        s0_host_id = await manager.get_host_id(servers[0].server_id)
-        s1_host_id = await manager.get_host_id(servers[1].server_id)
-        dst_shard = 0
-
-        await manager.api.enable_injection(servers[1].ip_addr, "stream_mutation_fragments", one_shot=True)
-        s1_log = await manager.server_open_log(servers[1].server_id)
-        s1_mark = await s1_log.mark()
-
-        migration_task = asyncio.create_task(
-            manager.api.move_tablet(servers[0].ip_addr, ks, "test", replica[0], replica[1], s1_host_id, dst_shard, tablet_token))
-
-        await s1_log.wait_for('stream_mutation_fragments: waiting', from_mark=s1_mark)
-        s1_mark = await s1_log.mark()
-
-        # write a tombstone with timestamp X to DB
-        await cql.run_async(f'DELETE FROM {ks}.test USING timestamp 10 WHERE pk = {key}')
-
-        # flush both servers
-        for s in servers:
-            await manager.api.flush_keyspace(s.ip_addr, ks)
-
-        await asyncio.sleep(1)
-
-        # major compact both servers
-        for s in servers:
-            await manager.api.keyspace_compaction(s.ip_addr, ks)
-
-        # write backdated data to test.test with timestamp X-1 with the same key as the tombstone
-        await cql.run_async(f'INSERT INTO {ks}.test (pk, c) VALUES ({key}, 0) USING timestamp 9')
-
-        # release streaming
-        await manager.api.message_injection(servers[1].ip_addr, "stream_mutation_fragments")
-        await s1_log.wait_for('stream_mutation_fragments: done', from_mark=s1_mark)
-
-        logger.info("Waiting for migration to finish")
-        await migration_task
-        logger.info("Migration done")
-
-        for s in servers:
-            await manager.api.flush_keyspace(s.ip_addr, ks)
-
-        # verify result
-        rows = await cql.run_async(f'SELECT pk, c FROM {ks}.test WHERE pk = {key};')
-        assert len(rows) == 0
-
-@pytest.mark.asyncio
-@skip_mode('release', 'error injections are not supported in release mode')
 async def test_schema_change_during_cleanup(manager: ManagerClient):
     logger.info("Start first node")
     servers = [await manager.server_add()]
@@ -1530,7 +1215,7 @@ async def test_tombstone_gc_correctness_during_tablet_split(manager: ManagerClie
         '--target-tablet-size-in-bytes', '5000',
     ]
     servers = [await manager.server_add(config={
-        'error_injections_at_startup': ['short_tablet_stats_refresh_interval']
+        'tablet_load_stats_refresh_interval_in_seconds': 1
     }, cmdline=cmdline)]
 
     await manager.api.disable_tablet_balancing(servers[0].ip_addr)
@@ -1604,12 +1289,12 @@ async def test_tombstone_gc_correctness_during_tablet_split(manager: ManagerClie
         logger.info("Verify data is not resurrected")
         await assert_empty_table()
 
-async def create_cluster(manager: ManagerClient, num_dcs: int, num_racks: int, nodes_per_rack: int) -> dict[ServerNum, ServerInfo]:
+async def create_cluster(manager: ManagerClient, num_dcs: int, num_racks: int, nodes_per_rack: int, config: dict[str, Any] = None) -> dict[ServerNum, ServerInfo]:
     logger.debug(f"Creating cluster: num_dcs={num_dcs} num_racks={num_racks} nodes_per_rack={nodes_per_rack}")
     servers: dict[ServerNum, ServerInfo] = dict()
     for dc in range(1, num_dcs + 1):
         for rack in range(1, num_racks + 1):
-            rack_servers = await manager.servers_add(nodes_per_rack, property_file={"dc": f"dc{dc}", "rack": f"rack{rack}"})
+            rack_servers = await manager.servers_add(nodes_per_rack, config=config, property_file={"dc": f"dc{dc}", "rack": f"rack{rack}"})
             for s in rack_servers:
                 servers[s.server_id] = s
     logger.debug(f"Created servers={list(servers.values())}")
@@ -1683,7 +1368,12 @@ async def test_decommission_rack_basic(manager: ManagerClient):
     nodes_per_rack = 2
     rf = num_racks - 1
 
-    all_servers = await create_cluster(manager, 1, num_racks, nodes_per_rack)
+    # We need to disable this option to be able to create a keyspace. This can be ditched
+    # once we've implemented scylladb/scylladb#23426 and we can add new racks with the option enabled.
+    # Then we can create `rf` nodes, create the keyspace, and add another node.
+    config = {"rf_rack_valid_keyspaces": False}
+
+    all_servers = await create_cluster(manager, 1, num_racks, nodes_per_rack, config)
     async with create_and_populate_table(manager, rf=rf) as ctx:
         logger.info("Verify tablet replicas distribution")
         tables = {ctx.ks: [ctx.table]}
@@ -1719,7 +1409,11 @@ async def test_decommission_rack_after_adding_new_rack(manager: ManagerClient):
     nodes_per_rack = 2
     rf = initial_num_racks
 
-    initial_servers = await create_cluster(manager, 1, initial_num_racks, nodes_per_rack)
+    # We can't add a new rack if we create a keyspace.
+    # Once scylladb/scylladb#23426 has been implemented, this can be ditched.
+    config = {"rf_rack_valid_keyspaces": False}
+
+    initial_servers = await create_cluster(manager, 1, initial_num_racks, nodes_per_rack, config)
     async with create_and_populate_table(manager, rf=rf) as ctx:
         logger.debug("Temporarily disable tablet load balancing")
         node1 = sorted(initial_servers.values(), key=lambda s: s.server_id)[0]
@@ -1729,7 +1423,7 @@ async def test_decommission_rack_after_adding_new_rack(manager: ManagerClient):
         new_rack = f"rack{num_racks}"
         # copy initial_servers into all_servers, don't just assign it (by reference)
         all_servers: list[ServerInfo] = list(initial_servers.values())
-        new_rack_servers = await manager.servers_add(nodes_per_rack, property_file={"dc": "dc1", "rack": new_rack})
+        new_rack_servers = await manager.servers_add(nodes_per_rack, config=config, property_file={"dc": "dc1", "rack": new_rack})
         all_servers.extend(new_rack_servers)
 
         logger.info("Verify tablet replicas distribution")
@@ -1787,7 +1481,7 @@ async def test_decommission_not_enough_racks(manager: ManagerClient):
             if s.rack == decommision_rack:
                 logger.debug(f"Decommissioning server={s}")
                 decommision_count += 1
-                expected_error = "Unable to find new replica for tablet" if decommision_count == nodes_per_rack else None
+                expected_error = "Decommission failed" if decommision_count == nodes_per_rack else None
                 await manager.decommission_node(s.server_id, expected_error=expected_error)
                 if not expected_error:
                     dead_servers[s.server_id] = s
@@ -1835,3 +1529,282 @@ async def test_tablet_cleanup_vs_snapshot_race(manager: ManagerClient):
         await s0_log.wait_for('Cleanup failed for tablet', from_mark=s0_mark)
 
         await manager.api.take_snapshot(servers[0].ip_addr, ks, "test_snapshot")
+
+# Reproduces assert failure when truncating table, either triggered by DROP TABLE or TRUNCATE.
+# See: https://github.com/scylladb/scylladb/issues/18059
+# It's achieved by migrating a tablet away that contains the highest replay position of a shard,
+# so when drop/truncate happens, the highest replay position will be greater than all the data
+# found in the table (includes data in memtable).
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ['DROP TABLE', 'TRUNCATE'])
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_drop_table_and_truncate_after_migration(manager: ManagerClient, operation):
+    cmdline = [ '--smp=2' ]
+    cfg = { 'auto_snapshot': True }
+    servers = [await manager.server_add(cmdline=cmdline, config=cfg)]
+
+    await manager.api.disable_tablet_balancing(servers[0].ip_addr)
+
+    cql = manager.get_cql()
+    ks = await create_new_test_keyspace(cql, f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}} AND TABLETS = {{'initial': 4}}")
+    await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
+
+    await manager.api.disable_autocompaction(servers[0].ip_addr, ks)
+
+    keys = range(100)
+    await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});") for k in keys])
+
+    tablet_replicas = await get_all_tablet_replicas(manager, servers[0], ks, 'test')
+    tablet_replicas_in_s0 = list[TabletReplicas]()
+
+    for replica in tablet_replicas:
+        if replica.replicas[0][1] == 0:
+            tablet_replicas_in_s0.append(replica)
+
+    assert len(tablet_replicas_in_s0) == 2
+
+    target_tablet = tablet_replicas_in_s0[0]
+
+    s0_host_id = await manager.get_host_id(servers[0].server_id)
+
+    logger.info("Migrating 1st tablet to shard 1")
+    await manager.api.move_tablet(servers[0].ip_addr, ks, "test", *(s0_host_id, 0), *(s0_host_id, 1), target_tablet.last_token)
+
+    await manager.api.enable_injection(servers[0].ip_addr, "truncate_disable_compaction_delay", one_shot=True)
+
+    logger.info(f"Running {operation} {ks}.test")
+    await cql.run_async(f"{operation} {ks}.test")
+
+@pytest.mark.asyncio
+@pytest.mark.nightly
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_truncate_during_topology_change(manager: ManagerClient):
+    """Test truncate operation during topology change."""
+
+    # Start 3 node cluster
+    servers = await manager.servers_add(3, config = { 'enable_tablets': True }, auto_rack_dc="dc1")
+    cql = manager.get_cql()
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (k int PRIMARY KEY, v int)")
+
+        logger.info("Populating table")
+        stmt = cql.prepare(f"INSERT INTO {ks}.test (k, v) VALUES (?, ?)")
+        stmt.consistency_level = ConsistencyLevel.QUORUM
+        await asyncio.gather(*(cql.run_async(stmt, [k, k]) for k in range(10000)))
+        await manager.api.keyspace_flush(servers[0].ip_addr, ks, "test")
+
+        async def truncate_table():
+            await asyncio.sleep(10)
+            logger.info("Executing truncate during bootstrap")
+            await cql.run_async(f"TRUNCATE {ks}.test USING TIMEOUT 1m")
+
+        truncate_task = asyncio.create_task(truncate_table())
+        logger.info("Adding fourth node")
+        new_server = await manager.server_add(config={'error_injections_at_startup': ['delay_bootstrap_120s'], 'enable_tablets': True},
+                                              property_file=servers[0].property_file())
+        await truncate_task
+
+        # Wait for bootstrap completion
+        await wait_for_cql_and_get_hosts(cql, servers + [new_server], time.time() + 60)
+
+        rows = await cql.run_async(f"SELECT COUNT(*) FROM {ks}.test")
+        assert rows[0].count == 0, "Table should be empty after truncation"
+
+# Reproducer for https://github.com/scylladb/scylladb/issues/22040.
+@pytest.mark.asyncio
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_concurrent_schema_change_with_compaction_completion(manager: ManagerClient):
+    cmdline = ['--smp=2']
+    servers = [await manager.server_add(cmdline=cmdline)]
+
+    await manager.api.enable_injection(servers[0].ip_addr, "sstable_list_builder_delay", one_shot=False)
+
+    cql = manager.get_cql()
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1}") as ks:
+        table = f"{ks}.test"
+        await cql.run_async(f"CREATE TABLE {table} (a int PRIMARY KEY, b int);")
+
+        stop_compaction = False
+        async def background_compaction():
+            while stop_compaction == False:
+                await manager.api.keyspace_compaction(servers[0].ip_addr, ks)
+
+        compaction_task = asyncio.create_task(background_compaction())
+
+        for i in range(5):
+            dotestCreateAndDropIndex(cql, table, "CamelCase", False)
+            dotestCreateAndDropIndex(cql, table, "CamelCase2", True)
+
+        stop_compaction = True
+        await compaction_task
+
+        async def force_minor_compaction():
+            for i in range(4):
+                cql.run_async(f"INSERT INTO {ks}.test (a, b) VALUES (1, 1);")
+                await manager.api.flush_keyspace(servers[0].ip_addr, ks)
+
+        await cql.run_async(f"ALTER TABLE {table} WITH compaction = {{ 'class' : 'TimeWindowCompactionStrategy' }};")
+        await force_minor_compaction()
+        await cql.run_async(f"ALTER TABLE {table} WITH compaction = {{ 'class' : 'IncrementalCompactionStrategy' }};")
+        await force_minor_compaction()
+
+# This is a test and reproducer for https://github.com/scylladb/scylladb/issues/24153
+@pytest.mark.asyncio
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_split_correctness_on_tablet_count_change(manager: ManagerClient):
+    logger.info('Bootstrapping cluster')
+    cfg = { 'enable_tablets': True,
+            'tablet_load_stats_refresh_interval_in_seconds': 1
+            }
+    cmdline = [
+        '--logger-log-level', 'load_balancer=debug',
+        '--logger-log-level', 'debug_error_injection=debug',
+        '--smp', '1', # single cpu is needed to prevent intra-node migration which interacts badly with injection splitting_mutation_writer_switch_wait.
+    ]
+    server = await manager.server_add(cmdline=cmdline, config=cfg)
+
+    logger.info(f'server_id = {server.server_id}')
+
+    cql = manager.get_cql()
+
+    await manager.api.disable_tablet_balancing(server.ip_addr)
+
+    initial_tablets = 2
+
+    async with new_test_keyspace(manager, f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int) WITH tablets = {{'min_tablet_count': {initial_tablets}}};")
+
+        await manager.api.disable_autocompaction(server.ip_addr, ks, 'test')
+
+        # insert data
+        pks = range(256)
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});") for k in pks])
+
+        # flush the table
+        await manager.api.flush_keyspace(server.ip_addr, ks)
+
+        # force split on the test table
+        expected_tablet_count = 4
+        await cql.run_async(f"ALTER TABLE {ks}.test WITH tablets = {{'min_tablet_count': {expected_tablet_count}}}")
+
+        log = await manager.server_open_log(server.server_id)
+        log_mark = await log.mark()
+
+        await manager.api.enable_injection(server.ip_addr, "splitting_mutation_writer_switch_wait", one_shot=True)
+        await manager.api.enable_tablet_balancing(server.ip_addr)
+
+        await log.wait_for('Emitting resize decision of type split', from_mark=log_mark)
+        await log.wait_for('splitting_mutation_writer_switch_wait: waiting', from_mark=log_mark)
+
+        # needs to skip update of repaired_at on merge, since it stops split task.
+        await manager.api.enable_injection(server.ip_addr, "skip_update_repaired_at_for_merge", one_shot=False)
+        await manager.api.enable_injection(server.ip_addr, "merge_completion_fiber", one_shot=True)
+
+        expected_tablet_count = 1
+        await cql.run_async(f"ALTER TABLE {ks}.test WITH tablets = {{'min_tablet_count': {expected_tablet_count}}}")
+
+        # wait for merge to complete
+        actual_tablet_count = 0
+        started = time.time()
+        while expected_tablet_count != actual_tablet_count:
+            actual_tablet_count = await get_tablet_count(manager, server, ks, 'test')
+            logger.debug(f'actual/expected tablet count: {actual_tablet_count}/{expected_tablet_count}')
+
+            assert time.time() - started < 120, 'Timeout while waiting for tablet merge'
+            await asyncio.sleep(.1)
+
+        logger.info(f'Merged test table; new number of tablets: {expected_tablet_count}')
+
+        await manager.api.message_injection(server.ip_addr, "splitting_mutation_writer_switch_wait")
+        await asyncio.sleep(.1)
+        await manager.api.message_injection(server.ip_addr, "merge_completion_fiber")
+
+# Reproducer for https://github.com/scylladb/scylladb/issues/26041.
+@pytest.mark.parametrize("primary_replica_only", [False, True])
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_tablet_load_and_stream_and_split_synchronization(manager: ManagerClient, primary_replica_only):
+    logger.info("Bootstrapping cluster")
+    cmdline = [
+        '--logger-log-level', 'storage_service=debug',
+        '--logger-log-level', 'table=debug',
+    ]
+    servers = [await manager.server_add(config={
+        'tablet_load_stats_refresh_interval_in_seconds': 1
+    }, cmdline=cmdline)]
+    server = servers[0]
+
+    await manager.api.disable_tablet_balancing(servers[0].ip_addr)
+
+    cql = manager.get_cql()
+
+    initial_tablets = 1
+
+    async with new_test_keyspace(manager, f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int) WITH tablets = {{'min_tablet_count': {initial_tablets}}};")
+
+        keys = range(100)
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});") for k in keys])
+
+        async def check(ks_name: str):
+            logger.info("Checking table")
+            cql = manager.get_cql()
+            rows = await cql.run_async(f"SELECT * FROM {ks_name}.test BYPASS CACHE;")
+            assert len(rows) == len(keys)
+            for r in rows:
+                assert r.c == r.pk
+
+        await manager.api.flush_keyspace(servers[0].ip_addr, ks)
+        await check(ks)
+
+        node_workdir = await manager.server_get_workdir(servers[0].server_id)
+
+        cql = await safe_server_stop_gracefully(manager, servers[0].server_id)
+
+        table_dir = glob.glob(os.path.join(node_workdir, "data", ks, "test-*"))[0]
+        logger.info(f"Table dir: {table_dir}")
+
+        def move_sstables_to_upload(table_dir: str):
+            logger.info("Moving sstables to upload dir")
+            table_upload_dir = os.path.join(table_dir, "upload")
+            for sst in glob.glob(os.path.join(table_dir, "*-Data.db")):
+                for src_path in glob.glob(os.path.join(table_dir, sst.removesuffix("-Data.db") + "*")):
+                    dst_path = os.path.join(table_upload_dir, os.path.basename(src_path))
+                    logger.info(f"Moving sstable file {src_path} to {dst_path}")
+                    os.rename(src_path, dst_path)
+
+        move_sstables_to_upload(table_dir)
+
+        await manager.server_start(servers[0].server_id)
+        cql = manager.get_cql()
+        await wait_for_cql_and_get_hosts(cql, servers, time.time() + 60)
+
+        rows = await cql.run_async(f"SELECT * FROM {ks}.test BYPASS CACHE;")
+        assert len(rows) == 0
+
+        await manager.api.disable_tablet_balancing(servers[0].ip_addr)
+
+        await manager.api.enable_injection(servers[0].ip_addr, "tablet_resize_finalization_post_barrier", one_shot=True)
+
+        s1_log = await manager.server_open_log(servers[0].server_id)
+        s1_mark = await s1_log.mark()
+
+        await manager.api.enable_tablet_balancing(servers[0].ip_addr)
+
+        await cql.run_async(f"ALTER TABLE {ks}.test WITH tablets = {{'min_tablet_count': {initial_tablets * 2}}}")
+
+        await s1_log.wait_for(f"tablet_resize_finalization_post_barrier: waiting", from_mark=s1_mark)
+
+        await manager.api.enable_injection(servers[0].ip_addr, "stream_mutation_fragments", one_shot=True)
+
+        load_and_stream_task = asyncio.create_task(manager.api.load_new_sstables(servers[0].ip_addr, ks, "test", primary_replica_only))
+        await s1_log.wait_for(f"Loading new SSTables for keyspace", from_mark=s1_mark)
+
+        await manager.api.message_injection(server.ip_addr, "tablet_resize_finalization_post_barrier")
+        await s1_log.wait_for('Detected tablet split for table', from_mark=s1_mark)
+
+        await s1_log.wait_for(f"stream_mutation_fragments: waiting", from_mark=s1_mark)
+        await manager.api.message_injection(server.ip_addr, "stream_mutation_fragments")
+
+        await load_and_stream_task
+
+        await check(ks)

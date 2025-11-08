@@ -26,7 +26,7 @@
 struct shared_load_stats {
     locator::load_stats stats;
 
-    locator::load_stats_ptr get() {
+    locator::load_stats_ptr get() const {
         return make_lw_shared(stats);
     }
 
@@ -71,10 +71,13 @@ public:
 private:
     cql_test_env& _env;
     int _nr_nodes = 0;
+    int _dc_id;
     int _rack_id;
     sstring _dc;
     sstring _rack;
     shared_load_stats _load_stats;
+    std::vector<locator::host_id> _hosts;
+    std::unordered_map<locator::host_id, gms::inet_address> _host_addresses;
 private:
     inet_address make_node_address(int n) {
         assert(n > 0);
@@ -149,8 +152,14 @@ public:
     // Starts building a new rack in the current DC.
     // Returns location of the new rack.
     endpoint_dc_rack start_new_rack() {
-        _rack_id++;
-        _rack = fmt::format("rack{}", _rack_id);
+        _rack = fmt::format("rack{}{:c}", _dc_id, 'a' + _rack_id++);
+        return rack();
+    }
+
+    // Starts building a new rack in the current DC.
+    // Returns location of the new rack.
+    endpoint_dc_rack start_new_rack(sstring rack_name) {
+        _rack = std::move(rack_name);
         return rack();
     }
 
@@ -158,17 +167,35 @@ public:
     // DC is named uniquely in the scope of the process, not just this object.
     endpoint_dc_rack start_new_dc() {
         static std::atomic<int> next_id = 1;
-        _dc = fmt::format("dc{}", next_id.fetch_add(1));
+        _dc_id = next_id.fetch_add(1);
+        _dc = fmt::format("dc{}", _dc_id);
         _rack_id = 0;
         return start_new_rack();
     }
 
-    locator::load_stats_ptr get_load_stats() {
+    // Starts building a new DC.
+    endpoint_dc_rack start_new_dc(endpoint_dc_rack dc_and_rack) {
+        _dc = dc_and_rack.dc;
+        _rack = dc_and_rack.rack;
+        return rack();
+    }
+
+    locator::load_stats_ptr get_load_stats() const {
         return _load_stats.get();
     }
 
     shared_load_stats& get_shared_load_stats() {
         return _load_stats;
+    }
+
+    /// Returns total cluster's storage capacity in bytes.
+    uint64_t get_capacity() const {
+        uint64_t cap = 0;
+        auto stats = get_load_stats();
+        for (auto h : _hosts) {
+            cap += stats->capacity.at(h);
+        }
+        return cap;
     }
 
     locator::host_id add_node(service::node_state state = service::node_state::normal,
@@ -215,7 +242,21 @@ public:
                 testlog.warn("Concurrent modification detected, retrying");
             }
         }
+        _hosts.push_back(id);
+        _host_addresses.emplace(id, ip);
         return id;
+    }
+
+    locator::host_id add_i4i_2xlarge(endpoint_dc_rack rack) {
+        auto h = add_node(service::node_state::normal, 7, rack);
+        get_shared_load_stats().set_capacity(h, 1'875'000'000'000);
+        return h;
+    }
+
+    locator::host_id add_i4i_large(endpoint_dc_rack rack) {
+        auto h = add_node(service::node_state::normal, 2, rack);
+        get_shared_load_stats().set_capacity(h, 468'000'000'000);
+        return h;
     }
 
     void set_node_state(locator::host_id id, service::node_state state) {
@@ -237,5 +278,13 @@ public:
                 testlog.warn("Concurrent modification detected, retrying");
             }
         }
+    }
+
+    const std::vector<locator::host_id>& hosts() const {
+        return _hosts;
+    }
+
+    const std::unordered_map<locator::host_id, gms::inet_address>& host_addresses() const {
+        return _host_addresses;
     }
 };

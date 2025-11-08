@@ -18,7 +18,7 @@ namespace cql3 {
 const cql_config default_cql_config(cql_config::default_tag{});
 
 thread_local const query_options::specific_options query_options::specific_options::DEFAULT{
-    -1, {}, db::consistency_level::SERIAL, api::missing_timestamp};
+    -1, {}, db::consistency_level::SERIAL, api::missing_timestamp, service::node_local_only::no};
 
 thread_local query_options query_options::DEFAULT{default_cql_config,
     db::consistency_level::ONE, std::nullopt,
@@ -160,12 +160,11 @@ void query_options::fill_value_views()
     }
 }
 
-db::consistency_level query_options::check_serial_consistency() const {
-
+utils::result_with_exception_ptr<db::consistency_level> query_options::check_serial_consistency() const {
     if (_options.serial_consistency.has_value()) {
         return *_options.serial_consistency;
     }
-    throw exceptions::protocol_exception("Consistency level for LWT is missing for a request with conditions");
+    return bo::failure(std::make_exception_ptr(exceptions::protocol_exception("Consistency level for LWT is missing for a request with conditions")));
 }
 
 void query_options::cache_pk_function_call(computed_function_values::key_type id, computed_function_values::mapped_type value) const {

@@ -83,13 +83,18 @@ def test_lwt_empty_clustering_range(cql, table1):
 # so if a batch has both a IF EXISTS and IF NOT EXISTS on the same row, they
 # can't possibly both be true, so this batch is guaranteed to fail
 # regardless of the data. Cassandra detects this specific conflict, and
-# prints an error instead of silently failing the batch.
-# Reproduces #13011.
-@pytest.mark.xfail(reason="issue #13011")
-def test_lwt_with_batch_conflict_1(cql, table1):
+# prints an error instead of silently failing the batch, but in ScyllaDB
+# we considered this check to be inconsistent and unhelpful, and
+# decided not to implement it, and this case is treated as a normal batch
+# failure (not all conditions are true), not an error. See discussion in #13011.
+# The test is marked scylla_only because it will fail on Cassandra which will
+# report an error, not a batch failure.
+def test_lwt_with_batch_conflict_1(cql, table1, scylla_only):
     p = unique_key_int()
-    with pytest.raises(InvalidRequest, match='Cannot mix'):
-        cql.execute(f'BEGIN BATCH DELETE FROM {table1} WHERE p={p} AND c=1 IF EXISTS; INSERT INTO {table1}(p,c,r) VALUES ({p},1,2) IF NOT EXISTS; APPLY BATCH;')
+    rs = cql.execute(f'BEGIN BATCH DELETE FROM {table1} WHERE p={p} AND c=1 IF EXISTS; INSERT INTO {table1}(p,c,r) VALUES ({p},1,2) IF NOT EXISTS; APPLY BATCH;')
+    # Cassandra fails with: "Cannot mix IF EXISTS and IF NOT EXISTS conditions for the same row"
+    for r in rs:
+        assert r.applied == False
 
 # However, Cassandra does not detect every case of a conflict between
 # different conditions in a batch. For example, trying both "IF r=1"
@@ -102,6 +107,40 @@ def test_lwt_with_batch_conflict_2(cql, table1):
     # Scylla returns a separate row for each of the two conditions.
     for r in rs:
         assert r.applied == False
+
+# Moreover, there are cases where Cassandra prevents mixing
+# IF EXISTS with different conditions such as IF r=1, despite
+# the fact that the conditions are not contradictory.
+def test_lwt_with_batch_conflict_3(cql, table1, scylla_only):
+    p = unique_key_int()
+    cql.execute(f'INSERT INTO {table1}(p,c,r) VALUES ({p},1,1)')
+    rs = cql.execute(f'BEGIN BATCH UPDATE {table1} SET r=10 WHERE p={p} AND c=1 IF r=1; UPDATE {table1} SET r=20 WHERE p={p} AND c=1 IF EXISTS;  APPLY BATCH;')
+    # Cassandra fails with: "Cannot mix IF conditions and IF EXISTS for the same row"
+    for r in rs:
+        assert r.applied == True
+
+# During a static column update, the clustering key is not required in the WHERE clause.
+# A batch composed of a query that updates a static column and a query that inserts
+# a new row is allowed and will be applied successfully.
+def test_lwt_with_batch_conflict_4(cql, table1):
+    p = unique_key_int()
+    cql.execute(f'INSERT INTO {table1}(p,c,r,s) VALUES ({p},1,1,1)')
+    rs = cql.execute(f'BEGIN BATCH UPDATE {table1} SET s=NULL WHERE p={p} IF EXISTS; INSERT INTO {table1}(p,c,r) VALUES ({p},2,2) IF NOT EXISTS; APPLY BATCH;')
+    for r in rs:
+        assert r.applied == True
+
+# However, even for static columns, mixing IF EXISTS and other conditions
+# is disallowed in Cassandra.
+def test_lwt_with_batch_conflict_5(cql, table1, scylla_only):
+    p = unique_key_int()
+    cql.execute(f'INSERT INTO {table1}(p,c,r,s) VALUES ({p},1,1,1)')
+    rs = cql.execute(f'BEGIN BATCH UPDATE {table1} SET s=NULL WHERE p={p} IF EXISTS; UPDATE {table1} SET s=NULL WHERE p={p} IF s = 1; APPLY BATCH;')
+    # Cassandra fails with: "Cannot mix IF conditions and IF NOT EXISTS for the same row"
+    # The fact that "IF NOT EXISTS" is used in the error message is a bit misleading,
+    # but that's what Cassandra returns
+    for r in rs:
+        assert r.applied == True
+
 
 # Test NOT IN condition in LWT IF clause
 #
@@ -128,3 +167,45 @@ def test_lwt_not_in(cql, table1, cassandra_bug):
     rs = list(cql.execute(f'UPDATE {table1} SET r=NULL WHERE p={p} AND c=1 IF r NOT IN (NULL, 7, 8)'))
     for r in rs:
         assert r.applied == False
+
+# Currently in Cassandra and in Scylla (see discussion in #24229), the full
+# LWT "IF" syntax is allowed on UPDATE and DELETE, but only the IF NOT EXISTS
+# condition is allowed for INSERT. This test confirms that INSERT with
+# IF NOT EXISTS works correctly, in other words, it:
+# 1. Returns a response with a boolean "applied" attribute.
+# 2. Doesn't do anything (and returns applied=False) when the row already
+#    exists.
+def test_lwt_insert_if_not_exists(cql, table1):
+    p = unique_key_int()
+    # The row doesn't yet exist, IF NOT EXISTS will insert it.
+    rs = list(cql.execute(f'INSERT INTO {table1}(p, c, r) values ({p}, 1, 1) IF NOT EXISTS'))
+    assert len(rs) == 1
+    assert rs[0].applied
+    assert list(cql.execute(f'SELECT * FROM {table1} WHERE p={p}')) == [(p, 1, None, 1)]
+    # Try again to insert the same row with IF NOT EXISTS, it won't do it,
+    # and the row won't change:
+    rs = list(cql.execute(f'INSERT INTO {table1}(p, c, r) values ({p}, 1, 2) IF NOT EXISTS'))
+    assert len(rs) == 1
+    assert not rs[0].applied
+    assert list(cql.execute(f'SELECT * FROM {table1} WHERE p={p}')) == [(p, 1, None, 1)]
+
+# Similarly to the above test, INSERT JSON should also accept IF NOT EXISTS
+# and work as expected with it. Reproduces issue #8682.
+@pytest.mark.xfail(reason="issue #8682")
+def test_lwt_insert_json_if_not_exists(cql, table1):
+    p = unique_key_int()
+    # The row doesn't yet exist, IF NOT EXISTS will insert it.
+    rs = list(cql.execute("""INSERT INTO %s JSON '{"p": %s, "c": 1, "r": 1}' IF NOT EXISTS""" % (table1, p)))
+    # The following assert failed in #8682 (INSERT didn't return a response
+    # row).
+    assert len(rs) == 1
+    assert rs[0].applied
+    assert list(cql.execute(f'SELECT * FROM {table1} WHERE p={p}')) == [(p, 1, None, 1)]
+    # Try again to insert the same row with IF NOT EXISTS, it won't do it,
+    # and the row won't change:
+    rs = list(cql.execute("""INSERT INTO %s JSON '{"p": %s, "c": 1, "r": 2}' IF NOT EXISTS""" % (table1, p)))
+    assert len(rs) == 1
+    assert not rs[0].applied
+    # The following assert failed in #8682 (the INSERT was done despite the
+    # row existing).
+    assert list(cql.execute(f'SELECT * FROM {table1} WHERE p={p}')) == [(p, 1, None, 1)]

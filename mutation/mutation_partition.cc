@@ -11,10 +11,10 @@
 #include <seastar/coroutine/maybe_yield.hh>
 
 #include "mutation_partition.hh"
-#include "clustering_interval_set.hh"
+#include "keys/clustering_interval_set.hh"
 #include "converting_mutation_partition_applier.hh"
 #include "partition_builder.hh"
-#include "query-result-writer.hh"
+#include "query/query-result-writer.hh"
 #include "mutation_fragment.hh"
 #include "mutation_query.hh"
 #include "mutation_compactor.hh"
@@ -26,7 +26,7 @@
 #include <seastar/core/execution_stage.hh>
 #include "types/map.hh"
 #include "compaction/compaction_garbage_collector.hh"
-#include "clustering_key_filter.hh"
+#include "keys/clustering_key_filter.hh"
 #include "mutation_partition_view.hh"
 #include "tombstone_gc.hh"
 #include "utils/assert.hh"
@@ -35,6 +35,11 @@
 
 logging::logger mclog("mutation_compactor");
 logging::logger mplog("mutation_partition");
+
+void on_bad_row_key(const schema& s, position_in_partition_view pos, const char* reason) {
+    on_internal_error(mplog, format("check_row_key(): attempted to use {} {} as row key for non-compact table {}.{}",
+            reason, pos, s.ks_name(), s.cf_name()));
+}
 
 mutation_partition::mutation_partition(const schema& s, const mutation_partition& x)
         : _tombstone(x._tombstone)
@@ -524,6 +529,7 @@ mutation_partition::find_row(const schema& s, const clustering_key& key) const {
 deletable_row&
 mutation_partition::clustered_row(const schema& s, clustering_key&& key) {
     check_schema(s);
+    check_row_key(s, key, is_dummy::no);
     auto i = _rows.find(key, rows_entry::tri_compare(s));
     if (i == _rows.end()) {
         auto e = alloc_strategy_unique_ptr<rows_entry>(
@@ -536,6 +542,7 @@ mutation_partition::clustered_row(const schema& s, clustering_key&& key) {
 deletable_row&
 mutation_partition::clustered_row(const schema& s, const clustering_key& key) {
     check_schema(s);
+    check_row_key(s, key, is_dummy::no);
     auto i = _rows.find(key, rows_entry::tri_compare(s));
     if (i == _rows.end()) {
         auto e = alloc_strategy_unique_ptr<rows_entry>(
@@ -548,6 +555,7 @@ mutation_partition::clustered_row(const schema& s, const clustering_key& key) {
 deletable_row&
 mutation_partition::clustered_row(const schema& s, clustering_key_view key) {
     check_schema(s);
+    check_row_key(s, key, is_dummy::no);
     auto i = _rows.find(key, rows_entry::tri_compare(s));
     if (i == _rows.end()) {
         auto e = alloc_strategy_unique_ptr<rows_entry>(
@@ -560,6 +568,7 @@ mutation_partition::clustered_row(const schema& s, clustering_key_view key) {
 rows_entry&
 mutation_partition::clustered_rows_entry(const schema& s, position_in_partition_view pos, is_dummy dummy, is_continuous continuous) {
     check_schema(s);
+    check_row_key(s, pos, dummy);
     auto i = _rows.find(pos, rows_entry::tri_compare(s));
     if (i == _rows.end()) {
         auto e = alloc_strategy_unique_ptr<rows_entry>(
@@ -577,6 +586,7 @@ mutation_partition::clustered_row(const schema& s, position_in_partition_view po
 deletable_row&
 mutation_partition::append_clustered_row(const schema& s, position_in_partition_view pos, is_dummy dummy, is_continuous continuous) {
     check_schema(s);
+    check_row_key(s, pos, dummy);
     const auto cmp = rows_entry::tri_compare(s);
     auto i = _rows.end();
     if (!_rows.empty() && (cmp(*std::prev(i), pos) >= 0)) {
@@ -2146,8 +2156,8 @@ to_data_query_result(const reconcilable_result& r, schema_ptr s, const query::pa
         query::result_options opts) {
     // This result was already built with a limit, don't apply another one.
     query::result::builder builder(slice, opts, query::result_memory_accounter{ query::result_memory_limiter::unlimited_result_size }, query::max_tombstones);
-    auto consumer = compact_for_query_v2<query_result_builder>(*s, gc_clock::time_point::min(), slice, max_rows,
-            max_partitions, query_result_builder(*s, builder));
+    auto consumer = compact_for_query<query_result_builder>(*s, gc_clock::time_point::min(), slice, max_rows,
+            max_partitions, tombstone_gc_state(nullptr), query_result_builder(*s, builder));
     auto compaction_state = consumer.get_state();
     frozen_mutation_consumer_adaptor adaptor(s, consumer);
     for (const partition& p : r.partitions()) {
@@ -2165,8 +2175,8 @@ to_data_query_result(const reconcilable_result& r, schema_ptr s, const query::pa
 query::result
 query_mutation(mutation&& m, const query::partition_slice& slice, uint64_t row_limit, gc_clock::time_point now, query::result_options opts) {
     query::result::builder builder(slice, opts, query::result_memory_accounter{ query::result_memory_limiter::unlimited_result_size }, query::max_tombstones);
-    auto consumer = compact_for_query_v2<query_result_builder>(*m.schema(), now, slice, row_limit,
-            query::max_partitions, query_result_builder(*m.schema(), builder));
+    auto consumer = compact_for_query<query_result_builder>(*m.schema(), now, slice, row_limit,
+            query::max_partitions, tombstone_gc_state(nullptr), query_result_builder(*m.schema(), builder));
     auto compaction_state = consumer.get_state();
     std::move(m).consume(consumer, consume_in_reverse::no);
     return builder.build(compaction_state->current_full_position());
@@ -2385,7 +2395,7 @@ future<mutation_opt> counter_write_query(schema_ptr s, const mutation_source& so
                          const query::partition_slice& slice,
                          tracing::trace_state_ptr trace_ptr)
             : range(dht::partition_range::make_singular(dk))
-            , reader(source.make_reader_v2(s, std::move(permit), range, slice,
+            , reader(source.make_mutation_reader(s, std::move(permit), range, slice,
                                                       std::move(trace_ptr), streamed_mutation::forwarding::no,
                                                       mutation_reader::forwarding::no))
         { }
@@ -2394,8 +2404,8 @@ future<mutation_opt> counter_write_query(schema_ptr s, const mutation_source& so
     // do_with() doesn't support immovable objects
     auto r_a_r = std::make_unique<range_and_reader>(s, source, std::move(permit), dk, slice, std::move(trace_ptr));
     auto cwqrb = counter_write_query_result_builder(*s);
-    auto cfq = compact_for_query_v2<counter_write_query_result_builder>(
-            *s, gc_clock::now(), slice, query::max_rows, query::max_partitions, std::move(cwqrb));
+    auto cfq = compact_for_query<counter_write_query_result_builder>(
+            *s, gc_clock::now(), slice, query::max_rows, query::max_partitions, tombstone_gc_state(nullptr), std::move(cwqrb));
     auto f = r_a_r->reader.consume(std::move(cfq));
     return f.finally([r_a_r = std::move(r_a_r)] {
         return r_a_r->reader.close();
@@ -2522,11 +2532,5 @@ future<> mutation_cleaner_impl::drain() {
         });
     });
 }
-
-can_gc_fn always_gc = [] (tombstone, is_shadowable) { return true; };
-can_gc_fn never_gc = [] (tombstone, is_shadowable) { return false; };
-
-max_purgeable_fn can_always_purge = [] (const dht::decorated_key&, is_shadowable) { return api::max_timestamp; };
-max_purgeable_fn can_never_purge = [] (const dht::decorated_key&, is_shadowable) { return api::min_timestamp; };
 
 logging::logger compound_logger("compound");

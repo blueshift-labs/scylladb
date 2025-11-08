@@ -14,6 +14,7 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/core/shared_ptr.hh>
 #include "utils/atomic_vector.hh"
+#include "utils/chunked_vector.hh"
 
 namespace data_dictionary {
 class keyspace_metadata;
@@ -31,9 +32,10 @@ class function_name;
 }
 namespace locator {
 class tablet_metadata_change_hint;
+class tablet_map;
 }
 
-#include "timestamp.hh"
+#include "mutation/timestamp.hh"
 
 #include "seastarx.hh"
 
@@ -62,7 +64,6 @@ public:
     virtual void on_update_function(const sstring& ks_name, const sstring& function_name) = 0;
     virtual void on_update_aggregate(const sstring& ks_name, const sstring& aggregate_name) = 0;
     virtual void on_update_view(const sstring& ks_name, const sstring& view_name, bool columns_changed) = 0;
-    virtual void on_update_tablet_metadata(const locator::tablet_metadata_change_hint&) = 0;
 
     // The callback runs inside seastar thread
     virtual void on_drop_keyspace(const sstring& ks_name) = 0;
@@ -80,10 +81,14 @@ public:
     // of the column family's keyspace. The reason for this is that we sometimes create a keyspace
     // and its column families together. Therefore, listeners can't load the keyspace from the
     // database. Instead, they should use the `ksm` parameter if needed.
-    virtual void on_before_create_column_family(const keyspace_metadata& ksm, const schema&, std::vector<mutation>&, api::timestamp_type) {}
-    virtual void on_before_update_column_family(const schema& new_schema, const schema& old_schema, std::vector<mutation>&, api::timestamp_type) {}
-    virtual void on_before_drop_column_family(const schema&, std::vector<mutation>&, api::timestamp_type) {}
-    virtual void on_before_drop_keyspace(const sstring& keyspace_name, std::vector<mutation>&, api::timestamp_type) {}
+    virtual void on_pre_create_column_families(const keyspace_metadata& ksm, std::vector<schema_ptr>&) {}
+    virtual void on_before_create_column_family(const keyspace_metadata& ksm, const schema&, utils::chunked_vector<mutation>&, api::timestamp_type) {}
+    virtual void on_before_create_column_families(const keyspace_metadata& ksm, const std::vector<schema_ptr>& cfms, utils::chunked_vector<mutation>& mutations, api::timestamp_type timestamp);
+    virtual void on_before_update_column_family(const schema& new_schema, const schema& old_schema, utils::chunked_vector<mutation>&, api::timestamp_type) {}
+    virtual void on_before_drop_column_family(const schema&, utils::chunked_vector<mutation>&, api::timestamp_type) {}
+    virtual void on_before_drop_keyspace(const sstring& keyspace_name, utils::chunked_vector<mutation>&, api::timestamp_type) {}
+
+    virtual void on_before_allocate_tablet_map(const locator::tablet_map&, const schema& s, utils::chunked_vector<mutation>&, api::timestamp_type) {}
 
     class only_view_notifications;
     class empty_listener;
@@ -102,7 +107,6 @@ public:
     void on_update_user_type(const sstring& ks_name, const sstring& type_name) override {}
     void on_update_function(const sstring& ks_name, const sstring& function_name) override {}
     void on_update_aggregate(const sstring& ks_name, const sstring& aggregate_name) override {}
-    void on_update_tablet_metadata(const locator::tablet_metadata_change_hint&) override {}
 
     void on_drop_keyspace(const sstring& ks_name) override {}
     void on_drop_column_family(const sstring& ks_name, const sstring& cf_name) override {}
@@ -130,26 +134,36 @@ public:
     /// Unregister a migration listener on current shard.
     future<> unregister_listener(migration_listener* listener);
 
-    future<> create_keyspace(lw_shared_ptr<keyspace_metadata> ksm);
+    future<> create_keyspace(const sstring& ks_name);
     future<> create_column_family(schema_ptr cfm);
     future<> create_user_type(user_type type);
     future<> create_view(view_ptr view);
-    future<> update_keyspace(lw_shared_ptr<keyspace_metadata> ksm);
+    future<> update_keyspace(const sstring& ks_name);
     future<> update_column_family(schema_ptr cfm, bool columns_changed);
     future<> update_user_type(user_type type);
     future<> update_view(view_ptr view, bool columns_changed);
-    future<> update_tablet_metadata(locator::tablet_metadata_change_hint);
-    future<> drop_keyspace(sstring ks_name);
+    future<> drop_keyspace(const sstring& ks_name);
     future<> drop_column_family(schema_ptr cfm);
     future<> drop_user_type(user_type type);
     future<> drop_view(view_ptr view);
     future<> drop_function(const db::functions::function_name& fun_name, const std::vector<data_type>& arg_types);
     future<> drop_aggregate(const db::functions::function_name& fun_name, const std::vector<data_type>& arg_types);
 
-    void before_create_column_family(const keyspace_metadata& ksm, const schema&, std::vector<mutation>&, api::timestamp_type);
-    void before_update_column_family(const schema& new_schema, const schema& old_schema, std::vector<mutation>&, api::timestamp_type);
-    void before_drop_column_family(const schema&, std::vector<mutation>&, api::timestamp_type);
-    void before_drop_keyspace(const sstring& keyspace_name, std::vector<mutation>&, api::timestamp_type);
+    // This notification allows the subscriber to modify the cfms vector before
+    // we create the tables mutations and notify about them. For example, we
+    // can add a new table here (e.g. CDC).
+    // We want to do this before calling `before_create_column_families`,
+    // because in `before_create_column_families` we want the subscriber to get
+    // the final list of tables.
+    void pre_create_column_families(const keyspace_metadata& ksm, std::vector<schema_ptr>&);
+
+    void before_create_column_family(const keyspace_metadata& ksm, const schema&, utils::chunked_vector<mutation>&, api::timestamp_type);
+    void before_create_column_families(const keyspace_metadata& ksm, const std::vector<schema_ptr>&, utils::chunked_vector<mutation>&, api::timestamp_type);
+    void before_update_column_family(const schema& new_schema, const schema& old_schema, utils::chunked_vector<mutation>&, api::timestamp_type);
+    void before_drop_column_family(const schema&, utils::chunked_vector<mutation>&, api::timestamp_type);
+    void before_drop_keyspace(const sstring& keyspace_name, utils::chunked_vector<mutation>&, api::timestamp_type);
+
+    void before_allocate_tablet_map(const locator::tablet_map&, const schema&, utils::chunked_vector<mutation>&, api::timestamp_type);
 };
 
 }

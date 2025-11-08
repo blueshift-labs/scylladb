@@ -7,7 +7,7 @@
  */
 
 #include "replica/memtable.hh"
-#include "readers/from_fragments_v2.hh"
+#include "readers/from_fragments.hh"
 #include "repair/hash.hh"
 #include "repair/row.hh"
 #include "repair/writer.hh"
@@ -23,6 +23,8 @@
 #include "test/lib/sstable_utils.hh"
 #include "readers/mutation_fragment_v1_stream.hh"
 #include "schema/schema_registry.hh"
+#include "utils/chunked_vector.hh"
+#include "repair/incremental.hh"
 
 BOOST_AUTO_TEST_SUITE(repair_test)
 
@@ -85,15 +87,15 @@ lw_shared_ptr<repair_writer> make_test_repair_writer(schema_ptr schema, reader_p
 
 repair_rows_on_wire make_random_repair_rows_on_wire(random_mutation_generator& gen, schema_ptr s, reader_permit permit, lw_shared_ptr<replica::memtable> m) {
     repair_rows_on_wire input;
-    std::vector<mutation> muts = gen(100);
+    utils::chunked_vector<mutation> muts = gen(100);
 
     for (mutation& mut : muts) {
         partition_key pk = mut.key();
         auto m2 = make_memtable(s, {mut});
         m->apply(mut);
-        auto reader = mutation_fragment_v1_stream(m2->make_flat_reader(s, permit));
+        auto reader = mutation_fragment_v1_stream(m2->make_mutation_reader(s, permit));
         auto close_reader = deferred_close(reader);
-        std::list<frozen_mutation_fragment> mfs;
+        utils::chunked_vector<frozen_mutation_fragment> mfs;
         reader.consume_pausable([s, &mfs](mutation_fragment mf) {
             if ((mf.is_partition_start() && !mf.as_partition_start().partition_tombstone()) || mf.is_end_of_partition()) {
                 // Stream of mutations coming from the wire doesn't contain partition_end
@@ -136,7 +138,7 @@ SEASTAR_TEST_CASE(flush_repair_rows_on_wire_to_sstable) {
         std::list<repair_row> repair_rows = to_repair_rows_list(std::move(input), s, seed, repair_master::yes, permit, repair_hasher(seed, s)).get();
         flush_rows(s, repair_rows, writer);
         writer->wait_for_writer_done().get();
-        compare_readers(*s, m->make_flat_reader(s, permit), make_mutation_reader_from_fragments(s, permit, std::move(fragments)));
+        compare_readers(*s, m->make_mutation_reader(s, permit), make_mutation_reader_from_fragments(s, permit, std::move(fragments)));
     });
 }
 
@@ -189,7 +191,7 @@ SEASTAR_TEST_CASE(test_reader_with_different_strategies) {
             });
             auto read_all = [&](repair_reader::read_strategy strategy) -> future<std::vector<mutation_fragment>> {
                 auto reader = repair_reader(e.db(), cf, cf.schema(), make_reader_permit(e),
-                    random_range, remote_sharder, remote_shard, 0, strategy, gc_clock::now());
+                    random_range, remote_sharder, remote_shard, 0, strategy, gc_clock::now(), incremental_repair_meta());
                 std::vector<mutation_fragment> result;
                 while (auto mf = co_await reader.read_mutation_fragment()) {
                     result.push_back(std::move(*mf));

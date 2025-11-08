@@ -11,7 +11,7 @@
 
 #include <seastar/core/sstring.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/abort_source.hh>
 #include "utils/log.hh"
 #include "utils/s3/creds.hh"
@@ -21,15 +21,10 @@
 
 namespace db {
 class extensions;
-class seed_provider_type;
 class config;
-namespace view {
-class view_update_generator;
-}
 }
 
 namespace gms {
-class feature_service;
 class inet_address;
 }
 
@@ -40,6 +35,7 @@ class bad_configuration_error : public std::exception {};
 [[nodiscard]] std::set<gms::inet_address> get_seeds_from_db_config(const db::config& cfg,
                                                                    gms::inet_address broadcast_address,
                                                                    bool fail_on_lookup_error);
+[[nodiscard]] std::set<sstring> get_disabled_features_from_db_config(const db::config& cfg, std::set<sstring> disabled = {});
 
 class service_set {
 public:
@@ -129,24 +125,3 @@ public:
 private:
     static void register_configurable(configurable &);
 };
-
-future<> read_object_storage_config(db::config& db_cfg);
-
-struct object_storage_endpoint_param {
-    sstring endpoint;
-    s3::endpoint_config config;
-};
-
-namespace YAML {
-template <>
-struct convert<object_storage_endpoint_param> {
-    static bool decode(const Node& node, ::object_storage_endpoint_param& ep) {
-        ep.endpoint = node["name"].as<std::string>();
-        ep.config.port = node["port"].as<unsigned>();
-        ep.config.use_https = node["https"].as<bool>(false);
-        ep.config.region = node["aws_region"] ? node["aws_region"].as<std::string>() : std::getenv("AWS_DEFAULT_REGION");
-        ep.config.role_arn = node["iam_role_arn"] ? node["iam_role_arn"].as<std::string>() : "";
-        return true;
-    }
-};
-}

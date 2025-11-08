@@ -12,27 +12,33 @@ import pathlib
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import List, Optional, Callable, Any, Awaitable, Dict, Tuple
+from typing import List, Optional, Callable, Any, Awaitable, Dict, Tuple, Union
 from time import time
 import logging
 from test.pylib.log_browsing import ScyllaLogFile
 from test.pylib.rest_client import UnixRESTClient, ScyllaRESTAPIClient, ScyllaMetricsClient
-from test.pylib.util import wait_for, wait_for_cql_and_get_hosts, Host
+from test.pylib.util import wait_for, wait_for_cql_and_get_hosts, universalasync_typed_wrap, Host
 from test.pylib.internal_types import ServerNum, IPAddress, HostID, ServerInfo, ServerUpState
-from test.pylib.scylla_cluster import ReplaceConfig, ScyllaServer
+from test.pylib.scylla_cluster import ReplaceConfig, ScyllaServer, ScyllaVersionDescription
 from cassandra.cluster import Session as CassandraSession, \
     ExecutionProfile, EXEC_PROFILE_DEFAULT  # type: ignore # pylint: disable=no-name-in-module
-from cassandra.policies import WhiteListRoundRobinPolicy
+from cassandra.policies import LoadBalancingPolicy, RoundRobinPolicy, WhiteListRoundRobinPolicy
 from cassandra.cluster import Cluster as CassandraCluster  # type: ignore # pylint: disable=no-name-in-module
 from cassandra.auth import AuthProvider
 import aiohttp
 import asyncio
+import allure
 
 
 logger = logging.getLogger(__name__)
 
 
-class ManagerClient():
+class NoSuchProcess(Exception):
+    ...
+
+
+@universalasync_typed_wrap
+class ManagerClient:
     """Helper Manager API client
     Args:
         sock_path (str): path to an AF_UNIX socket where Manager server is listening
@@ -41,12 +47,13 @@ class ManagerClient():
     # pylint: disable=too-many-public-methods
 
     def __init__(self, sock_path: str, port: int, use_ssl: bool, auth_provider: Any|None,
-                 con_gen: Callable[[List[IPAddress], int, bool, Any], CassandraSession]) \
+                 con_gen: Callable[[List[IPAddress], int, bool, Any, LoadBalancingPolicy], CassandraCluster]) \
                          -> None:
         self.test_log_fh: Optional[logging.FileHandler] = None
         self.port = port
         self.use_ssl = use_ssl
         self.auth_provider = auth_provider
+        self.load_balancing_policy = RoundRobinPolicy()
         self.con_gen = con_gen
         self.ccluster: Optional[CassandraCluster] = None
         self.cql: Optional[CassandraSession] = None
@@ -88,7 +95,7 @@ class ManagerClient():
         self.driver_close()
         logger.debug("driver connecting to %s", servers)
         self.ccluster = self.con_gen(servers, self.port, self.use_ssl,
-                                     auth_provider if auth_provider else self.auth_provider)
+                                     auth_provider if auth_provider else self.auth_provider, self.load_balancing_policy)
         self.cql = self.ccluster.connect()
 
     def driver_close(self) -> None:
@@ -113,6 +120,12 @@ class ManagerClient():
         await self.servers_see_each_other(servers)
         hosts = await wait_for_cql_and_get_hosts(cql, servers, time() + 60)
         return cql, hosts
+
+    async def get_cql_exclusive(self, server: ServerInfo):
+        cql = self.con_gen([server.ip_addr], self.port, self.use_ssl, self.auth_provider,
+                                     WhiteListRoundRobinPolicy([server.ip_addr])).connect()
+        await wait_for_cql_and_get_hosts(cql, [server], time() + 60)
+        return cql
 
     # Make driver update endpoints from remote connection
     def _driver_update(self) -> None:
@@ -163,7 +176,9 @@ class ManagerClient():
         for server in await self.all_servers():
             log_file = await self.server_open_log(server_id=server.server_id)
             shutil.copyfile(log_file.file, failed_test_path_dir / f"{pathlib.Path(log_file.file).name}")
+            allure.attach(log_file.file.read_bytes(), name=log_file.file.name, attachment_type=allure.attachment_type.TEXT)
         for name, log in logs.items():
+            allure.attach(log.read_bytes(), name=name, attachment_type=allure.attachment_type.TEXT) if name != "pytest.log" else None
             shutil.copyfile(log, failed_test_path_dir / name)
 
     async def is_manager_up(self) -> bool:
@@ -202,6 +217,20 @@ class ManagerClient():
         return [ServerInfo(ServerNum(int(info[0])), IPAddress(info[1]), IPAddress(info[2]), info[3], info[4])
                 for info in server_info_list]
 
+    async def starting_servers(self) -> list[ServerInfo]:
+        """Get List of server info (id and IP address) of servers currently
+           starting. Can be useful for killing (with server_stop()) a server
+           which a test started in the background but now doesn't expect to
+           ever finish booting successfully.
+        """
+        try:
+            server_info_list = await self.client.get_json("/cluster/starting-servers")
+        except RuntimeError as exc:
+            raise Exception("Failed to get list of starting servers") from exc
+        assert isinstance(server_info_list, list), "starting_servers got unknown data type"
+        return [ServerInfo(ServerNum(int(info[0])), IPAddress(info[1]), IPAddress(info[2]), info[3], info[4])
+                for info in server_info_list]
+
     async def mark_dirty(self) -> None:
         """Manually mark current cluster dirty.
            To be used when a server was modified outside of this API."""
@@ -217,17 +246,38 @@ class ManagerClient():
         logger.debug("ManagerClient stopping %s", server_id)
         await self.client.put_json(f"/cluster/server/{server_id}/stop")
 
-    async def server_stop_gracefully(self, server_id: ServerNum, timeout: float = 60) -> None:
+    async def server_stop_gracefully(self, server_id: ServerNum, timeout: float = 180) -> None:
         """Stop specified server gracefully"""
         logger.debug("ManagerClient stopping gracefully %s", server_id)
         await self.client.put_json(f"/cluster/server/{server_id}/stop_gracefully", timeout=timeout)
 
-    async def server_start(self, server_id: ServerNum, expected_error: Optional[str] = None,
-                           wait_others: int = 0, wait_interval: float = 45, seeds: Optional[List[IPAddress]] = None,
-                           timeout: Optional[float] = None, connect_driver: bool = True) -> None:
-        """Start specified server and optionally wait for it to learn of other servers"""
+    async def server_start(self,
+                           server_id: ServerNum,
+                           expected_error: str | None = None,
+                           wait_others: int = 0,
+                           wait_interval: float = 45,
+                           seeds: list[IPAddress] | None = None,
+                           timeout: float | None = None,
+                           connect_driver: bool = True,
+                           expected_server_up_state: ServerUpState = ServerUpState.CQL_QUERIED,
+                           cmdline_options_override: list[str] | None = None,
+                           append_env_override: dict[str, str] | None = None,
+                           auth_provider: dict[str, str] | None = None) -> None:
+        """Start specified server and optionally wait for it to learn of other servers.
+
+        Replace CLI options and environment variables with `cmdline_options_override` and `append_env_override`
+        if provided.
+        """
         logger.debug("ManagerClient starting %s", server_id)
-        data = {"expected_error": expected_error, "seeds": seeds}
+        data = {
+            "expected_error": expected_error,
+            "seeds": seeds,
+            "connect_driver": connect_driver,
+            "expected_server_up_state": expected_server_up_state.name,
+            "cmdline_options_override": cmdline_options_override,
+            "append_env_override": append_env_override,
+            "auth_provider": auth_provider,
+        }
         await self.client.put_json(f"/cluster/server/{server_id}/start", data, timeout=timeout)
         await self.server_sees_others(server_id, wait_others, interval = wait_interval)
         if expected_error is None and connect_driver:
@@ -242,7 +292,7 @@ class ManagerClient():
         await self.server_stop_gracefully(server_id)
         await self.server_start(server_id=server_id, wait_others=wait_others, wait_interval=wait_interval)
 
-    async def rolling_restart(self, servers: List[ServerInfo], with_down: Optional[Callable[[ServerInfo], Awaitable[Any]]] = None):
+    async def rolling_restart(self, servers: List[ServerInfo], with_down: Optional[Callable[[ServerInfo], Awaitable[Any]]] = None, wait_for_cql = True):
         # `servers` might not include all the running servers, but we want to check against all of them
         servers_running = await self.running_servers()
 
@@ -258,10 +308,11 @@ class ManagerClient():
 
             if with_down:
                 up_servers = [u for u in servers if u.server_id != s.server_id]
-                await wait_for_cql_and_get_hosts(self.cql, up_servers, time() + 60)
+                if wait_for_cql:
+                    await wait_for_cql_and_get_hosts(self.cql, up_servers, time() + 60)
                 await with_down(s)
 
-            await self.server_start(s.server_id)
+            await self.server_start(s.server_id, connect_driver=wait_for_cql)
 
             # Wait for other servers to see the restarted server.
             # Otherwise, the next server we are going to restart may not yet see "s" as restarted
@@ -271,8 +322,8 @@ class ManagerClient():
             for s2 in servers_running:
                 if s2.server_id != s.server_id:
                     await self.server_sees_other_server(s2.ip_addr, s.ip_addr)
-
-        await wait_for_cql_and_get_hosts(self.cql, servers_running, time() + 60)
+        if wait_for_cql:
+            await wait_for_cql_and_get_hosts(self.cql, servers_running, time() + 60)
 
     async def server_pause(self, server_id: ServerNum) -> None:
         """Pause the specified server."""
@@ -283,6 +334,20 @@ class ManagerClient():
         """Unpause the specified server."""
         logger.debug("ManagerClient unpausing %s", server_id)
         await self.client.put_json(f"/cluster/server/{server_id}/unpause")
+
+    async def server_switch_executable(self, server_id: ServerNum, path: str) -> None:
+        """Switch the executable path of a stopped server"""
+        logger.debug("ManagerClient starting %s", server_id)
+        data = {"path": path}
+        await self.client.put_json(f"/cluster/server/{server_id}/switch_executable", data)
+
+    async def server_change_version(self, server_id: ServerNum, exe: str):
+        """ Upgrades a running Scylla node by switching it to a new binary version 
+            specified by the 'exe' parameter.
+        """
+        await self.server_stop_gracefully(server_id)
+        await self.server_switch_executable(server_id, exe)
+        await self.server_start(server_id)
 
     async def server_wipe_sstables(self, server_id: ServerNum, keyspace: str, table: str) -> None:
         """Delete all files for the given table from the data directory"""
@@ -297,7 +362,8 @@ class ManagerClient():
                                 replace_cfg: Optional[ReplaceConfig],
                                 cmdline: Optional[List[str]],
                                 config: Optional[dict[str, Any]],
-                                property_file: Optional[dict[str, Any]],
+                                version: Optional[ScyllaVersionDescription],
+                                property_file: Union[List[dict[str, Any]], dict[str, Any], None],
                                 start: bool,
                                 seeds: Optional[List[IPAddress]],
                                 expected_error: Optional[str],
@@ -310,6 +376,8 @@ class ManagerClient():
             data['cmdline'] = cmdline
         if config:
             data['config'] = config
+        if version:
+            data['version'] = version._asdict()
         if property_file:
             data['property_file'] = property_file
         if seeds:
@@ -326,6 +394,7 @@ class ManagerClient():
                          replace_cfg: Optional[ReplaceConfig] = None,
                          cmdline: Optional[List[str]] = None,
                          config: Optional[dict[str, Any]] = None,
+                         version: Optional[ScyllaVersionDescription] = None,
                          property_file: Optional[dict[str, Any]] = None,
                          start: bool = True,
                          expected_error: Optional[str] = None,
@@ -340,6 +409,7 @@ class ManagerClient():
                 replace_cfg,
                 cmdline,
                 config,
+                version,
                 property_file,
                 start,
                 seeds,
@@ -380,20 +450,26 @@ class ManagerClient():
     async def servers_add(self, servers_num: int = 1,
                           cmdline: Optional[List[str]] = None,
                           config: Optional[dict[str, Any]] = None,
-                          property_file: Optional[dict[str, Any]] = None,
+                          version: Optional[ScyllaVersionDescription] = None,
+                          property_file: Union[List[dict[str, Any]], dict[str, Any], None] = None,
                           start: bool = True,
                           seeds: Optional[List[IPAddress]] = None,
                           driver_connect_opts: dict[str, Any] = {},
                           expected_error: Optional[str] = None,
-                          server_encryption: str = "none") -> List[ServerInfo]:
+                          server_encryption: str = "none",
+                          auto_rack_dc: Optional[str] = None) -> List[ServerInfo]:
         """Add new servers concurrently.
         This function can be called only if the cluster uses consistent topology changes, which support
         concurrent bootstraps. If your test does not fulfill this condition and you want to add multiple
         servers, you should use multiple server_add calls."""
         assert servers_num > 0, f"servers_add: cannot add {servers_num} servers, servers_num must be positive"
+        assert not (property_file and auto_rack_dc), f"Either property_file or auto_rack_dc can be provided, but not both"
+
+        if auto_rack_dc:
+            property_file = [{"dc":auto_rack_dc, "rack":f"rack{i+1}"} for i in range(servers_num)]
 
         try:
-            data = self._create_server_add_data(None, cmdline, config, property_file, start, seeds, expected_error, server_encryption, None)
+            data = self._create_server_add_data(None, cmdline, config, version, property_file, start, seeds, expected_error, server_encryption, None)
             data['servers_num'] = servers_num
             server_infos = await self.client.put_json("/cluster/addservers", data, response_type="json",
                                                       timeout=ScyllaServer.TOPOLOGY_TIMEOUT * servers_num)
@@ -464,14 +540,41 @@ class ManagerClient():
                                    timeout=timeout)
         self._driver_update()
 
-    async def server_get_config(self, server_id: ServerNum) -> dict[str, object]:
+    async def server_get_config(self, server_id: ServerNum) -> dict[str, Any]:
         data = await self.client.get_json(f"/cluster/server/{server_id}/get_config")
         assert isinstance(data, dict), f"server_get_config: got {type(data)} expected dict"
         return data
 
-    async def server_update_config(self, server_id: ServerNum, key: str, value: object) -> None:
-        await self.client.put_json(f"/cluster/server/{server_id}/update_config",
-                                   {"key": key, "value": value})
+    async def server_update_config(self,
+                                   server_id: ServerNum,
+                                   key: str | None = None,
+                                   value: Any = None,
+                                   *,
+                                   config_options: dict[str, Any] | None = None) -> None:
+        """
+        Update the server's configuration file.
+
+        You can update a single option by providing the (key, value) pair, or multiple options using config_options.
+        """
+        if key is not None:
+            if value is None:
+                raise RuntimeError("`value` is required if `key` is not None")
+            if config_options is not None:
+                raise RuntimeError("`key: value` pair and `config_options` dict can't be used simultaneously")
+            config_options = {key: value}
+        elif not isinstance(config_options, dict):
+            raise RuntimeError(f"`config_options` is expected to be a dict, not {type(config_options)}")
+        await self.client.put_json(
+            resource_uri=f"/cluster/server/{server_id}/update_config",
+            data={"config_options": config_options},
+        )
+
+    async def server_remove_config_option(self, server_id: ServerNum, key: str) -> None:
+        """Remove the provided option from the server's configuration file."""
+        await self.client.put_json(
+            resource_uri=f"/cluster/server/{server_id}/remove_config_option",
+            data={"key": key},
+        )
 
     async def server_update_cmdline(self, server_id: ServerNum, cmdline_options: List[str]) -> None:
         await self.client.put_json(f"/cluster/server/{server_id}/update_cmdline",
@@ -543,6 +646,13 @@ class ManagerClient():
         rows = await self.cql.run_async(f"select id from system_schema.views where keyspace_name = '{keyspace}' and view_name = '{view}'")
         return rows[0].id
 
+    async def get_table_or_view_id(self, keyspace: str, table: str):
+        rows = await self.cql.run_async(f"select id from system_schema.tables where keyspace_name = '{keyspace}' and table_name = '{table}'")
+        if len(rows) > 0:
+            return rows[0].id
+        rows = await self.cql.run_async(f"select id from system_schema.views where keyspace_name = '{keyspace}' and view_name = '{table}'")
+        return rows[0].id
+
     async def server_sees_others(self, server_id: ServerNum, count: int, interval: float = 45.):
         """Wait till a server sees a minimum given count of other servers"""
         if count < 1:
@@ -596,3 +706,12 @@ class ManagerClient():
 
     async def server_get_exe(self, server_id: ServerNum) -> str:
         return await self.client.get_json(f"/cluster/server/{server_id}/exe")
+
+    async def server_get_returncode(self, server_id: ServerNum) -> int | None:
+        match await self.client.get_json(f"/cluster/server/{server_id}/returncode"):
+            case "NO_SUCH_PROCESS":
+                raise NoSuchProcess(f"No process found for {server_id=}")
+            case "RUNNING":
+                return None
+            case returncode:
+                return int(returncode)

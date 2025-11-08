@@ -13,38 +13,41 @@
 #include <fmt/ostream.h>
 #include <fmt/ranges.h>
 #include <seastar/core/coroutine.hh>
-#include <seastar/core/queue.hh>
 #include <seastar/core/units.hh>
 #include <seastar/http/short_streams.hh>
 #include <seastar/util/closeable.hh>
-#include <seastar/core/queue.hh>
 
 #include "init.hh"
 #include "compaction/compaction.hh"
 #include "compaction/compaction_strategy.hh"
 #include "compaction/compaction_strategy_state.hh"
-#include "cql3/type_json.hh"
 #include "cql3/statements/raw/parsed_statement.hh"
+#include "cql3/statements/modification_statement.hh"
 #include "cql3/statements/select_statement.hh"
 #include "db/config.hh"
 #include "db/large_data_handler.hh"
+#include "db/corrupt_data_handler.hh"
+#include "db/object_storage_endpoint_param.hh"
 #include "gms/feature_service.hh"
 #include "reader_concurrency_semaphore.hh"
 #include "readers/combined.hh"
-#include "readers/generating_v2.hh"
+#include "readers/generating.hh"
 #include "schema/schema_builder.hh"
 #include "sstables/index_reader.hh"
 #include "sstables/sstables_manager.hh"
 #include "sstables/sstable_directory.hh"
 #include "sstables/open_info.hh"
+#include "release.hh"
 #include "replica/schema_describe_helper.hh"
 #include "test/lib/cql_test_env.hh"
 #include "tools/json_writer.hh"
+#include "tools/json_mutation_stream_parser.hh"
 #include "tools/load_system_tablets.hh"
 #include "tools/lua_sstable_consumer.hh"
 #include "tools/schema_loader.hh"
 #include "tools/sstable_consumer.hh"
 #include "tools/utils.hh"
+#include "types/json_utils.hh"
 #include "locator/host_id.hh"
 
 using namespace seastar;
@@ -71,8 +74,6 @@ namespace {
 const auto app_name = "sstable";
 
 logging::logger sst_log(format("scylla-{}", app_name));
-
-db::nop_large_data_handler large_data_handler;
 
 struct decorated_key_hash {
     std::size_t operator()(const dht::decorated_key& dk) const {
@@ -354,13 +355,24 @@ const std::vector<sstables::shared_sstable> load_sstables(schema_ptr schema, sst
         data_dictionary::storage_options options;
         auto ed = sstables::parse_path(sst_path, schema->ks_name(), schema->cf_name());
 
-        if (s3::is_s3_fqn(sst_path)) {
-            if (sst_man.config().object_storage_config().empty()) {
-                throw std::invalid_argument("Unable to open SSTable in S3: AWS object storage configuration missing. Please provide a --scylla-yaml-file with "
-                                            "valid AWS object storage configuration.");
+        using osp = db::object_storage_endpoint_param;
+        static const auto os_types = { osp::s3_type, osp::gs_type };
+        auto is_fqn = os_types | std::views::filter(std::bind_front(&data_dictionary::is_object_storage_fqn, sst_path));
+
+        if (!is_fqn.empty()) {
+            auto type = is_fqn.front();
+            auto endpoints = sst_man.config().object_storage_endpoints() 
+                | std::views::filter(std::bind_back(&osp::is_storage_of_type, type)) 
+                ;
+            if (endpoints.empty()) {
+                throw std::invalid_argument(fmt::format(
+                    "Unable to open SSTable in {}: AWS object storage configuration missing. Please provide a --scylla-yaml-file with "
+                    "valid AWS object storage configuration."
+                    , type
+                ));
             }
-            auto endpoint = sst_man.config().object_storage_config().begin()->first;
-            options = data_dictionary::make_s3_options(endpoint, sst_path);
+            auto endpoint = endpoints.front().key();
+            options = data_dictionary::make_object_storage_options(endpoint, sst_path);
         } else {
             sst_path = std::filesystem::canonical(std::filesystem::path(sst_name));
             const auto dir_path = sst_path.parent_path();
@@ -421,6 +433,24 @@ output_format get_output_format_from_options(const bpo::variables_map& opts, out
             return output_format::json;
         } else {
             throw std::invalid_argument(fmt::format("invalid value for dump option output-format: {}", value));
+        }
+    }
+    return default_format;
+}
+
+enum class input_format {
+    cql, json
+};
+
+input_format get_input_format_from_options(const bpo::variables_map& opts, input_format default_format) {
+    if (auto it = opts.find("input-format"); it != opts.end()) {
+        const auto& value = it->second.as<std::string>();
+        if (value == "cql") {
+            return input_format::cql;
+        } else if (value == "json") {
+            return input_format::json;
+        } else {
+            throw std::invalid_argument(fmt::format("invalid value for option input-format: {}", value));
         }
     }
     return default_format;
@@ -648,183 +678,6 @@ public:
     virtual future<> consume_stream_end() override { return _consumer->consume_stream_end(); }
 };
 
-class writetime_histogram_collecting_consumer : public sstable_consumer {
-private:
-    enum class bucket {
-        years,
-        months,
-        weeks,
-        days,
-        hours,
-    };
-
-public:
-    schema_ptr _schema;
-    bucket _bucket = bucket::months;
-    std::map<api::timestamp_type, uint64_t> _histogram;
-    uint64_t _partitions = 0;
-    uint64_t _rows = 0;
-    uint64_t _cells = 0;
-    uint64_t _timestamps = 0;
-
-private:
-    api::timestamp_type timestamp_bucket(api::timestamp_type ts) {
-        using namespace std::chrono;
-        switch (_bucket) {
-            case bucket::years:
-                return duration_cast<microseconds>(duration_cast<years>(microseconds(ts))).count();
-            case bucket::months:
-                return duration_cast<microseconds>(duration_cast<months>(microseconds(ts))).count();
-            case bucket::weeks:
-                return duration_cast<microseconds>(duration_cast<weeks>(microseconds(ts))).count();
-            case bucket::days:
-                return duration_cast<microseconds>(duration_cast<days>(microseconds(ts))).count();
-            case bucket::hours:
-                return duration_cast<microseconds>(duration_cast<hours>(microseconds(ts))).count();
-        }
-        std::abort();
-    }
-    void collect_timestamp(api::timestamp_type ts) {
-        ts = timestamp_bucket(ts);
-
-        ++_timestamps;
-        auto it = _histogram.find(ts);
-        if (it == _histogram.end()) {
-            it = _histogram.emplace(ts, 0).first;
-        }
-        ++it->second;
-    }
-    void collect_column(const atomic_cell_or_collection& cell, const column_definition& cdef) {
-        if (cdef.is_atomic()) {
-            ++_cells;
-            collect_timestamp(cell.as_atomic_cell(cdef).timestamp());
-        } else if (cdef.type->is_collection() || cdef.type->is_user_type()) {
-            cell.as_collection_mutation().with_deserialized(*cdef.type, [&, this] (collection_mutation_view_description mv) {
-                if (mv.tomb) {
-                    collect_timestamp(mv.tomb.timestamp);
-                }
-                for (auto&& c : mv.cells) {
-                    ++_cells;
-                    collect_timestamp(c.second.timestamp());
-                }
-            });
-        } else {
-            throw std::runtime_error(fmt::format("Cannot collect timestamp of cell (column {} of unknown type {})", cdef.name_as_text(), cdef.type->name()));
-        }
-    }
-
-    void collect_row(const row& r, column_kind kind) {
-        ++_rows;
-        r.for_each_cell([this, kind] (column_id id, const atomic_cell_or_collection& cell) {
-            collect_column(cell, _schema->column_at(kind, id));
-        });
-    }
-
-    void collect_static_row(const static_row& sr) {
-        collect_row(sr.cells(), column_kind::static_column);
-    }
-
-    void collect_clustering_row(const clustering_row& cr) {
-        if (!cr.marker().is_missing()) {
-            collect_timestamp(cr.marker().timestamp());
-        }
-        if (cr.tomb() != row_tombstone{}) {
-            collect_timestamp(cr.tomb().tomb().timestamp);
-        }
-
-        collect_row(cr.cells(), column_kind::regular_column);
-    }
-
-public:
-    explicit writetime_histogram_collecting_consumer(schema_ptr s, reader_permit, const bpo::variables_map& vm) : _schema(std::move(s)) {
-        auto it = vm.find("bucket");
-        if (it != vm.end()) {
-            auto value = it->second.as<std::string>();
-            if (value == "years") {
-                _bucket = bucket::years;
-            } else if (value == "months") {
-                _bucket = bucket::months;
-            } else if (value == "weeks") {
-                _bucket = bucket::weeks;
-            } else if (value == "days") {
-                _bucket = bucket::days;
-            } else if (value == "hours") {
-                _bucket = bucket::hours;
-            } else {
-                throw std::invalid_argument(fmt::format("invalid value for writetime-histogram option bucket: {}", value));
-            }
-        }
-    }
-    virtual future<> consume_stream_start() override {
-        return make_ready_future<>();
-    }
-    virtual future<stop_iteration> consume_sstable_start(const sstables::sstable* const sst) override {
-        return make_ready_future<stop_iteration>(stop_iteration::no);
-    }
-    virtual future<stop_iteration> consume(partition_start&& ps) override {
-        ++_partitions;
-        if (auto tomb = ps.partition_tombstone()) {
-            collect_timestamp(tomb.timestamp);
-        }
-        return make_ready_future<stop_iteration>(stop_iteration::no);
-    }
-    virtual future<stop_iteration> consume(static_row&& sr) override {
-        collect_static_row(sr);
-        return make_ready_future<stop_iteration>(stop_iteration::no);
-    }
-    virtual future<stop_iteration> consume(clustering_row&& cr) override {
-        collect_clustering_row(cr);
-        return make_ready_future<stop_iteration>(stop_iteration::no);
-    }
-    virtual future<stop_iteration> consume(range_tombstone_change&& rtc) override {
-        collect_timestamp(rtc.tombstone().timestamp);
-        return make_ready_future<stop_iteration>(stop_iteration::no);
-    }
-    virtual future<stop_iteration> consume(partition_end&& pe) override {
-        return make_ready_future<stop_iteration>(stop_iteration::no);
-    }
-    virtual future<stop_iteration> consume_sstable_end() override {
-        return make_ready_future<stop_iteration>(stop_iteration::no);
-    }
-    virtual future<> consume_stream_end() override {
-        if (_histogram.empty()) {
-            sst_log.info("Histogram empty, no data to write");
-            co_return;
-        }
-        sst_log.info("Histogram has {} entries, collected from {} partitions, {} rows, {} cells: {} timestamps total", _histogram.size(), _partitions, _rows, _cells, _timestamps);
-
-        const auto filename = "histogram.json";
-
-        auto file = co_await open_file_dma(filename, open_flags::wo | open_flags::create);
-        auto fstream = co_await make_file_output_stream(file);
-
-        co_await fstream.write("{");
-
-        co_await fstream.write("\n\"buckets\": [");
-        auto it = _histogram.begin();
-        co_await fstream.write(format("\n  {}", it->first));
-        for (++it; it != _histogram.end(); ++it) {
-            co_await fstream.write(format(",\n  {}", it->first));
-        }
-        co_await fstream.write("\n]");
-
-        co_await fstream.write(",\n\"counts\": [");
-        it = _histogram.begin();
-        co_await fstream.write(format("\n  {}", it->second));
-        for (++it; it != _histogram.end(); ++it) {
-            co_await fstream.write(format(",\n  {}", it->second));
-        }
-        co_await fstream.write("\n]");
-        co_await fstream.write("\n}");
-
-        co_await fstream.close();
-
-        sst_log.info("Histogram written to {}", filename);
-
-        co_return;
-    }
-};
-
 stop_iteration consume_reader(mutation_reader rd, sstable_consumer& consumer, sstables::sstable* sst, const partition_set& partitions, bool no_skips) {
     auto close_rd = deferred_close(rd);
     if (consumer.consume_sstable_start(sst).get() == stop_iteration::yes) {
@@ -897,10 +750,10 @@ void consume_sstables(schema_ptr schema, reader_permit permit, std::vector<sstab
     }
 }
 
-class scylla_sstable_table_state : public compaction::table_state {
-    struct dummy_compaction_backlog_tracker : public compaction_backlog_tracker::impl {
+class scylla_sstable_compaction_group_view : public compaction::compaction_group_view {
+    struct dummy_compaction_backlog_tracker : public compaction::compaction_backlog_tracker::impl {
         virtual void replace_sstables(const std::vector<sstables::shared_sstable>& old_ssts, const std::vector<sstables::shared_sstable>& new_ssts) override { }
-        virtual double backlog(const compaction_backlog_tracker::ongoing_writes& ow, const compaction_backlog_tracker::ongoing_compactions& oc) const override { return 0.0; }
+        virtual double backlog(const compaction::compaction_backlog_tracker::ongoing_writes& ow, const compaction::compaction_backlog_tracker::ongoing_compactions& oc) const override { return 0.0; }
     };
 
 private:
@@ -911,10 +764,10 @@ private:
     sstables::sstable_set _main_set;
     sstables::sstable_set _maintenance_set;
     std::vector<sstables::shared_sstable> _compacted_undeleted_sstables;
-    mutable sstables::compaction_strategy _compaction_strategy;
-    compaction_strategy_state _compaction_strategy_state;
+    mutable compaction::compaction_strategy _compaction_strategy;
+    compaction::compaction_strategy_state _compaction_strategy_state;
     tombstone_gc_state _tombstone_gc_state;
-    compaction_backlog_tracker _backlog_tracker;
+    compaction::compaction_backlog_tracker _backlog_tracker;
     std::string _group_id;
     condition_variable _staging_done_condition;
     mutable sstable_generation_generator _generation_generator;
@@ -922,7 +775,7 @@ private:
 private:
     sstables::shared_sstable do_make_sstable() const {
         const auto format = sstables::sstable_format_types::big;
-        const auto version = sstables::get_highest_sstable_version();
+        const auto version = _sst_man.get_preferred_sstable_version();
         auto generation = _generation_generator();
         auto sst_name = sstables::sstable::filename(_output_dir, _schema->ks_name(), _schema->cf_name(), version, generation, format, component_type::Data);
         if (file_exists(sst_name).get()) {
@@ -936,30 +789,31 @@ private:
     }
 
 public:
-    scylla_sstable_table_state(schema_ptr schema, reader_permit permit, sstables::sstables_manager& sst_man, std::string output_dir)
+    scylla_sstable_compaction_group_view(schema_ptr schema, reader_permit permit, sstables::sstables_manager& sst_man, std::string output_dir)
         : _schema(std::move(schema))
         , _permit(std::move(permit))
         , _sst_man(sst_man)
         , _output_dir(std::move(output_dir))
-        , _main_set(sstables::make_partitioned_sstable_set(_schema, false))
-        , _maintenance_set(sstables::make_partitioned_sstable_set(_schema, false))
-        , _compaction_strategy(sstables::make_compaction_strategy(_schema->compaction_strategy(), _schema->compaction_strategy_options()))
+        , _main_set(sstables::make_partitioned_sstable_set(_schema, token_range()))
+        , _maintenance_set(sstables::make_partitioned_sstable_set(_schema, token_range()))
+        , _compaction_strategy(compaction::make_compaction_strategy(_schema->compaction_strategy(), _schema->compaction_strategy_options()))
         , _compaction_strategy_state(compaction::compaction_strategy_state::make(_compaction_strategy))
         , _tombstone_gc_state(nullptr)
         , _backlog_tracker(std::make_unique<dummy_compaction_backlog_tracker>())
         , _group_id("dummy-group")
-        , _generation_generator(0)
+        , _generation_generator()
     { }
+    virtual dht::token_range token_range() const noexcept override { return dht::token_range::make(dht::first_token(), dht::last_token()); }
     virtual const schema_ptr& schema() const noexcept override { return _schema; }
     virtual unsigned min_compaction_threshold() const noexcept override { return _schema->min_compaction_threshold(); }
     virtual bool compaction_enforce_min_threshold() const noexcept override { return false; }
-    virtual const sstables::sstable_set& main_sstable_set() const override { return _main_set; }
-    virtual const sstables::sstable_set& maintenance_sstable_set() const override { return _maintenance_set; }
-    lw_shared_ptr<const sstables::sstable_set> sstable_set_for_tombstone_gc() const override { return make_lw_shared<const sstables::sstable_set>(main_sstable_set()); }
+    virtual future<lw_shared_ptr<const sstables::sstable_set>> main_sstable_set() const override { co_return make_lw_shared<const sstables::sstable_set>(_main_set); }
+    virtual future<lw_shared_ptr<const sstables::sstable_set>> maintenance_sstable_set() const override { co_return make_lw_shared<const sstables::sstable_set>(_maintenance_set); }
+    lw_shared_ptr<const sstables::sstable_set> sstable_set_for_tombstone_gc() const override { return make_lw_shared<const sstables::sstable_set>(_main_set); }
     virtual std::unordered_set<sstables::shared_sstable> fully_expired_sstables(const std::vector<sstables::shared_sstable>& sstables, gc_clock::time_point compaction_time) const override { return {}; }
     virtual const std::vector<sstables::shared_sstable>& compacted_undeleted_sstables() const noexcept override { return _compacted_undeleted_sstables; }
-    virtual sstables::compaction_strategy& get_compaction_strategy() const noexcept override { return _compaction_strategy; }
-    virtual compaction_strategy_state& get_compaction_strategy_state() noexcept override { return _compaction_strategy_state; }
+    virtual compaction::compaction_strategy& get_compaction_strategy() const noexcept override { return _compaction_strategy; }
+    virtual compaction::compaction_strategy_state& get_compaction_strategy_state() noexcept override { return _compaction_strategy_state; }
     virtual reader_permit make_compaction_reader_permit() const override { return _permit; }
     virtual sstables::sstables_manager& get_sstables_manager() noexcept override { return _sst_man; }
     virtual sstables::shared_sstable make_sstable() const override { return do_make_sstable(); }
@@ -968,14 +822,15 @@ public:
     virtual api::timestamp_type min_memtable_live_timestamp() const override { return api::min_timestamp; }
     virtual api::timestamp_type min_memtable_live_row_marker_timestamp() const override { return api::min_timestamp; }
     virtual bool memtable_has_key(const dht::decorated_key& key) const override { return false; }
-    virtual future<> on_compaction_completion(sstables::compaction_completion_desc desc, sstables::offstrategy offstrategy) override { return make_ready_future<>(); }
+    virtual future<> on_compaction_completion(compaction::compaction_completion_desc desc, sstables::offstrategy offstrategy) override { return make_ready_future<>(); }
     virtual bool is_auto_compaction_disabled_by_user() const noexcept override { return false; }
     virtual bool tombstone_gc_enabled() const noexcept override { return false; }
     virtual const tombstone_gc_state& get_tombstone_gc_state() const noexcept override { return _tombstone_gc_state; }
-    virtual compaction_backlog_tracker& get_backlog_tracker() override { return _backlog_tracker; }
+    virtual compaction::compaction_backlog_tracker& get_backlog_tracker() override { return _backlog_tracker; }
     virtual const std::string get_group_id() const noexcept override { return _group_id; }
     virtual seastar::condition_variable& get_staging_done_condition() noexcept override { return _staging_done_condition; }
     dht::token_range get_token_range_after_split(const dht::token& t) const noexcept override { return dht::token_range(); }
+    int64_t get_sstables_repaired_at() const noexcept override { return 0; }
 };
 
 void validate_output_dir(std::filesystem::path output_dir, bool accept_nonempty_output_dir) {
@@ -1018,23 +873,23 @@ void validate_operation(schema_ptr schema, reader_permit permit, const std::vect
 
 void scrub_operation(schema_ptr schema, reader_permit permit, const std::vector<sstables::shared_sstable>& sstables,
         sstables::sstables_manager& sst_man, const bpo::variables_map& vm) {
-    static const std::vector<std::pair<std::string, compaction_type_options::scrub::mode>> scrub_modes{
-        {"abort", compaction_type_options::scrub::mode::abort},
-        {"skip", compaction_type_options::scrub::mode::skip},
-        {"segregate", compaction_type_options::scrub::mode::segregate},
-        {"validate", compaction_type_options::scrub::mode::validate},
+    static const std::vector<std::pair<std::string, compaction::compaction_type_options::scrub::mode>> scrub_modes{
+        {"abort", compaction::compaction_type_options::scrub::mode::abort},
+        {"skip", compaction::compaction_type_options::scrub::mode::skip},
+        {"segregate", compaction::compaction_type_options::scrub::mode::segregate},
+        {"validate", compaction::compaction_type_options::scrub::mode::validate},
     };
 
     if (sstables.empty()) {
         throw std::invalid_argument("no sstables specified on the command line");
     }
-    compaction_type_options::scrub::mode scrub_mode;
+    compaction::compaction_type_options::scrub::mode scrub_mode;
     {
         if (!vm.count("scrub-mode")) {
             throw std::invalid_argument("missing mandatory command-line argument --scrub-mode");
         }
         const auto mode_name = vm["scrub-mode"].as<std::string>();
-        auto mode_it = std::ranges::find_if(scrub_modes, [&mode_name] (const std::pair<std::string, compaction_type_options::scrub::mode>& v) {
+        auto mode_it = std::ranges::find_if(scrub_modes, [&mode_name] (const std::pair<std::string, compaction::compaction_type_options::scrub::mode>& v) {
             return v.first == mode_name;
         });
         if (mode_it == scrub_modes.end()) {
@@ -1043,21 +898,21 @@ void scrub_operation(schema_ptr schema, reader_permit permit, const std::vector<
         scrub_mode = mode_it->second;
     }
     auto output_dir = vm["output-dir"].as<std::string>();
-    if (scrub_mode != compaction_type_options::scrub::mode::validate) {
+    if (scrub_mode != compaction::compaction_type_options::scrub::mode::validate) {
         validate_output_dir(output_dir, vm.count("unsafe-accept-nonempty-output-dir"));
     }
 
-    scylla_sstable_table_state table_state(schema, permit, sst_man, output_dir);
+    scylla_sstable_compaction_group_view compaction_group_view(schema, permit, sst_man, output_dir);
 
-    auto compaction_descriptor = sstables::compaction_descriptor(std::move(sstables));
-    compaction_descriptor.options = sstables::compaction_type_options::make_scrub(scrub_mode, sstables::compaction_type_options::scrub::quarantine_invalid_sstables::no);
-    compaction_descriptor.creator = [&table_state] (shard_id) { return table_state.make_sstable(); };
-    compaction_descriptor.replacer = [] (sstables::compaction_completion_desc) { };
+    auto compaction_descriptor = compaction::compaction_descriptor(std::move(sstables));
+    compaction_descriptor.options = compaction::compaction_type_options::make_scrub(scrub_mode, compaction::compaction_type_options::scrub::quarantine_invalid_sstables::no);
+    compaction_descriptor.creator = [&compaction_group_view] (shard_id) { return compaction_group_view.make_sstable(); };
+    compaction_descriptor.replacer = [] (compaction::compaction_completion_desc) { };
 
-    auto compaction_data = sstables::compaction_data{};
+    auto compaction_data = compaction::compaction_data{};
 
-    compaction_progress_monitor progress_monitor;
-    sstables::compact_sstables(std::move(compaction_descriptor), compaction_data, table_state, progress_monitor).get();
+    compaction::compaction_progress_monitor progress_monitor;
+    compaction::compact_sstables(std::move(compaction_descriptor), compaction_data, compaction_group_view, progress_monitor).get();
 }
 
 void dump_index_operation(schema_ptr schema, reader_permit permit, const std::vector<sstables::shared_sstable>& sstables,
@@ -1069,25 +924,27 @@ void dump_index_operation(schema_ptr schema, reader_permit permit, const std::ve
     json_writer writer;
     writer.StartStream();
     for (auto& sst : sstables) {
-        sstables::index_reader idx_reader(sst, permit);
-        auto close_idx_reader = deferred_close(idx_reader);
+        auto idx_reader = sst->make_index_reader(permit);
+        auto close_idx_reader = deferred_close(*idx_reader);
 
         writer.Key(fmt::to_string(sst->get_filename()));
         writer.StartArray();
 
-        while (!idx_reader.eof()) {
-            idx_reader.read_partition_data().get();
-            auto pos = idx_reader.get_data_file_position();
-            auto pkey = idx_reader.get_partition_key();
+        while (!idx_reader->eof()) {
+            idx_reader->read_partition_data().get();
+            auto pos = idx_reader->data_file_positions().start;
+            auto pkey = idx_reader->get_partition_key();
 
             writer.StartObject();
-            writer.Key("key");
-            writer.DataKey(*schema, pkey);
+            if (pkey) {
+                writer.Key("key");
+                writer.DataKey(*schema, *pkey);
+            }
             writer.Key("pos");
             writer.Uint64(pos);
             writer.EndObject();
 
-            idx_reader.advance_to_next_partition().get();
+            idx_reader->advance_to_next_partition().get();
         }
         writer.EndArray();
     }
@@ -1495,6 +1352,7 @@ const char* to_string(sstables::scylla_metadata_type t) {
         case sstables::scylla_metadata_type::ScyllaBuildId: return "scylla_build_id";
         case sstables::scylla_metadata_type::ExtTimestampStats: return "ext_timestamp_stats";
         case sstables::scylla_metadata_type::SSTableIdentifier: return "sstable_identifier";
+        case sstables::scylla_metadata_type::Schema: return "schema";
     }
     std::abort();
 }
@@ -1617,8 +1475,53 @@ public:
         (*this)(m.value);
     }
 
+    template <typename Size, typename Members>
+    void operator()(const sstables::disk_array<Size, Members>& a) const {
+        _writer.StartArray();
+        for (const auto& element : a.elements) {
+            (*this)(element);
+        }
+        _writer.EndArray();
+    }
+
     void operator()(const sstables::scylla_metadata::sstable_identifier& sid) const {
         _writer.AsString(sid.value);
+    }
+
+    void operator()(const sstables::sstable_column_description& cd) const {
+        _writer.StartObject();
+
+        _writer.Key("kind");
+        _writer.Int64(static_cast<uint32_t>(cd.kind));
+
+        _writer.Key("name");
+        _writer.String(disk_string_to_string(cd.name));
+
+        _writer.Key("type");
+        _writer.String(disk_string_to_string(cd.type));
+
+        _writer.EndObject();
+    }
+
+    void operator()(const sstables::scylla_metadata::sstable_schema& s) const {
+        _writer.StartObject();
+
+        _writer.Key("id");
+        _writer.String(fmt::to_string(s.id));
+
+        _writer.Key("version");
+        _writer.String(fmt::to_string(s.version));
+
+        _writer.Key("keyspace_name");
+        _writer.String(disk_string_to_string(s.keyspace_name));
+
+        _writer.Key("table_name");
+        _writer.String(disk_string_to_string(s.table_name));
+
+        _writer.Key("columns");
+        (*this)(s.columns);
+
+        _writer.EndObject();
     }
 };
 
@@ -1709,7 +1612,7 @@ void decompress_operation(schema_ptr schema, reader_permit permit, const std::ve
         auto ostream = make_file_output_stream(std::move(ofile), options).get();
         auto close_ostream = defer([&ostream] { ostream.close().get(); });
 
-        auto istream = sst->data_stream(0, sst->data_size(), permit, nullptr, nullptr);
+        auto istream = sst->data_stream(0, sst->data_size(), permit, nullptr, nullptr).get();
         auto close_istream = defer([&istream] { istream.close().get(); });
 
         istream.consume([&] (temporary_buffer<char> buf) {
@@ -1723,874 +1626,142 @@ void decompress_operation(schema_ptr schema, reader_permit permit, const std::ve
     }
 }
 
-class json_mutation_stream_parser {
-    using reader = rapidjson::GenericReader<rjson::encoding, rjson::encoding, rjson::allocator>;
-    class stream {
-    public:
-        using Ch = char;
-    private:
-        input_stream<Ch> _is;
-        temporary_buffer<Ch> _current;
-        size_t _pos = 0;
-        size_t _line = 1;
-        size_t _last_lf_pos = 0;
-    private:
-        void maybe_read_some() {
-            if (!_current.empty()) {
-                return;
-            }
-            _current = _is.read().get();
-            // EOS is encoded as null char
-            if (_current.empty()) {
-                _current = temporary_buffer<Ch>("\0", 1);
-            }
-        }
-    public:
-        stream(input_stream<Ch> is) : _is(std::move(is)) {
-            maybe_read_some();
-        }
-        stream(stream&&) = default;
-        ~stream() {
-            _is.close().get();
-        }
-        Ch Peek() const {
-            return *_current.get();
-        }
-        Ch Take() {
-            auto c = Peek();
-            if (c == '\n') {
-                ++_line;
-                ++_last_lf_pos = _pos;
-            }
-            ++_pos;
-            _current.trim_front(1);
-            maybe_read_some();
-            return c;
-        }
-        size_t Tell() {
-            return _pos;
-        }
-        // ostream methods, unused but need a definition
-        Ch* PutBegin() { return nullptr; }
-        void Put(Ch c) { }
-        void Flush() { }
-        size_t PutEnd(Ch* begin) { return 0; }
-        // own methods
-        size_t line() const {
-            return _line;
-        }
-        size_t last_line_feed_pos() const {
-            return _last_lf_pos;
-        }
-    };
-    class handler {
-    public:
-        using Ch = char;
-    private:
-        enum class state {
-            start,
-            before_partition,
-            in_partition,
-            before_key,
-            in_key,
-            before_tombstone,
-            in_tombstone,
-            before_static_columns,
-            before_clustering_elements,
-            before_clustering_element,
-            in_clustering_element,
-            in_range_tombstone_change,
-            in_clustering_row,
-            before_marker,
-            in_marker,
-            before_clustering_columns,
-            before_column_key,
-            before_column,
-            in_column,
-            before_ignored_value,
-            before_integer,
-            before_string,
-            before_bool,
-        };
-        struct column {
-            const column_definition* def = nullptr;
-            std::optional<bool> is_live;
-            std::optional<api::timestamp_type> timestamp;
-            std::optional<bytes> value;
-            std::optional<gc_clock::time_point> deletion_time;
+future<replica::table&> create_table_in_cql_env(cql_test_env& env, schema_ptr sstable_schema) {
+    auto& db = env.local_db();
 
-            explicit column(const column_definition* def) : def(def) { }
-        };
-        struct tombstone {
-            std::optional<api::timestamp_type> timestamp;
-            std::optional<gc_clock::time_point> deletion_time;
-        };
-    private:
-        schema_ptr _schema;
-        reader_permit _permit;
-        queue<mutation_fragment_v2_opt>& _queue;
-        circular_buffer<state> _state_stack;
-        std::string _key; // last seen key
-        bool _partition_start_emited = false;
-        bool _is_shadowable = false; // currently processed tombstone is a shadowable one
-        std::optional<bool> _bool;
-        std::optional<int64_t> _integer;
-        std::optional<std::string_view> _string;
-        std::optional<partition_key> _pkey;
-        std::optional<tombstone> _tombstone;
-        std::optional<clustering_key> _ckey;
-        std::optional<bound_weight> _bound_weight;
-        std::optional<row_marker> _row_marker;
-        std::optional<row_tombstone> _row_tombstone;
-        std::optional<row> _row;
-        std::optional<column> _column;
-        std::optional<gc_clock::duration> _ttl;
-        std::optional<gc_clock::time_point> _expiry;
-    private:
-        static std::string_view to_string(state s) {
-            switch (s) {
-                case state::start: return "start";
-                case state::before_partition: return "before_partition";
-                case state::in_partition: return "in_partition";
-                case state::before_key: return "before_key";
-                case state::in_key: return "in_key";
-                case state::before_tombstone: return "before_tombstone";
-                case state::in_tombstone: return "in_tombstone";
-                case state::before_static_columns: return "before_static_columns";
-                case state::before_clustering_elements: return "before_clustering_elements";
-                case state::before_clustering_element: return "before_clustering_element";
-                case state::in_clustering_element: return "in_clustering_element";
-                case state::in_range_tombstone_change: return "in_range_tombstone_change";
-                case state::in_clustering_row: return "in_clustering_row";
-                case state::before_marker: return "before_marker";
-                case state::in_marker: return "in_marker";
-                case state::before_clustering_columns: return "before_clustering_columns";
-                case state::before_column_key: return "before_column_key";
-                case state::before_column: return "before_column";
-                case state::in_column: return "in_column";
-                case state::before_ignored_value: return "before_ignored_value";
-                case state::before_integer: return "before_integer";
-                case state::before_string: return "before_string";
-                case state::before_bool: return "before_bool";
-            }
-            std::abort();
-        }
+    const auto keyspace_name = "scylla_sstable";
+    co_await env.execute_cql(seastar::format("CREATE KEYSPACE {} WITH replication = {{'class': 'LocalStrategy'}}", keyspace_name));
+    auto& keyspace = db.find_keyspace(keyspace_name);
 
-        std::string stack_to_string() const {
-            return fmt::to_string(fmt::join(_state_stack | std::views::transform([] (state s) { return to_string(s); }), "|"));
-        }
+    // Clone and modify the schema:
+    // * Change keyspace name to scylla_sstable
+    // * Generate a new ID
+    // * Drop all properties
+    //
+    // This will help avoid conflicts when querying sstables of system-tables
+    // and allows cql_test_env to work with a simple config (no EAR setup).
+    auto builder = schema_builder(keyspace_name, sstable_schema->cf_name());
+    for (const auto& col_kind : {column_kind::partition_key, column_kind::clustering_key, column_kind::static_column, column_kind::regular_column}) {
+        for (const auto& col : sstable_schema->columns(col_kind)) {
+            builder.with_column(col.name(), col.type, col_kind, col.view_virtual());
 
-        template<typename... Args>
-        bool error(fmt::format_string<Args...> fmt, Args&&... args) {
-            auto parse_error = fmt::format(fmt, std::forward<Args>(args)...);
-            sst_log.trace("{}", parse_error);
-            _queue.abort(std::make_exception_ptr(std::runtime_error(parse_error)));
-            return false;
+            // Register any user types, so they are known by the time we create the table.
+            if (col.type->is_user_type()) {
+                keyspace.add_user_type(dynamic_pointer_cast<const user_type_impl>(col.type));
+            }
         }
+    }
+    auto schema = builder.build();
 
-        bool emit(mutation_fragment_v2 mf) {
-            sst_log.trace("emit({})", mf.mutation_fragment_kind());
-            _queue.push_eventually(std::move(mf)).get();
-            return true;
-        }
+    const auto table_name = schema->cf_name();
 
-        bool parse_partition_key() {
-            try {
-                auto raw = from_hex(*_string);
-                _pkey.emplace(partition_key::from_bytes(raw));
-            } catch (...) {
-                return error("failed to parse partition key from raw string: {}", fmt::streamed(std::current_exception()));
-            }
-            return true;
-        }
+    schema_describe_helper describe_helper = replica::make_schema_describe_helper(schema, db.as_data_dictionary());
 
-        bool parse_clustering_key() {
-            try {
-                auto raw = from_hex(*_string);
-                _ckey.emplace(clustering_key::from_bytes(raw));
-            } catch (...) {
-                return error("failed to parse clustering key from raw string: {}", fmt::streamed(std::current_exception()));
-            }
-            return true;
-        }
+    const auto original_schema_description = sstable_schema->describe(describe_helper, cql3::describe_option::STMTS_AND_INTERNALS);
+    const auto schema_description = schema->describe(describe_helper, cql3::describe_option::STMTS_AND_INTERNALS);
 
-        bool parse_bound_weight() {
-            switch (*_integer) {
-                case -1:
-                    _bound_weight.emplace(bound_weight::before_all_prefixed);
-                    return true;
-                case 0:
-                    _bound_weight.emplace(bound_weight::equal);
-                    return true;
-                case 1:
-                    _bound_weight.emplace(bound_weight::after_all_prefixed);
-                    return true;
-                default:
-                    return error("failed to parse bound weight: {} is not a valid bound weight value", *_integer);
-            }
-        }
+    const sstring original_create_statement = original_schema_description.create_statement.value().linearize();
+    const sstring schema_create_statement = schema_description.create_statement.value().linearize();
 
-        bool parse_deletion_time() {
-            try {
-                auto dt = gc_clock::time_point(gc_clock::duration(timestamp_from_string(*_string) / 1000));
-                if (top(1) == state::in_column) {
-                    _column->deletion_time = dt;
-                } else {
-                    _tombstone->deletion_time = dt;
-                }
-                return true;
-            } catch (...) {
-                return error("failed to parse deletion_time: {}", std::current_exception());
-            }
-        }
+    sst_log.debug("\noriginal schema:\n{}\nreplacement schema:\n{}\n\nNote: original keyspace name of {} was replaced with {}, original id of {} was replaced with {} and all properties were dropped!\n",
+            original_create_statement,
+            schema_create_statement,
+            sstable_schema->ks_name(),
+            keyspace_name,
+            sstable_schema->id(),
+            schema->id());
 
-        bool parse_ttl() {
-            auto e = _string->end();
-            if (*std::prev(e) == 's') {
-                --e;
-            }
-            uint64_t ttl;
-            std::stringstream ss(std::string(_string->begin(), e));
-            ss >> ttl;
-            if (ss.fail()) {
-                return error("failed to parse ttl value of {}", _string);
-            }
-            _ttl = gc_clock::duration(ttl);
-            return true;
-        }
+    co_await env.execute_cql(schema_create_statement);
 
-        bool parse_expiry() {
-            try {
-                _expiry = gc_clock::time_point(gc_clock::duration(timestamp_from_string(*_string) / 1000));
-            } catch (...) {
-                return error("failed to parse expiry: {}", std::current_exception());
-            }
-            return true;
-        }
+    co_return std::ref(db.find_column_family(keyspace_name, table_name));
+}
 
-        std::optional<::tombstone> get_tombstone() {
-            if (bool(_tombstone->timestamp) != bool(_tombstone->deletion_time)) {
-                error("incomplete tombstone: timestamp or deletion-time have to be either both present or missing");
-                return {};
-            }
-            if (!_tombstone->timestamp) {
-                _tombstone.reset();
-                return ::tombstone{};
-            }
-            auto tomb = ::tombstone(*_tombstone->timestamp, *_tombstone->deletion_time);
-            _tombstone.reset();
-            return tomb;
-        }
+shared_ptr<cql3::cql_statement>
+validate_and_prepare_query(std::string_view query, std::string_view table_name, data_dictionary::database db, std::string_view query_type) {
+    std::vector<std::unique_ptr<cql3::statements::raw::parsed_statement>> raw_statements;
+    try {
+        raw_statements = cql3::query_processor::parse_statements(query, cql3::dialect{});
+    } catch (...) {
+        throw std::invalid_argument(seastar::format("failed to parse query: {}", std::current_exception()));
+    }
+    if (raw_statements.size() != 1) {
+        throw std::invalid_argument(seastar::format("expected exactly 1 query, got {}", raw_statements.size()));
+    }
 
-        bool finalize_partition_start(::tombstone tomb = {}) {
-            auto pkey = std::exchange(_pkey, {});
-            if (!pkey) {
-                return error("failed to finalize partition start: no partition key");
-            }
-            partition_start ps(dht::decorate_key(*_schema, *pkey), tomb);
-            _partition_start_emited = true;
-            return emit(mutation_fragment_v2(*_schema, _permit, std::move(ps)));
-        }
+    const auto raw_statement = raw_statements.front().get();
 
-        bool finalize_static_row() {
-            if (!_row) {
-                return error("failed to finalize clustering row: row is not initialized yet");
-            }
-            auto row = std::exchange(_row, {});
-            auto sr = static_row(std::move(*row));
-            return emit(mutation_fragment_v2(*_schema, _permit, std::move(sr)));
+    if (auto cf_statement = dynamic_cast<cql3::statements::raw::cf_statement*>(raw_statement)) {
+        if (!cf_statement->has_keyspace()) {
+            throw std::invalid_argument("query must have keyspace and the keyspace has to be scylla_sstable");
         }
+        if (cf_statement->keyspace() != "scylla_sstable") {
+            throw std::invalid_argument(seastar::format("query must be against scylla_sstable keyspace, got {} instead", std::string_view(cf_statement->keyspace())));
+        }
+        if (cf_statement->column_family() != table_name) {
+            throw std::invalid_argument(seastar::format("query must be against {} table, got {} instead", table_name, std::string_view(cf_statement->column_family())));
+        }
+    } else {
+        throw std::invalid_argument(fmt::format("query must be a {} query", query_type));
+    }
 
-        bool finalize_range_tombstone_change() {
-            if (!_bound_weight) {
-                return error("failed to finalize range tombstone change: missing bound weight");
-            }
-            if (*_bound_weight == bound_weight::equal) {
-                return error("failed to finalize range tombstone change: bound_weight::equal is not valid for range tombstones changes");
-            }
-            if (!_row_tombstone) {
-                return error("failed to finalize range tombstone change: missing tombstone");
-            }
-            clustering_key ckey = clustering_key::make_empty();
-            if (_ckey) {
-                ckey = std::move(*std::exchange(_ckey, {}));
-            }
-            auto pos = position_in_partition(partition_region::clustered, *std::exchange(_bound_weight, {}), std::move(ckey));
-            auto tomb = std::exchange(_row_tombstone, {})->tomb();
-            auto rtc = range_tombstone_change(std::move(pos), std::move(tomb));
-            return emit(mutation_fragment_v2(*_schema, _permit, std::move(rtc)));
-        }
+    cql3::cql_stats cql_stats;
 
-        bool finalize_row_marker() {
-            if (!_row_marker) {
-                return error("failed to finalize row marker: it has no timestamp");
-            }
-            if (bool(_expiry) != bool(_ttl)) {
-                return error("failed to finalize row marker: ttl and expiry must either be both present or both missing");
-            }
-            if (!_expiry && !_ttl) {
-                return true;
-            }
-            _row_marker->apply(row_marker(_row_marker->timestamp(), *std::exchange(_ttl, {}), *std::exchange(_expiry, {})));
-            return true;
-        }
+    try {
+        auto prepared_statement = raw_statement->prepare(db, cql_stats);
+        return std::move(prepared_statement->statement);
+    } catch (...) {
+        throw std::invalid_argument(seastar::format("failed to prepare query: {}", std::current_exception()));
+    }
+}
 
-        bool parse_column_value() {
-            try {
-                _column->value.emplace(_column->def->type->from_string(*_string));
-            } catch (...) {
-                return error("failed to parse cell value: {}", std::current_exception());
-            }
-            return true;
-        }
+template <typename statement_type>
+void validate_query(std::string_view query, std::string_view table_name, data_dictionary::database db, std::string_view query_type) {
+    auto statement = validate_and_prepare_query(query, table_name, db, query_type);
 
-        bool finalize_column() {
-            if (!_row) {
-                return error("failed to finalize cell: row not initialized yet");
-            }
-            if (!_column->is_live || !_column->timestamp) {
-                return error("failed to finalize cell: required fields is_live and/or timestamp missing");
-            }
-            if (*_column->is_live && !_column->value) {
-                return error("failed to finalize cell: live cell doesn't have data");
-            }
-            if (!*_column->is_live && !_column->deletion_time) {
-                return error("failed to finalize cell: dead cell doesn't have deletion time");
-            }
-            if (bool(_expiry) != bool(_ttl)) {
-                return error("failed to finalize cell: ttl and expiry must either be both present or both missing");
-            }
-            if (*_column->is_live) {
-                if (_ttl) {
-                    _row->apply(*_column->def, ::atomic_cell::make_live(*_column->def->type, *_column->timestamp, *_column->value,
-                            *std::exchange(_expiry, {}), *std::exchange(_ttl, {})));
-                } else {
-                    _row->apply(*_column->def, ::atomic_cell::make_live(*_column->def->type, *_column->timestamp, *_column->value));
-                }
-            } else {
-                _row->apply(*_column->def, ::atomic_cell::make_dead(*_column->timestamp, *_column->deletion_time));
-            }
-            _column.reset();
-            return true;
-        }
+    if (dynamic_cast<statement_type*>(statement.get()) == nullptr) {
+        throw std::invalid_argument(fmt::format("query must be {} query", query_type));
+    }
+}
 
-        bool finalize_clustering_row() {
-            if (!_ckey) {
-                return error("failed to finalize clustering row: missing clustering key");
-            }
-            if (!_row) {
-                return error("failed to finalize clustering row: row is not initialized yet");
-            }
-            auto row = std::exchange(_row, {});
-            auto tomb = std::exchange(_row_tombstone, {});
-            auto marker = std::exchange(_row_marker, {});
-            auto cr = clustering_row(
-                    std::move(*_ckey),
-                    tomb.value_or(row_tombstone{}),
-                    marker.value_or(row_marker{}),
-                    std::move(*row));
-            return emit(mutation_fragment_v2(*_schema, _permit, std::move(cr)));
-        }
+future<> consume_queries(input_stream<char>&& is, std::function<future<>(std::string_view)> consumer) {
+    temporary_buffer<char> buf;
 
-        bool finalize_partition() {
-            _partition_start_emited = false;
-            return emit(mutation_fragment_v2(*_schema, _permit, partition_end{}));
+    auto trimmed = [&buf] (size_t query_size) {
+        if (query_size == 0) {
+            return std::string_view{};
         }
-
-        struct retire_state_result {
-            bool ok = true;
-            unsigned pop_states = 1;
-            std::optional<state> next_state;
-        };
-        retire_state_result handle_retire_state() {
-            sst_log.trace("handle_retire_state(): stack={}", stack_to_string());
-            retire_state_result ret;
-            switch (top()) {
-                case state::before_partition:
-                    // EOS
-                    _queue.push_eventually({}).get();
-                    break;
-                case state::in_partition:
-                    ret.ok = finalize_partition();
-                    break;
-                case state::in_key:
-                    ret.pop_states = 2;
-                    break;
-                case state::in_tombstone:
-                    ret.pop_states = 2;
-                    {
-                        auto is_shadowable = std::exchange(_is_shadowable, false);
-                        auto tomb = get_tombstone();
-                        if (!tomb) {
-                            ret.ok = false;
-                            break;
-                        }
-                        if (top(2) == state::in_partition) {
-                            ret.ok = finalize_partition_start(*tomb);
-                        } else if (top(2) == state::in_range_tombstone_change) {
-                            _row_tombstone.emplace(*tomb);
-                        } else if (top(2) == state::in_clustering_row) {
-                            if (is_shadowable) {
-                                if (!_row_tombstone) {
-                                    ret.ok = error("cannot apply shadowable tombstone, row tombstone not initialized yet");
-                                    break;
-                                }
-                                _row_tombstone->apply(shadowable_tombstone(*tomb), {});
-                            } else {
-                                _row_tombstone.emplace(*tomb);
-                            }
-                        } else {
-                            ret.ok = error("retiring in_tombstone state in invalid context: {}", stack_to_string());
-                        }
-                    }
-                    break;
-                case state::in_marker:
-                    ret.pop_states = 2;
-                    ret.ok = finalize_row_marker();
-                    break;
-                case state::in_column:
-                    ret.pop_states = 2;
-                    ret.ok = finalize_column();
-                    break;
-                case state::before_column_key:
-                    if (top(1) == state::before_static_columns) {
-                        ret.ok = finalize_static_row();
-                    }
-                    ret.pop_states = 2;
-                    break;
-                case state::before_clustering_element:
-                    ret.pop_states = 2;
-                    break;
-                case state::in_range_tombstone_change:
-                    ret.pop_states = 2;
-                    ret.ok = finalize_range_tombstone_change();
-                    break;
-                case state::in_clustering_row:
-                    ret.pop_states = 2;
-                    ret.ok = finalize_clustering_row();
-                    break;
-                case state::before_ignored_value:
-                    break;
-                case state::before_bool:
-                    if (top(1) == state::in_column) {
-                        _column->is_live = _bool;
-                    }
-                    _bool.reset();
-                    break;
-                case state::before_integer:
-                    if (top(1) == state::in_tombstone) {
-                        _tombstone->timestamp = _integer.value();
-                    }
-                    if (top(1) == state::in_range_tombstone_change) {
-                        ret.ok = parse_bound_weight();
-                    }
-                    if (top(1) == state::in_column) {
-                        _column->timestamp = _integer;
-                    }
-                    if (top(1) == state::in_marker) {
-                        _row_marker.emplace(_integer.value());
-                    }
-                    _integer.reset();
-                    break;
-                case state::before_string:
-                    if (top(1) == state::in_key) {
-                        if (top(3) == state::in_partition) {
-                            ret.ok = parse_partition_key();
-                        } else if (top(3) == state::in_clustering_row || top(3) == state::in_range_tombstone_change) {
-                            ret.ok = parse_clustering_key();
-                        }
-                    } else if (top(1) == state::in_tombstone) {
-                        ret.ok = parse_deletion_time();
-                    } else if (top(1) == state::in_marker) {
-                        if (_key == "ttl") {
-                            ret.ok = parse_ttl();
-                        } else {
-                            ret.ok = parse_expiry();
-                        }
-                    } else if (top(1) == state::in_clustering_element) {
-                        if (*_string == "clustering-row") {
-                            ret.next_state = state::in_clustering_row;
-                        } else if (*_string == "range-tombstone-change") {
-                            ret.next_state = state::in_range_tombstone_change;
-                        } else {
-                            ret.ok = error("invalid clustering element type: {}, expected clustering-row or range-tombstone-change", *_string);
-                        }
-                    } else if (top(1) == state::in_column) {
-                        if (_key == "type") {
-                            if (*_string != "regular") {
-                                ret.ok = error("unsupported cell type {}, currently only regular cells are supported", *_string);
-                            } else {
-                                ret.ok = true;
-                            }
-                        } else if (_key == "ttl") {
-                            ret.ok = parse_ttl();
-                        } else if (_key == "expiry") {
-                            ret.ok = parse_expiry();
-                        } else if (_key == "deletion_time") {
-                            ret.ok = parse_deletion_time();
-                        } else {
-                            ret.ok = parse_column_value();
-                        }
-                    }
-                    _string.reset();
-                    break;
-                default:
-                    ret.ok =  error("attempted to retire unexpected state {} ({})", to_string(top()), stack_to_string());
-                    break;
-            }
-            return ret;
+        auto query = std::string_view(buf.begin(), query_size);
+        while (!query.empty() && std::isspace(query.front())) {
+            query.remove_prefix(1);
         }
-        state top(size_t i = 0) const {
-            return _state_stack[i];
-        }
-        bool push(state s) {
-            sst_log.trace("push({})", to_string(s));
-            _state_stack.push_front(s);
-            return true;
-        }
-        bool pop() {
-            auto res = handle_retire_state();
-            sst_log.trace("pop({})", res.ok ? res.pop_states : 0);
-            if (!res.ok) {
-                return false;
-            }
-            while (res.pop_states--) {
-                _state_stack.pop_front();
-            }
-            if (res.next_state) {
-                push(*res.next_state);
-            }
-            return true;
-        }
-        bool unexpected(seastar::compat::source_location sl = seastar::compat::source_location::current()) {
-            return error("unexpected json event {} in state {}", sl.function_name(), stack_to_string());
-        }
-        bool unexpected(std::string_view key, seastar::compat::source_location sl = seastar::compat::source_location::current()) {
-            return error("unexpected json event {}({}) in state {}", sl.function_name(), key, stack_to_string());
-        }
-    public:
-        explicit handler(schema_ptr schema, reader_permit permit, queue<mutation_fragment_v2_opt>& queue)
-            : _schema(std::move(schema))
-            , _permit(std::move(permit))
-            , _queue(queue)
-        {
-            push(state::start);
-        }
-        handler(handler&&) = default;
-        bool Null() {
-            sst_log.trace("Null()");
-            switch (top()) {
-                case state::before_ignored_value:
-                    return pop();
-                default:
-                    return unexpected();
-            }
-            return true;
-        }
-        bool Bool(bool b) {
-            sst_log.trace("Bool({})", b);
-            switch (top()) {
-                case state::before_bool:
-                    _bool.emplace(b);
-                    return pop();
-                default:
-                    return unexpected();
-            }
-            return true;
-        }
-        bool Int(int i) {
-            sst_log.trace("Int({})", i);
-            switch (top()) {
-                case state::before_ignored_value:
-                    return pop();
-                case state::before_integer:
-                    _integer.emplace(i);
-                    return pop();
-                default:
-                    return unexpected();
-            }
-            return true;
-        }
-        bool Uint(unsigned i) {
-            sst_log.trace("Uint({})", i);
-            switch (top()) {
-                case state::before_ignored_value:
-                    return pop();
-                case state::before_integer:
-                    _integer.emplace(i);
-                    return pop();
-                default:
-                    return unexpected();
-            }
-            return true;
-        }
-        bool Int64(int64_t i) {
-            sst_log.trace("Int64({})", i);
-            switch (top()) {
-                case state::before_ignored_value:
-                    return pop();
-                case state::before_integer:
-                    _integer.emplace(i);
-                    return pop();
-                default:
-                    return unexpected();
-            }
-            return true;
-        }
-        bool Uint64(uint64_t i) {
-            sst_log.trace("Uint64({})", i);
-            switch (top()) {
-                case state::before_ignored_value:
-                    return pop();
-                case state::before_integer:
-                    _integer.emplace(i);
-                    return pop();
-                default:
-                    return unexpected();
-            }
-            return true;
-        }
-        bool Double(double d) {
-            sst_log.trace("Double({})", d);
-            switch (top()) {
-                case state::before_ignored_value:
-                    return pop();
-                default:
-                    return unexpected();
-            }
-            return true;
-        }
-        bool RawNumber(const Ch* str, rapidjson::SizeType length, bool copy) {
-            sst_log.trace("RawNumber({})", std::string_view(str, length));
-            return unexpected();
-        }
-        bool String(const Ch* str, rapidjson::SizeType length, bool copy) {
-            sst_log.trace("String({})", std::string_view(str, length));
-            switch (top()) {
-                case state::before_ignored_value:
-                    return pop();
-                case state::before_string:
-                    _string.emplace(str, length);
-                    return pop();
-                default:
-                    return unexpected();
-            }
-            return true;
-        }
-        bool StartObject() {
-            sst_log.trace("StartObject()");
-            switch (top()) {
-                case state::before_partition:
-                    return push(state::in_partition);
-                case state::before_key:
-                    return push(state::in_key);
-                case state::before_tombstone:
-                    _tombstone.emplace();
-                    return push(state::in_tombstone);
-                case state::before_static_columns:
-                    _row.emplace();
-                    return push(state::before_column_key);
-                case state::before_clustering_element:
-                    _row.emplace();
-                    return push(state::in_clustering_element);
-                case state::before_marker:
-                    return push(state::in_marker);
-                case state::before_clustering_columns:
-                    return push(state::before_column_key);
-                case state::before_column:
-                    return push(state::in_column);
-                default:
-                    return unexpected();
-            }
-        }
-        bool Key(const Ch* str, rapidjson::SizeType length, bool copy) {
-            _key = std::string(str, length);
-            sst_log.trace("Key({})", _key);
-            switch (top()) {
-                case state::in_partition:
-                    if (_key == "key") {
-                        return push(state::before_key);
-                    }
-                    if (_key == "tombstone") {
-                        return push(state::before_tombstone);
-                    }
-                    if (_key == "static_row" || _key == "clustering_elements") {
-                        if (!_partition_start_emited && !finalize_partition_start()) {
-                            return false;
-                        }
-                        if (_key == "static_row") {
-                            return push(state::before_static_columns);
-                        } else {
-                            return push(state::before_clustering_elements);
-                        }
-                    }
-                    return unexpected(_key);
-                case state::in_key:
-                    if (_key == "value" || (top(2) == state::in_partition && _key == "token")) {
-                        return push(state::before_ignored_value);
-                    }
-                    if (_key == "raw") {
-                        return push(state::before_string);
-                    }
-                    return unexpected(_key);
-                case state::in_tombstone:
-                    if (_key == "timestamp") {
-                        return push(state::before_integer);
-                    }
-                    if (_key == "deletion_time") {
-                        return push(state::before_string);
-                    }
-                    return unexpected(_key);
-                case state::in_marker:
-                    if (_key == "timestamp") {
-                        return push(state::before_integer);
-                    }
-                    if (_key == "ttl" || _key == "expiry") {
-                        return push(state::before_string);
-                    }
-                    return unexpected(_key);
-                case state::in_clustering_element:
-                    if (_key == "type") {
-                        return push(state::before_string);
-                    }
-                    return unexpected(_key);
-                case state::in_range_tombstone_change:
-                    if (_key == "key") {
-                        return push(state::before_key);
-                    }
-                    if (_key == "weight") {
-                        return push(state::before_integer);
-                    }
-                    if (_key == "tombstone") {
-                        return push(state::before_tombstone);
-                    }
-                    return unexpected(_key);
-                case state::in_clustering_row:
-                    if (_key == "key") {
-                        return push(state::before_key);
-                    }
-                    if (_key == "marker") {
-                        return push(state::before_marker);
-                    }
-                    if (_key == "tombstone") {
-                        return push(state::before_tombstone);
-                    }
-                    if (_key == "shadowable_tombstone") {
-                        _is_shadowable = true;
-                        return push(state::before_tombstone);
-                    }
-                    if (_key == "columns") {
-                        return push(state::before_clustering_columns);
-                    }
-                    return unexpected(_key);
-                case state::before_column_key:
-                    _column.emplace(_schema->get_column_definition(bytes(reinterpret_cast<bytes::const_pointer>(_key.data()), _key.size())));
-                    if (!_column->def) {
-                        return error("failed to look-up column name {}", _key);
-                    }
-                    if (top(1) == state::before_static_columns && _column->def->kind != column_kind::static_column) {
-                        return error("cannot add column {} of kind {} to static row", _key, to_sstring(_column->def->kind));
-                    }
-                    if (top(1) == state::before_clustering_columns && _column->def->kind != column_kind::regular_column) {
-                        return error("cannot add column {} of kind {} to regular row", _key, to_sstring(_column->def->kind));
-                    }
-                    if (!_column->def->is_atomic()) {
-                        return error("failed to initialize column {}: non-atomic columns are not supported yet", _key);
-                    }
-                    return push(state::before_column);
-                case state::in_column:
-                    if (_key == "is_live") {
-                        return push(state::before_bool);
-                    }
-                    if (_key == "timestamp") {
-                        return push(state::before_integer);
-                    }
-                    if (_key == "type" || _key == "ttl" || _key == "expiry" || _key == "value" || _key == "deletion_time") {
-                        return push(state::before_string);
-                    }
-                    return unexpected(_key);
-                default:
-                    return unexpected(_key);
-            }
-        }
-        bool EndObject(rapidjson::SizeType memberCount) {
-            sst_log.trace("EndObject()");
-            switch (top()) {
-                case state::in_partition:
-                case state::in_key:
-                case state::in_tombstone:
-                case state::in_range_tombstone_change:
-                case state::in_clustering_row:
-                case state::before_column_key:
-                case state::in_marker:
-                case state::in_column:
-                    return pop();
-                default:
-                    return unexpected();
-            }
-        }
-        bool StartArray() {
-            sst_log.trace("StartArray()");
-            switch (top()) {
-                case state::start:
-                    return push(state::before_partition);
-                case state::before_clustering_elements:
-                    return push(state::before_clustering_element);
-                default:
-                    return unexpected();
-            }
-        }
-        bool EndArray(rapidjson::SizeType elementCount) {
-            sst_log.trace("EndArray({})", elementCount);
-            switch (top()) {
-                case state::before_clustering_element:
-                case state::before_partition:
-                    return pop();
-                default:
-                    return unexpected();
-            }
-        }
+        return query;
     };
 
-private:
-    struct parsing_aborted : public std::exception { };
-    class impl {
-        queue<mutation_fragment_v2_opt> _queue;
-        stream _stream;
-        handler _handler;
-        reader _reader;
-        thread _thread;
-
-    public:
-        impl(schema_ptr schema, reader_permit permit, input_stream<char> istream)
-            : _queue(1)
-            , _stream(std::move(istream))
-            , _handler(std::move(schema), std::move(permit), _queue)
-            , _thread([this] { _reader.Parse(_stream, _handler); })
-        { }
-        ~impl() {
-            _queue.abort(std::make_exception_ptr(parsing_aborted{}));
-            try {
-                _thread.join().get();
-            } catch (...) {
-                sst_log.warn("json_mutation_stream_parser: parser thread exited with exception: {}", std::current_exception());
+    while (true) {
+        // Attemp to extract a query from existing data.
+        if (const auto separator_pos = std::ranges::find(buf, ';'); separator_pos != buf.end()) {
+            const auto query_size = separator_pos - buf.begin();
+            if (auto query = trimmed(query_size); !query.empty()) {
+                co_await consumer(query);
             }
+            buf.trim_front(query_size + 1); // include the separator too
+        // Attempt to read more data.
+        } else if (auto read_buf = co_await is.read(); read_buf) {
+            auto new_buf = temporary_buffer<char>(buf.size() + read_buf.size());
+            std::ranges::copy(buf, new_buf.get_write());
+            std::ranges::copy(read_buf, new_buf.get_write() + buf.size());
+            buf = std::move(new_buf);
+        // Reached EOF
+        } else {
+            if (auto query = trimmed(buf.size()); !query.empty()) {
+                co_await consumer(query);
+            }
+            break;
         }
-        future<mutation_fragment_v2_opt> operator()() {
-            return _queue.pop_eventually().handle_exception([this] (std::exception_ptr e) -> mutation_fragment_v2_opt {
-                auto err_off = _reader.GetErrorOffset();
-                throw std::runtime_error(fmt::format("parsing input failed at line {}, offset {}: {}", _stream.line(), err_off - _stream.last_line_feed_pos(), e));
-            });
-        }
-    };
-    std::unique_ptr<impl> _impl;
+    }
 
-public:
-    explicit json_mutation_stream_parser(schema_ptr schema, reader_permit permit, input_stream<char> istream)
-        : _impl(std::make_unique<impl>(std::move(schema), std::move(permit), std::move(istream)))
-    { }
-    future<mutation_fragment_v2_opt> operator()() { return (*_impl)(); }
-};
+    co_await is.close();
+}
 
 void write_operation(schema_ptr schema, reader_permit permit, const std::vector<sstables::shared_sstable>& sstables,
         sstables::sstables_manager& manager, const bpo::variables_map& vm) {
@@ -2619,31 +1790,84 @@ void write_operation(schema_ptr schema, reader_permit permit, const std::vector<
         validation_level = vl_it->second;
     }
     auto input_file = vm["input-file"].as<std::string>();
+    auto input_format = get_input_format_from_options(vm, input_format::cql);
+    auto memory_limit = vm["memory-limit"].as<size_t>();
     auto output_dir = vm["output-dir"].as<std::string>();
-    if (!vm.count("generation")) {
-        throw std::invalid_argument("missing required option '--generation'");
-    }
-    auto generation = sstables::generation_type(vm["generation"].as<int64_t>());
     auto format = sstables::sstable_format_types::big;
-    auto version = sstables::get_highest_sstable_version();
+    auto version = vm.contains("sstable-version")
+        ? version_from_string(vm["sstable-version"].as<std::string>())
+        : manager.get_preferred_sstable_version();
 
-    {
-        auto sst_name = sstables::sstable::filename(output_dir, schema->ks_name(), schema->cf_name(), version, generation, format, component_type::Data);
-        if (file_exists(sst_name).get()) {
-            throw std::invalid_argument(fmt::format("cannot create output sstable {}, file already exists", sst_name));
+    auto consume_reader = [&] (mutation_reader reader, size_t partition_count_estimate) -> future<> {
+        auto generation = sstables::generation_type(utils::UUID_gen::get_time_UUID());
+
+        {
+            auto sst_name = sstables::sstable::filename(output_dir, schema->ks_name(), schema->cf_name(), version, generation, format, component_type::Data);
+            if (co_await file_exists(sst_name)) {
+                throw std::invalid_argument(fmt::format("cannot create output sstable {}, file already exists", sst_name));
+            }
         }
-    }
+
+        auto writer_cfg = manager.configure_writer("scylla-sstable");
+        writer_cfg.validation_level = validation_level;
+        auto local = data_dictionary::make_local_options(output_dir);
+        auto sst = manager.make_sstable(schema, local, generation, sstables::sstable_state::normal, version, format);
+
+        co_await sst->write_components(std::move(reader), partition_count_estimate, schema, writer_cfg, encoding_stats{});
+
+        fmt::print(std::cout, "{}\n", generation);
+    };
 
     auto ifile = open_file_dma(input_file, open_flags::ro).get();
     auto istream = make_file_input_stream(std::move(ifile));
-    auto parser = json_mutation_stream_parser{schema, permit, std::move(istream)};
-    auto reader = make_generating_reader_v2(schema, permit, std::move(parser));
-    auto writer_cfg = manager.configure_writer("scylla-sstable");
-    writer_cfg.validation_level = validation_level;
-    auto local = data_dictionary::make_local_options(output_dir);
-    auto sst = manager.make_sstable(schema, local, generation, sstables::sstable_state::normal, version, format);
 
-    sst->write_components(std::move(reader), 1, schema, writer_cfg, encoding_stats{}).get();
+    if (input_format == input_format::json) {
+        auto parser = tools::json_mutation_stream_parser{schema, permit, std::move(istream), sst_log};
+        auto reader = make_generating_reader(schema, permit, std::move(parser));
+        consume_reader(std::move(reader), 1).get();
+    } else {
+        lw_shared_ptr<replica::memtable> mt = make_lw_shared<replica::memtable>(schema);
+        auto flush_memtable = [&consume_reader, &schema, &permit] (replica::memtable& mt) -> future<> {
+            co_await consume_reader(mt.make_flush_reader(schema, permit), mt.partition_count());
+            co_await mt.clear_gently();
+        };
+        do_with_cql_env_noreentrant_in_thread([&] (cql_test_env& env) mutable -> future<> {
+            auto& db = env.local_db();
+            auto& table = co_await create_table_in_cql_env(env, schema);
+            auto table_schema = table.schema();
+
+            // Disable commitlog.
+            table.set_durable_writes(false);
+
+            // We don't want to register the sstables with the table object,
+            // to avoid any attempt to compact/split/merge/rewrite them.
+            // Also, they were created with a foreign stable-manager (not part of
+            // cql_test_env).
+            // Use the virtual reader facility to isolate the sstables from
+            // cql-test-env.
+            table.set_virtual_writer([&] (const frozen_mutation& fm) -> future<> {
+                mt->apply(fm, schema);
+                sst_log.trace("applied mutation of size {}", fm.representation().size());
+                if (mt->occupancy().total_space() >= memory_limit) {
+                    sst_log.debug("cycling memtable with occupancy {}", mt->occupancy().total_space());
+                    co_await flush_memtable(*mt);
+                    mt = make_lw_shared<replica::memtable>(schema);
+                }
+            });
+
+            co_await consume_queries(std::move(istream), [&] (std::string_view query) -> future<> {
+                sst_log.debug("write_operation(): processing query {}", query);
+
+                validate_query<cql3::statements::modification_statement>(query, table_schema->cf_name(), db.as_data_dictionary(), "an insert, update or delete");
+
+                const auto result = co_await env.execute_cql(query);
+                result->throw_if_exception();
+            });
+        });
+        if (!mt->empty()) {
+            flush_memtable(*mt).get();
+        }
+    }
 }
 
 void script_operation(schema_ptr schema, reader_permit permit, const std::vector<sstables::shared_sstable>& sstables,
@@ -2852,8 +2076,9 @@ void print_query_results_json(const cql3::result& result) {
         writer.StartObject();
         for (size_t i = 0; i < row.size(); ++i) {
             writer.Key(column_metadata[i]->name->text());
-            if (!row[i]) {
+            if (!row[i] || row[i]->empty()) {
                 writer.Null();
+                continue;
             }
             const auto value = to_json_string(*column_metadata[i]->type, *row[i]);
             const auto type = to_json_type(*column_metadata[i]->type, *row[i]);
@@ -2892,48 +2117,6 @@ public:
     }
 };
 
-void query_operation_validate_query(const sstring& query, std::string_view table_name, data_dictionary::database db) {
-    std::vector<std::unique_ptr<cql3::statements::raw::parsed_statement>> raw_statements;
-    try {
-        raw_statements = cql3::query_processor::parse_statements(query, cql3::dialect{});
-    } catch (...) {
-        throw std::invalid_argument(seastar::format("failed to parse query: {}", std::current_exception()));
-    }
-    if (raw_statements.size() != 1) {
-        throw std::invalid_argument(seastar::format("expected exactly 1 query, got {}", raw_statements.size()));
-    }
-
-    const auto raw_statement = raw_statements.front().get();
-
-    if (auto cf_statement = dynamic_cast<cql3::statements::raw::cf_statement*>(raw_statement)) {
-        if (!cf_statement->has_keyspace()) {
-            throw std::invalid_argument("query must have keyspace and the keyspace has to be scylla_sstable");
-        }
-        if (cf_statement->keyspace() != "scylla_sstable") {
-            throw std::invalid_argument(seastar::format("query must select from scylla_sstable keyspace, got {} instead", std::string_view(cf_statement->keyspace())));
-        }
-        if (cf_statement->column_family() != table_name) {
-            throw std::invalid_argument(seastar::format("query must select from {} table, got {} instead", table_name, std::string_view(cf_statement->column_family())));
-        }
-    } else {
-        throw std::invalid_argument("query must be a select query");
-    }
-
-    seastar::shared_ptr<cql3::cql_statement> statement;
-    cql3::cql_stats cql_stats;
-
-    try {
-        auto prepared_statement = raw_statement->prepare(db, cql_stats);
-        statement = prepared_statement->statement;
-    } catch (...) {
-        throw std::invalid_argument(seastar::format("failed to prepare query: {}", std::current_exception()));
-    }
-
-    if (dynamic_cast<cql3::statements::select_statement*>(statement.get()) == nullptr) {
-        throw std::invalid_argument("query must be a select query");
-    }
-}
-
 void query_operation(schema_ptr sstable_schema, reader_permit permit, const std::vector<sstables::shared_sstable>& sstables,
         sstables::sstables_manager& sstable_manager, const bpo::variables_map& vm) {
     if (vm.contains("query") && vm.contains("query-file")) {
@@ -2950,48 +2133,8 @@ void query_operation(schema_ptr sstable_schema, reader_permit permit, const std:
     do_with_cql_env_noreentrant_in_thread([&] (cql_test_env& env) mutable -> future<> {
         auto& db = env.local_db();
 
-        const auto keyspace_name = "scylla_sstable";
-        co_await env.execute_cql(seastar::format("CREATE KEYSPACE {} WITH replication = {{'class': 'LocalStrategy'}}", keyspace_name));
-        auto& keyspace = db.find_keyspace(keyspace_name);
-
-        // Clone and modify the schema:
-        // * Change keyspace name to scylla_sstable
-        // * Generate a new ID
-        // * Drop all properties
-        //
-        // This will help avoid conflicts when querying sstables of system-tables
-        // and allows cql_test_env to work with a simple config (no EAR setup).
-        auto builder = schema_builder(keyspace_name, sstable_schema->cf_name());
-        for (const auto& col_kind : {column_kind::partition_key, column_kind::clustering_key, column_kind::static_column, column_kind::regular_column}) {
-            for (const auto& col : sstable_schema->columns(col_kind)) {
-                builder.with_column(col.name(), col.type, col_kind, col.view_virtual());
-
-                // Register any user types, so they are known by the time we create the table.
-                if (col.type->is_user_type()) {
-                    keyspace.add_user_type(dynamic_pointer_cast<const user_type_impl>(col.type));
-                }
-            }
-        }
-        auto schema = builder.build();
-
-        const auto table_name = schema->cf_name();
-
-        replica::schema_describe_helper describe_helper{db.as_data_dictionary()};
-
-        const auto original_schema_description = sstable_schema->describe(describe_helper, cql3::describe_option::STMTS_AND_INTERNALS);
-        const auto schema_description = schema->describe(describe_helper, cql3::describe_option::STMTS_AND_INTERNALS);
-
-        sst_log.debug("\noriginal schema:\n{}\nreplacement schema:\n{}\n\nNote: original keyspace name of {} was replaced with {}, original id of {} was replaced with {} and all properties were dropped!\n",
-                original_schema_description.create_statement.value(),
-                schema_description.create_statement.value(),
-                sstable_schema->ks_name(),
-                keyspace_name,
-                sstable_schema->id(),
-                schema->id());
-
-        co_await env.execute_cql(schema_description.create_statement.value());
-
-        auto& table = db.find_column_family(keyspace_name, table_name);
+        auto& table = co_await create_table_in_cql_env(env, sstable_schema);
+        auto table_schema = table.schema();
 
         // We don't want to register the sstables with the table object,
         // to avoid any attempt to compact/split/merge/rewrite them.
@@ -3027,10 +2170,10 @@ void query_operation(schema_ptr sstable_schema, reader_permit permit, const std:
             auto fstream = make_file_input_stream(file);
             query = co_await util::read_entire_stream_contiguous(fstream);
         } else {
-            query = seastar::format("SELECT * FROM {}.{} ", keyspace_name, table_name);
+            query = seastar::format("SELECT * FROM {}.{} ", table_schema->ks_name(), table_schema->cf_name());
         }
 
-        query_operation_validate_query(query, table_name, db.as_data_dictionary());
+        validate_query<cql3::statements::select_statement>(query, table_schema->cf_name(), db.as_data_dictionary(), "a select");
 
         sst_log.debug("query_operation(): running query {}", query);
 
@@ -3040,6 +2183,46 @@ void query_operation(schema_ptr sstable_schema, reader_permit permit, const std:
         query_operation_result_visitor visitor{format};
         result->accept(visitor);
     }, {});
+}
+
+void upgrade_operation(schema_ptr schema, reader_permit permit, const std::vector<sstables::shared_sstable>& sstables,
+        sstables::sstables_manager& sst_man, const bpo::variables_map& vm) {
+    if (sstables.empty()) {
+        throw std::invalid_argument("no sstables specified on the command line");
+    }
+
+    const auto all = vm.count("all");
+
+    const auto output_dir = vm["output-dir"].as<std::string>();
+    validate_output_dir(output_dir, vm.count("unsafe-accept-nonempty-output-dir"));
+
+    const auto local = data_dictionary::make_local_options(output_dir);
+
+    const auto new_format = sstables::sstable_format_types::big;
+    const auto new_version = vm.contains("sstable-version")
+        ? sstables::version_from_string(vm["sstable-version"].as<std::string>())
+        : sst_man.get_preferred_sstable_version();
+
+    for (const auto& sst : sstables) {
+        if (sst->get_version() == new_version && !all) {
+            fmt::print(std::cout, "Nothing to do for sstable {}, skipping (use --all to force upgrade all sstables).\n", sst->get_filename());
+            continue;
+        }
+
+        const auto new_generation = sstables::generation_type(utils::UUID_gen::get_time_UUID());
+
+        auto writer_cfg = sst_man.configure_writer("scylla-sstable");
+        auto new_sst = sst_man.make_sstable(schema, local, new_generation, sstables::sstable_state::normal, new_version, new_format);
+
+        new_sst->write_components(
+                sst->make_full_scan_reader(schema, permit),
+                sst->get_estimated_key_count(),
+                schema,
+                writer_cfg,
+                sst->get_encoding_stats_for_compaction()).get();
+
+        fmt::print(std::cout, "Upgraded sstable {} to {}.\n", sst->get_filename(), new_sst->get_filename());
+    }
 }
 
 const std::vector<operation_option> global_options {
@@ -3063,7 +2246,7 @@ const std::map<operation, operation_func> operations_with_func{
 /* dump-data */
     {{"dump-data",
             "Dump content of sstable(s)",
-R"(
+fmt::format(R"(
 Dump the content of the data component. This component contains the data-proper
 of the sstable. This might produce a huge amount of output. In general the
 human-readable output will be larger than the binary file.
@@ -3075,9 +2258,8 @@ format.
 Supports both a text and JSON output. The text output uses the built-in scylla
 printers, which are also used when logging mutation-related data structures.
 
-See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#dump-data
-for more information on this operation, including the schema of the JSON output.
-)",
+For more information, see: {}
+)", doc_link("operating-scylla/admin-tools/scylla-sstable#dump-data")),
             {
                     typed_option<std::vector<sstring>>("partition", "partition(s) to filter for, partitions are expected to be in the hex format"),
                     typed_option<sstring>("partitions-file", "file containing partition(s) to filter for, partitions are expected to be in the hex format"),
@@ -3089,7 +2271,7 @@ for more information on this operation, including the schema of the JSON output.
 /* dump-index */
     {{"dump-index",
             "Dump content of sstable index(es)",
-R"(
+fmt::format(R"(
 Dump the content of the index component. Contains the partition-index of the data
 component. This is effectively a list of all the partitions in the sstable, with
 their starting position in the data component and optionally a promoted index,
@@ -3097,123 +2279,73 @@ which contains a sampled index of the clustering rows in the partition.
 Positions (both that of partition and that of rows) is valid for uncompressed
 data.
 
-See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#dump-index
-for more information on this operation, including the schema of the JSON output.
-)"},
+For more information, see: {}
+)", doc_link("operating-scylla/admin-tools/scylla-sstable#dump-index"))},
             dump_index_operation},
 /* dump-compression-info */
     {{"dump-compression-info",
             "Dump content of sstable compression info(s)",
-R"(
+fmt::format(R"(
 Dump the content of the compression-info component. Contains compression
 parameters and maps positions into the uncompressed data to that into compressed
 data. Note that compression happens over chunks with configurable size, so to
 get data at a position in the middle of a compressed chunk, the entire chunk has
 to be decompressed.
 
-See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#dump-compression-info
-for more information on this operation, including the schema of the JSON output.
-)"},
+For more information, see: {}
+)", doc_link("operating-scylla/admin-tools/scylla-sstable#dump-compression-info"))},
             dump_compression_info_operation},
 /* dump-summary */
     {{"dump-summary",
             "Dump content of sstable summary(es)",
-R"(
+fmt::format(R"(
 Dump the content of the summary component. The summary is a sampled index of the
 content of the index-component. An index of the index. Sampling rate is chosen
 such that this file is small enough to be kept in memory even for very large
 sstables.
 
-See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#dump-summary
-for more information on this operation, including the schema of the JSON output.
-
-)"},
+For more information, see: {}
+)", doc_link("operating-scylla/admin-tools/scylla-sstable#dump-summary"))},
             dump_summary_operation},
 /* dump-statistics */
     {{"dump-statistics",
             "Dump content of sstable statistics(s)",
-R"(
+fmt::format(R"(
 Dump the content of the statistics component. Contains various metadata about the
 data component. In the sstable 3 format, this component is critical for parsing
 the data component.
 
-See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#dump-statistics
-for more information on this operation, including the schema of the JSON output.
-)"},
+For more information, see: {}
+)", doc_link("operating-scylla/admin-tools/scylla-sstable#dump-statistics"))},
             dump_statistics_operation},
 /* dump-scylla-metadata */
     {{"dump-scylla-metadata",
             "Dump content of sstable scylla metadata(s)",
-R"(
+fmt::format(R"(
 Dump the content of the scylla-metadata component. Contains scylla-specific
 metadata about the data component. This component won't be present in sstables
 produced by Apache Cassandra.
 
-See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#dump-scylla-metadata
-for more information on this operation, including the schema of the JSON output.
-)"},
+For more information, see: {}
+)", doc_link("operating-scylla/admin-tools/scylla-sstable#dump-scylla-metadata"))},
             dump_scylla_metadata_operation},
-/* writetime-histogram */
-    {{"writetime-histogram",
-            "Generate a histogram of all the timestamps (writetime)",
-R"(
-Crawl over all timestamps in the data component and add them to a histogram. The
-bucket size by default is a month, tunable with the --bucket option.
-The timestamp of all objects that have one are added to the histogram:
-* cells (atomic and collection cells)
-* tombstones (partition-tombstone, range-tombstone, row-tombstone,
-  shadowable-tombstone, cell-tombstone, collection-tombstone, cell-tombstone)
-* row-marker
-
-This allows determining when the data was written, provided the writer of the
-data didn't mangle with the timestamps.
-This produces a json file `histogram.json` whose content can be plotted with the
-following example python script:
-
-     import datetime
-     import json
-     import matplotlib.pyplot as plt # requires the matplotlib python package
-
-     with open('histogram.json', 'r') as f:
-         data = json.load(f)
-
-     x = data['buckets']
-     y = data['counts']
-
-     max_y = max(y)
-
-     x = [datetime.date.fromtimestamp(i / 1000000).strftime('%Y.%m') for i in x]
-     y = [i / max_y for i in y]
-
-     fig, ax = plt.subplots()
-
-     ax.set_xlabel('Timestamp')
-     ax.set_ylabel('Normalized cell count')
-     ax.set_title('Histogram of data write-time')
-     ax.bar(x, y)
-
-     plt.show()
-)",
-            {typed_option<std::string>("bucket", "months", "the unit of time to use as bucket, one of (years, months, weeks, days, hours)")}},
-            sstable_consumer_operation<writetime_histogram_collecting_consumer>},
 /* validate */
     {{"validate",
             "Validate the sstable(s), same as scrub in validate mode",
-R"(
+fmt::format(R"(
 Validates the content of the sstable on the mutation-fragment level, see
 https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#sstable-content
 for more details.
 Any parsing errors will also be detected, but after successful parsing the
 validation will happen on the fragment level.
 
-See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#validate
-for more information on this operation.
-)"},
+For more information, see: {}
+)", doc_link("operating-scylla/admin-tools/scylla-sstable#validate"))},
             validate_operation},
 /* scrub */
     {{"scrub",
             "Scrub the sstable(s), in the specified mode",
-R"(
+fmt::format(R"(
 Read and re-write the sstable, getting rid of or fixing broken parts, depending
 on the selected mode.
 Output sstables are written to the directory specified via `--output-directory`.
@@ -3226,9 +2358,8 @@ abort the scrub. This can be overridden by the
 be aborted if an sstable cannot be written because its generation clashes with
 pre-existing sstables in the directory.
 
-See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#scrub
-for more information on this operation, including what the different modes do.
-)",
+For more information, see: {}
+)", doc_link("operating-scylla/admin-tools/scylla-sstable#scrub")),
             {
                     typed_option<std::string>("scrub-mode", "scrub mode to use, one of (abort, skip, segregate, validate)"),
                     typed_option<std::string>("output-dir", ".", "directory to place the scrubbed sstables to"),
@@ -3238,12 +2369,11 @@ for more information on this operation, including what the different modes do.
 /* validate-checksums */
     {{"validate-checksums",
             "Validate the checksums of the sstable(s)",
-R"(
+fmt::format(R"(
 Validate both the whole-file and the per-chunk checksums of the data component.
 
-See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#validate-checksums
-for more information on this operation.
-)"},
+For more information, see: {}
+)", doc_link("operating-scylla/admin-tools/scylla-sstable#validate-checksums"))},
             validate_checksums_operation},
 /* decompress */
     {{"decompress",
@@ -3262,8 +2392,34 @@ the output will be:
 /* write */
     {{"write",
             "Write an sstable",
-R"(
-Write an sstable based on a JSON representation of the content. The JSON
+fmt::format(R"(
+Write an sstable based on the input provided via --input-file and
+--input-format.
+
+The input formats are supported: CQL and JSON
+
+CQL
+---
+
+Write output sstable(s) based on the CQL statements provided in the input.
+The following statements are supported: INSERT, UPDATE and DELETE.
+The statements are expected to be separated by semicolons.
+The statements do not need to be ordered in any way.
+
+Data is buffered in memory, in a memtable. This provides the required ordering
+to the incoming statements. When the memtable reaches its maximum size, it is
+flushed and a new output sstable is created. Consequently, multiple output
+sstables can be created for large enough inputs.
+The maximum size of the memtable can be controlled via the --memory-limit command
+line argument, which defaults to 1MiB.
+
+Reading the statements from the input file happens via a streaming parser, it is
+safe to provide input files of any size.
+
+JSON
+----
+
+Wite an sstable based on the JSON representation of the content. The JSON
 representation has to have the same schema as that of a single sstable
 from the output of the dump-data operation (corresponding to the $SSTABLE
 symbol).
@@ -3277,31 +2433,37 @@ storage engine. The following is not supported:
 Parsing uses a streaming json parser, it is safe to pass in input-files
 of any size.
 
-The output sstable will use the BIG format, the highest supported sstable
-format and the specified generation (--generation). By default it is
-placed in the local directory, can be changed with --output-dir. If the
-output sstable clashes with an existing sstable, the write will fail.
+Produces a single output sstable.
 
-See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#write
-for more information on this operation, including the schema of the JSON input.
-)",
+Output SSTables
+---------------
+
+The output sstable(s) will use the BIG format, the highest supported sstable
+format (can be changed with --sstable-version) and random UUID generation
+(printed to stdout). By default it is placed in the local directory, can be
+changed with --output-dir. If the output sstable clashes with an existing
+sstable, the write will fail.
+
+For more information, see: {}
+)", doc_link("operating-scylla/admin-tools/scylla-sstable#write")),
             {
                     typed_option<std::string>("input-file", "the file containing the input"),
+                    typed_option<std::string>("input-format", "text", "the input-format, one of (cql, json)"),
+                    typed_option<size_t>("memory-limit", 1 << 20, "the maximum amount of memory in bytes to use for the memtable buffering the query results (default 1MiB)"),
                     typed_option<std::string>("output-dir", ".", "directory to place the output sstable(s) to"),
-                    typed_option<sstables::generation_type::int_t>("generation", "generation of generated sstable"),
                     typed_option<std::string>("validation-level", "clustering_key", "degree of validation on the output, one of (partition_region, token, partition_key, clustering_key)"),
+                    typed_option<std::string>("sstable-version", "SSTable format version, (e.g. \"me\", \"ms\")"),
             }},
             write_operation},
 /* script */
     {{"script",
             "Run a script on content of an sstable",
-R"(
+fmt::format(R"(
 Read the sstable(s) and pass the resulting fragment stream to the script
 specified by `--script-file`. Currently only Lua scripts are supported.
 
-See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#script
-for more information on this operation, including the API documentation.
-)",
+For more information, see: {}
+)", doc_link("operating-scylla/admin-tools/scylla-sstable#script")),
             {
                 typed_option<>("merge", "merge all sstables into a single mutation fragment stream (use a combining reader over all sstable readers)"),
                 typed_option<std::string>("script-file", "script file to load and execute"),
@@ -3322,7 +2484,7 @@ for more information on this operation, including the API documentation.
 /* query */
     {{"query",
             "Run a query on the content of the sstable(s)",
-R"(
+fmt::format(R"(
 The query is run on the combined content of all input sstables.
 
 By default, the following query is run: SELECT * FROM $table.
@@ -3346,15 +2508,43 @@ cql_test_env. This temporary directory will have a size of a couple of megabytes
 By default it will create this in /tmp, this can be changed with the `TEMPDIR`
 environment variable. This temporary directory is removed on exit.
 
-See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#query
-for more information on this operation, including usage examples.
-)",
+For more information, see: {}
+)", doc_link("operating-scylla/admin-tools/scylla-sstable#query")),
             {
                 typed_option<std::string>("query,q", "execute the query provided on the command-line"),
                 typed_option<std::string>("query-file", "execute the query from the file, the file is expected to contain a single query"),
                 typed_option<std::string>("output-format", "text", "the output-format, one of (text, json)"),
             }},
             query_operation},
+/* upgrade */
+    {{"upgrade",
+            "Upgrade sstable(s) to the highest supported version and apply the latest schema",
+fmt::format(R"(
+This command is an offline version of nodetool upgradesstables.
+Applies the latest sstable version and the latest schema to the sstables.
+
+To apply the latest schema, it is advised to use the system schema tables as the
+schema source.
+It is possible to apply an altered schema to the sstable, by providing the altered
+schema via the schema-file option. Do this with care as incompatible changes to
+columns, can cause crashes or data-loss. Also, not all schema options can be
+directly expressed in CQL. Editing schema options (the part after WITH) is safe.
+
+The sstable version can be selected manually with the --sstable-version option,
+by default the latest supported version is used. Valid options are sstable
+versions which are supported for writing: mc, md, me, ms.
+
+Mapping of input sstables to output sstables is printed to stdout.
+
+For more information, see: {}
+)", doc_link("operating-scylla/admin-tools/scylla-sstable#upgrade")),
+            {
+                typed_option<std::string>("output-dir", ".", "directory to place the output sstable(s) to"),
+                typed_option<std::string>("sstable-version", "sstable version to use, defaults to the same version as ScyllaDB would"),
+                typed_option<>("all", "upgrade all sstables, even if they are already at the requested version"),
+                typed_option<>("unsafe-accept-nonempty-output-dir", "allow the operation to write into a non-empty output directory, acknowledging the risk that this may result in sstable clash"),
+            }},
+            upgrade_operation},
 };
 
 } // anonymous namespace
@@ -3464,9 +2654,6 @@ $ scylla sstable dump-data /path/to/md-123456-big-Data.db
 Dump the content of the two sstable(s) as a unified stream:
 $ scylla sstable dump-data --merge /path/to/md-123456-big-Data.db /path/to/md-123457-big-Data.db
 
-Generate a joint histogram for the specified partition:
-$ scylla sstable writetime-histogram --partition={{myhexpartitionkey}} /path/to/md-123456-big-Data.db
-
 Validate the specified sstables:
 $ scylla sstable validate /path/to/md-123456-big-Data.db /path/to/md-123457-big-Data.db
 
@@ -3521,8 +2708,6 @@ $ scylla sstable validate /path/to/md-123456-big-Data.db /path/to/md-123457-big-
             }).get();
             dbcfg.setup_directories();
             sst_log.debug("Successfully read scylla.yaml from {} location of {}", scylla_yaml_path_source, scylla_yaml_path);
-            read_object_storage_config(dbcfg).get();
-            sst_log.debug("Successfully read object storage settings");
         } else {
             dbcfg.experimental_features.set(db::experimental_features_t::all());
             sst_log.debug("Failed to read scylla.yaml from {} location of {}, some functionality may be unavailable", scylla_yaml_path_source, scylla_yaml_path);
@@ -3530,6 +2715,14 @@ $ scylla sstable validate /path/to/md-123456-big-Data.db /path/to/md-123457-big-
 
         dbcfg.enable_cache(false);
         dbcfg.volatile_system_keyspace_for_testing(true);
+
+        // Override whatever value the option has. Setting this to `true` is correct because
+        // schema loader doesn't attempt to create any keyspace and doesn't go through any
+        // validation code; there is no topology either. Thanks to that, we won't run into
+        // any problems due to enforcing RF-rack-valid keyspaces.
+        //
+        // On the other hand, we gain access to the code hidden behind the option
+        dbcfg.rf_rack_valid_keyspaces(true, ::utils::config_file::config_source::CommandLine);
 
         {
             unsigned schema_sources = 0;
@@ -3559,26 +2752,34 @@ $ scylla sstable validate /path/to/md-123456-big-Data.db /path/to/md-123457-big-
             return 1;
         }
 
-        gms::feature_service feature_service(gms::feature_config_from_db_config(dbcfg));
+        gms::feature_service feature_service({get_disabled_features_from_db_config(dbcfg)});
+        auto scf = make_sstable_compressor_factory_for_tests_in_thread();
         cache_tracker tracker;
         sstables::directory_semaphore dir_sem(1);
         abort_source abort;
 
         sstables::storage_manager::config stm_cfg;
-        stm_cfg.s3_clients_memory = 100_MiB;
+        stm_cfg.object_storage_clients_memory = 100_MiB;
+        stm_cfg.skip_metrics_registration = true;
         sharded<sstables::storage_manager> sstm;
         sstm.start(std::ref(dbcfg), stm_cfg).get();
         auto stop_sstm = defer([&sstm] { sstm.stop().get(); });
 
+        db::nop_large_data_handler large_data_handler;
+        db::nop_corrupt_data_handler corrupt_data_handler(db::corrupt_data_handler::register_metrics::no);
+
+        feature_service.ms_sstable.enable();
         sstables::sstables_manager sst_man(
             "scylla_sstable",
             large_data_handler,
+            corrupt_data_handler,
             dbcfg,
             feature_service,
             tracker,
             1_GiB,
             dir_sem,
             [host_id = locator::host_id::create_random_id()] { return host_id; },
+            *scf,
             abort,
             current_scheduling_group(),
             &sstm.local());

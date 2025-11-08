@@ -17,9 +17,9 @@
 #include <seastar/net/byteorder.hh>
 #include "bytes.hh"
 #include "reader_permit.hh"
-#include "utils/assert.hh"
 #include "utils/fragmented_temporary_buffer.hh"
 #include "utils/small_vector.hh"
+#include "exceptions.hh"
 
 #include <variant>
 
@@ -70,6 +70,7 @@ private:
         READING_U8,
         READING_U16,
         READING_U32,
+        READING_U56,
         READING_U64,
         READING_BYTES_CONTIGUOUS,
         READING_BYTES,
@@ -196,6 +197,17 @@ public:
     }
     inline read_status read_32() noexcept {
         return read_partial_int(prestate::READING_U32);
+    }
+    inline read_status read_56(Buffer& data) {
+        if (data.size() >= 7) {
+            char buf[8] = {0};
+            std::memcpy(buf + 1, data.get(), 7);
+            _u64 = read_be<uint64_t>(buf);
+            data.trim_front(7);
+            return read_status::ready;
+        } else {
+            return read_partial_int(data, prestate::READING_U56);
+        }
     }
     inline read_status read_64(Buffer& data) {
         if (data.size() >= sizeof(uint64_t)) {
@@ -324,7 +336,7 @@ private:
     // Reads bytes belonging to an integer of size len. Returns true
     // if a full integer is now available.
     bool process_int(Buffer& data, unsigned len) {
-        SCYLLA_ASSERT(_pos < len);
+        sstables::parse_assert(_pos < len);
         auto n = std::min((size_t)(len - _pos), data.size());
         std::copy(data.begin(), data.begin() + n, _read_int.bytes + _pos);
         data.trim_front(n);
@@ -344,7 +356,7 @@ public:
     // Feeds data into the state machine.
     // After the call, when data is not empty then active() can be assumed to be false.
     read_status consume(Buffer& data) {
-        if (__builtin_expect(_prestate == prestate::NONE, true)) {
+        if (_prestate == prestate::NONE) [[likely]] {
             return read_status::ready;
         }
         // We're in the middle of reading a basic type, which crossed
@@ -461,6 +473,13 @@ public:
             break;
         case prestate::READING_U32:
             return consume_u32(data);
+        case prestate::READING_U56:
+            if (process_int(data, 7)) {
+                _u64 = net::ntoh(_read_int.uint64) >> 8;
+                _prestate = prestate::NONE;
+                return read_status::ready;
+            }
+            break;
         case prestate::READING_U64:
             if (process_int(data, sizeof(uint64_t))) {
                 _u64 = net::ntoh(_read_int.uint64);
@@ -556,12 +575,12 @@ public:
     inline processing_result process(temporary_buffer<char>& data) {
         while (data || (!primitive_consumer::active() && non_consuming())) {
             // The primitive_consumer must finish before the enclosing state machine can continue.
-            if (__builtin_expect(primitive_consumer::consume(data) == read_status::waiting, false)) {
-                SCYLLA_ASSERT(data.size() == 0);
+            if (primitive_consumer::consume(data) == read_status::waiting) [[unlikely]] {
+                sstables::parse_assert(data.size() == 0);
                 return proceed::yes;
             }
             auto ret = state_processor().process_state(data);
-            if (__builtin_expect(ret != proceed::yes, 0)) {
+            if (ret != proceed::yes) [[unlikely]] {
                 return ret;
             }
         }
@@ -607,7 +626,7 @@ public:
             }, [this, &data, orig_data_size](skip_bytes skip) {
                 // we only expect skip_bytes to be used if reader needs to skip beyond the provided buffer
                 // otherwise it should just trim_front and proceed as usual
-                SCYLLA_ASSERT(data.size() == 0);
+                sstables::parse_assert(data.size() == 0);
                 _remain -= orig_data_size;
                 if (skip.get_value() >= _remain) {
                     skip_bytes skip_remaining(_remain);
@@ -625,11 +644,11 @@ public:
     }
 
     future<> fast_forward_to(size_t begin, size_t end) {
-        SCYLLA_ASSERT(begin >= _stream_position.position);
+        sstables::parse_assert(begin >= _stream_position.position);
         auto n = begin - _stream_position.position;
         _stream_position.position = begin;
 
-        SCYLLA_ASSERT(end >= _stream_position.position);
+        sstables::parse_assert(end >= _stream_position.position);
         _remain = end - _stream_position.position;
 
         primitive_consumer::reset();

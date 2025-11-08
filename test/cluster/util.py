@@ -22,8 +22,7 @@ from test.pylib.internal_types import ServerInfo, HostID
 from test.pylib.manager_client import ManagerClient
 from test.pylib.rest_client import get_host_api_address, read_barrier
 from test.pylib.util import wait_for, wait_for_cql_and_get_hosts, get_available_host, unique_name
-from typing import Optional, List
-
+from typing import Optional, List, Union
 
 logger = logging.getLogger(__name__)
 
@@ -116,15 +115,22 @@ async def check_token_ring_and_group0_consistency(manager: ManagerClient) -> Non
 
 
 async def wait_for_token_ring_and_group0_consistency(manager: ManagerClient, deadline: float) -> None:
-    """Weaker version of the above check; the token ring is not immediately updated after
-    bootstrap/replace/decommission - the normal tokens of the new node propagate through gossip.
+    """
+    Weaker version of the above check.
+
+    In the Raft-based topology, a decommissioning node is removed from group 0 after the decommission request is
+    considered finished (and the token ring is updated).
+
+    Moreover, in the gossip-based topology, the token ring is not immediately updated after
+    bootstrap/replace/decommission - the normal tokens propagate through gossip.
+
     Take this into account and wait for the equality condition to hold, with a timeout.
     """
     servers = await manager.running_servers()
     for srv in servers:
-        group0_members = await get_current_group0_config(manager, srv)
-        group0_ids = {m[0] for m in group0_members}
-        async def token_ring_matches():
+        async def token_ring_and_group0_match():
+            group0_members = await get_current_group0_config(manager, srv)
+            group0_ids = {m[0] for m in group0_members}
             token_ring_ids = await get_token_ring_host_ids(manager, srv)
             diff = token_ring_ids ^ group0_ids
             if diff:
@@ -132,7 +138,7 @@ async def wait_for_token_ring_and_group0_consistency(manager: ManagerClient, dea
                                f" according to {srv}, symmetric difference: {diff}")
                 return None
             return True
-        await wait_for(token_ring_matches, deadline, period=.5)
+        await wait_for(token_ring_and_group0_match, deadline, period=.5)
 
 
 async def wait_for_upgrade_state(state: str, cql: Session, host: Host, deadline: float) -> None:
@@ -197,6 +203,11 @@ async def wait_until_topology_upgrade_finishes(manager: ManagerClient, ip_addr: 
         return status == "done" or None
     await wait_for(check, deadline=deadline, period=1.0)
 
+async def wait_until_driver_service_level_created(cql: Session, deadline: float):
+    async def check():
+        service_levels = await cql.run_async("LIST ALL SERVICE_LEVELS")
+        return ("driver" in [sl.service_level for sl in service_levels]) or None
+    await wait_for(check, deadline=deadline, period=1.0)
 
 async def delete_raft_topology_state(cql: Session, host: Host):
     await cql.run_async("truncate table system.topology", host=host)
@@ -301,7 +312,7 @@ async def check_system_topology_and_cdc_generations_v3_consistency(manager: Mana
 async def check_node_log_for_failed_mutations(manager: ManagerClient, server: ServerInfo):
     logging.info(f"Checking that node {server} had no failed mutations")
     log = await manager.server_open_log(server.server_id)
-    occurrences = await log.grep(expr="Failed to apply mutation from")
+    occurrences = await log.grep(expr="Failed to apply mutation from", filter_expr="(TRACE|DEBUG|INFO)")
     assert len(occurrences) == 0
 
 
@@ -595,3 +606,51 @@ def disable_schema_agreement_wait(cql: Session):
         yield
     finally:
         cql.cluster.max_schema_agreement_wait = old_value
+
+
+ReplicationOption = Union[str, List[str]]
+ReplicationOptions = dict[str, ReplicationOption]
+
+
+def parse_replication_options(replication_column) -> ReplicationOptions:
+    """
+    Parses the value of "replication_v2" or "replication" column from system_schema.keyspaces,
+    which is a flattened map of options, into an expanded map.
+    Expands a flattened map like {"dc0:0": "r1", "dc0:1": "r2"} into {"dc0": ["r1", "r2"]}.
+    See docs/dev/system_schema_keyspace.md
+    """
+    result = {}
+    for key, value in replication_column.items():
+        if ':' in key:
+            sub_key, index_str = key.split(':', 1)
+            if sub_key not in result:
+                result[sub_key] = []
+            index = int(index_str)
+            while len(result[sub_key]) <= index:
+                result[sub_key].append(None)
+            if index >= 0:
+                result[sub_key][index] = value
+        else:
+            result[key] = value
+    return result
+
+
+def get_replication(cql, keyspace) -> ReplicationOptions:
+    """
+    Returns replication options for a given keyspace.
+
+    Example result: {"dc1": "2", "dc2": ["rack1", "rack2"]}
+    """
+    row = cql.execute(f"SELECT replication, replication_v2 FROM system_schema.keyspaces WHERE keyspace_name='{keyspace}'").one()
+    return parse_replication_options(row.replication_v2 or row.replication)
+
+
+def get_replica_count(rf: ReplicationOption) -> int:
+    """
+    Returns replica count corresponding to the given replication option.
+
+    Examples:
+        get_replica_count(["rack1", "rack2"]) == 2
+        get_replica_count(["2"]) == 2
+    """
+    return len(rf) if type(rf) is list else int(rf)

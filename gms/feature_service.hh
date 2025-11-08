@@ -20,7 +20,6 @@
 #include "gms/feature.hh"
 
 namespace db {
-class config;
 class system_keyspace;
 }
 namespace service { class storage_service; }
@@ -32,15 +31,8 @@ class feature_service;
 class i_endpoint_state_change_subscriber;
 
 struct feature_config {
-private:
-    std::set<sstring> _disabled_features;
-    feature_config();
-
-    friend class feature_service;
-    friend feature_config feature_config_from_db_config(const db::config& cfg, std::set<sstring> disabled);
+    std::set<sstring> disabled_features;
 };
-
-feature_config feature_config_from_db_config(const db::config& cfg, std::set<sstring> disabled = {});
 
 class unsupported_feature_exception : public std::runtime_error {
 public:
@@ -48,6 +40,8 @@ public:
             : runtime_error(std::move(what))
     {}
 };
+
+bool is_test_only_feature_enabled();
 
 using namespace std::literals;
 
@@ -119,7 +113,6 @@ public:
     gms::feature truncate_as_topology_operation { *this, "TRUNCATE_AS_TOPOLOGY_OPERATION"sv };
     gms::feature secondary_indexes_on_static_columns { *this, "SECONDARY_INDEXES_ON_STATIC_COLUMNS"sv };
     gms::feature tablets { *this, "TABLETS"sv };
-    gms::feature uuid_sstable_identifiers { *this, "UUID_SSTABLE_IDENTIFIERS"sv };
     gms::feature table_digest_insensitive_to_expiry { *this, "TABLE_DIGEST_INSENSITIVE_TO_EXPIRY"sv };
     // If this feature is enabled, schema versions are persisted by the group 0 command
     // that modifies schema instead of being calculated as a digest (hash) by each node separately.
@@ -136,6 +129,8 @@ public:
     gms::feature zero_token_nodes { *this, "ZERO_TOKEN_NODES"sv };
     gms::feature view_build_status_on_group0 { *this, "VIEW_BUILD_STATUS_ON_GROUP0"sv };
     gms::feature views_with_tablets { *this, "VIEWS_WITH_TABLETS"sv };
+    gms::feature group0_limited_voters { *this, "GROUP0_LIMITED_VOTERS"sv };
+    gms::feature compaction_history_upgrade { *this, "COMPACTION_HISTORY_UPGRADE"};
 
     // Whether to allow fragmented commitlog entries. While this is a node-local feature as such, hide
     // behind a feature to ensure an upgrading cluster appears to be at least functional before using,
@@ -146,6 +141,7 @@ public:
     gms::feature fragmented_commitlog_entries { *this, "FRAGMENTED_COMMITLOG_ENTRIES"sv };
     gms::feature maintenance_tenant { *this, "MAINTENANCE_TENANT"sv };
 
+    gms::feature tablet_incremental_repair { *this, "TABLET_INCREMENTAL_REPAIR"sv };
     gms::feature tablet_repair_scheduler { *this, "TABLET_REPAIR_SCHEDULER"sv };
     gms::feature tablet_merge { *this, "TABLET_MERGE"sv };
     gms::feature tablet_rack_aware_view_pairing { *this, "TABLET_RACK_AWARE_VIEW_PAIRING"sv };
@@ -161,10 +157,25 @@ public:
 
     gms::feature in_memory_tables { *this, "IN_MEMORY_TABLES"sv };
     gms::feature workload_prioritization { *this, "WORKLOAD_PRIORITIZATION"sv };
+    gms::feature colocated_tablets { *this, "COLOCATED_TABLETS"sv };
+    gms::feature cdc_with_tablets { *this, "CDC_WITH_TABLETS"sv };
+    gms::feature counters_with_tablets { *this, "COUNTERS_WITH_TABLETS"sv };
     gms::feature file_stream { *this, "FILE_STREAM"sv };
     gms::feature compression_dicts { *this, "COMPRESSION_DICTS"sv };
     gms::feature tablet_options { *this, "TABLET_OPTIONS"sv };
     gms::feature tablet_load_stats_v2 { *this, "TABLET_LOAD_STATS_V2"sv };
+    gms::feature sstable_compression_dicts { *this, "SSTABLE_COMPRESSION_DICTS"sv };
+    gms::feature repair_based_tablet_rebuild { *this, "REPAIR_BASED_TABLET_REBUILD"sv };
+    gms::feature enforced_raft_rpc_scheduling_group { *this, "ENFORCED_RAFT_RPC_SCHEDULING_GROUP"sv };
+    gms::feature load_and_stream_abort_rpc_message { *this, "LOAD_AND_STREAM_ABORT_RPC_MESSAGE"sv };
+    gms::feature topology_global_request_queue { *this, "TOPOLOGY_GLOBAL_REQUEST_QUEUE"sv };
+    gms::feature lwt_with_tablets { *this, "LWT_WITH_TABLETS"sv };
+    gms::feature repair_msg_split { *this, "REPAIR_MSG_SPLIT"sv };
+    gms::feature view_building_coordinator { *this, "VIEW_BUILDING_COORDINATOR"sv };
+    gms::feature ms_sstable { *this, "MS_SSTABLE_FORMAT"sv };
+    gms::feature rack_list_rf { *this, "RACK_LIST_RF"sv };
+    gms::feature driver_service_level { *this, "DRIVER_SERVICE_LEVEL"sv };
+    gms::feature strongly_consistent_tables { *this, "STRONGLY_CONSISTENT_TABLES"sv };
 public:
 
     const std::unordered_map<sstring, std::reference_wrapper<feature>>& registered_features() const;

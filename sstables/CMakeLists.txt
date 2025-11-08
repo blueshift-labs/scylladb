@@ -2,6 +2,7 @@ add_library(sstables STATIC)
 target_sources(sstables
   PRIVATE
     compress.cc
+    compressor.cc
     checksummed_data_source.cc
     integrity_checked_file_impl.cc
     kl/reader.cc
@@ -10,6 +11,7 @@ target_sources(sstables
     mx/partition_reversing_data_source.cc
     mx/reader.cc
     mx/writer.cc
+    object_storage_client.cc
     prepended_input_stream.cc
     random_access_reader.cc
     sstable_directory.cc
@@ -19,6 +21,13 @@ target_sources(sstables
     sstables_manager.cc
     sstable_version.cc
     storage.cc
+    trie/bti_key_translation.cc
+    trie/bti_index_reader.cc
+    trie/bti_node_reader.cc
+    trie/bti_node_sink.cc
+    trie/bti_partition_index_writer.cc
+    trie/bti_row_index_writer.cc
+    trie/trie_writer.cc
     writer.cc)
 target_include_directories(sstables
   PUBLIC

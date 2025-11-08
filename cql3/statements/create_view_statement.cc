@@ -32,6 +32,7 @@
 #include "db/view/view.hh"
 #include "service/migration_manager.hh"
 #include "replica/database.hh"
+#include "db/config.hh"
 
 namespace cql3 {
 
@@ -151,9 +152,13 @@ std::pair<view_ptr, cql3::cql_warnings_vec> create_view_statement::prepare_view(
 
     schema_ptr schema = validation::validate_column_family(db, _base_name.get_keyspace(), _base_name.get_column_family());
 
-    if (!db.features().views_with_tablets && db.find_keyspace(keyspace()).get_replication_strategy().uses_tablets()) {
-        throw exceptions::invalid_request_exception(format("Materialized views are not supported on base tables with tablets"));
+    try {
+        db::view::validate_view_keyspace(db, keyspace());
+    } catch (const std::exception& e) {
+        // The type of the thrown exception is not specified, so we need to wrap it here.
+        throw exceptions::invalid_request_exception(e.what());
     }
+
     if (schema->is_counter()) {
         throw exceptions::invalid_request_exception(format("Materialized views are not supported on counter tables"));
     }
@@ -378,14 +383,14 @@ std::pair<view_ptr, cql3::cql_warnings_vec> create_view_statement::prepare_view(
     }
 
     auto where_clause_text = util::relations_to_where_clause(_where_clause);
-    builder.with_view_info(schema->id(), schema->cf_name(), included.empty(), std::move(where_clause_text));
+    builder.with_view_info(schema, included.empty(), std::move(where_clause_text));
 
     return std::make_pair(view_ptr(builder.build()), std::move(warnings));
 }
 
-future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>>
+future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, utils::chunked_vector<mutation>, cql3::cql_warnings_vec>>
 create_view_statement::prepare_schema_mutations(query_processor& qp, const query_options&, api::timestamp_type ts) const {
-    std::vector<mutation> m;
+    utils::chunked_vector<mutation> m;
     auto [definition, warnings] = prepare_view(qp.db());
     try {
         m = co_await service::prepare_new_view_announcement(qp.proxy(), std::move(definition), ts);

@@ -15,6 +15,7 @@ from contextlib import contextmanager, ExitStack
 from .util import new_type, unique_name, new_test_table, new_test_keyspace, new_function, new_aggregate, \
     new_cql, keyspace_has_tablets, unique_name_prefix, new_session, new_user, new_materialized_view, \
     new_secondary_index
+from .test_service_levels import MAX_USER_SERVICE_LEVELS
 from cassandra.protocol import InvalidRequest, Unauthorized
 from collections.abc import Iterable
 from typing import Any
@@ -25,10 +26,11 @@ DescRowType = Any
 
 DEFAULT_SUPERUSER = "cassandra"
 # The prefix of the create statement returned by `DESC SCHEMA` and corresponding to a CDC log table.
-CDC_LOG_TABLE_DESC_PREFIX =                                                                 \
-                "/* Do NOT execute this statement! It's only for informational purposes.\n" \
-                "   A CDC log table is created automatically when the base is created.\n"   \
-                "\n"
+CDC_LOG_TABLE_DESC_PREFIX =                                                                \
+    "/* Do NOT execute this statement! It's only for informational purposes.\n"            \
+    "   A CDC log table is created automatically when creating the base with CDC\n"        \
+    "   enabled option or creating the vector index on the base table's vector column.\n"  \
+    "\n"
 CDC_LOG_TABLE_DESC_SUFFIX = "\n*/"
 
 def filter_non_default_user(desc_result_iter: Iterable[DescRowType]) -> Iterable[DescRowType]:
@@ -45,8 +47,12 @@ def filter_grant_roles(desc_result_iter: Iterable[DescRowType]) -> Iterable[Desc
 def filter_grant_permissions(desc_result_iter: Iterable[DescRowType]) -> Iterable[DescRowType]:
     return filter(lambda result: result.type == "grant_permission", desc_result_iter)
 
-def filter_service_levels(desc_result_iter: Iterable[DescRowType]) -> Iterable[DescRowType]:
-    return filter(lambda result: result.type == "service_level", desc_result_iter)
+def filter_service_levels(desc_result_iter: Iterable[DescRowType], filter_driver: bool = True) -> Iterable[DescRowType]:
+    # Filter out driver service level, which is created by the system automatically
+    f = lambda result: result.type == "service_level"
+    if filter_driver:
+        f = (lambda result: result.type == "service_level" and result.name != "driver")
+    return filter(f, desc_result_iter)
 
 def filter_attached_service_levels(desc_result_iter: Iterable[DescRowType]) -> Iterable[DescRowType]:
     return filter(lambda result: result.type == "service_level_attachment", desc_result_iter)
@@ -184,10 +190,7 @@ def test_desc_scylla_keyspace(scylla_only, cql, random_seed):
 
 # Test that `DESC TABLE {tbl}` contains appropriate create statement for table
 # This test compares the content of `system_schema.tables` and `system_schema.columns` tables.
-def test_desc_table(cql, test_keyspace, random_seed, has_tablets):
-    if has_tablets:  # issue #18180
-        global counter_table_chance
-        counter_table_chance = 0
+def test_desc_table(cql, test_keyspace, random_seed):
     with new_random_table(cql, test_keyspace) as tbl:
         desc = cql.execute(f"DESC TABLE {tbl}")
         desc_stmt = desc.one().create_statement
@@ -237,10 +240,7 @@ def test_desc_table(cql, test_keyspace, random_seed, has_tablets):
 
 # This test compares the content of `system_schema.tables` and `system_schema.columns` tables
 # when providing tablet options to CREATE TABLE.
-def test_desc_table_with_tablet_options(cql, test_keyspace, random_seed, has_tablets):
-    if has_tablets:  # issue #18180
-        global counter_table_chance
-        counter_table_chance = 0
+def test_desc_table_with_tablet_options(cql, test_keyspace, random_seed):
     tablet_options = {
         'min_tablet_count': '100',
         'min_per_shard_tablet_count': '0.8',   # Verify that a floating point value works for this hint
@@ -263,10 +263,7 @@ def test_desc_table_with_tablet_options(cql, test_keyspace, random_seed, has_tab
 # Test that `DESC TABLE {tbl}` contains appropriate create statement for table
 # This test compares the content of `system_schema.scylla_tables` tables, thus the test
 # is `scylla_only`.
-def test_desc_scylla_table(scylla_only, cql, test_keyspace, random_seed, has_tablets):
-    if has_tablets:  # issue #18180
-        global counter_table_chance
-        counter_table_chance = 0
+def test_desc_scylla_table(scylla_only, cql, test_keyspace, random_seed):
     with new_random_table(cql, test_keyspace) as tbl:
         desc = cql.execute(f"DESC TABLE {tbl}")
         desc_stmt = desc.one().create_statement
@@ -420,10 +417,7 @@ def test_desc_table_internals(cql, test_keyspace):
         assert f"ALTER TABLE {tbl} ADD b int" in desc_internals
 
 # Test that `DESC KEYSPACE {ks}` contains not only keyspace create statement but also for its elements
-def test_desc_keyspace_elements(cql, random_seed, has_tablets):
-    if has_tablets:  # issue #18180
-        global counter_table_chance
-        counter_table_chance = 0
+def test_desc_keyspace_elements(cql, random_seed):
     with new_random_keyspace(cql) as ks:
         with new_random_type(cql, ks) as udt:
             with new_random_table(cql, ks, [udt]) as tbl:
@@ -443,10 +437,7 @@ def test_desc_keyspace_elements(cql, random_seed, has_tablets):
 
 # Test that `DESC SCHEMA` contains all information for user created keyspaces
 # and `DESC FULL SCHEMA` contains also information for system keyspaces
-def test_desc_schema(cql, test_keyspace, random_seed, has_tablets):
-    if has_tablets:  # issue #18180
-        global counter_table_chance
-        counter_table_chance = 0
+def test_desc_schema(cql, test_keyspace, random_seed):
     with new_random_keyspace(cql) as ks:
         with new_random_table(cql, test_keyspace) as tbl1, new_random_table(cql, ks) as tbl2:
             desc = cql.execute("DESC SCHEMA")
@@ -684,10 +675,7 @@ def test_view_desc_in_table_desc(cql, test_keyspace, cassandra_bug):
 # keyspace, table, view, index, UDT, UDF, UDA
 
 # Cassandra compatibility require us to be able generic describe: keyspace, table, view, index.
-def test_generic_desc(cql, random_seed, has_tablets):
-    if has_tablets:  # issue #18180
-        global counter_table_chance
-        counter_table_chance = 0
+def test_generic_desc(cql, random_seed):
     with new_random_keyspace(cql) as ks:
         with new_random_table(cql, ks) as t1, new_test_table(cql, ks, "a int primary key, b int, c int") as tbl:
             cql.execute(f"CREATE INDEX idx ON {tbl}(b)")
@@ -746,9 +734,6 @@ def test_desc_udf_uda(cql, test_keyspace, scylla_only):
 # Example: caching = {'keys': 'ALL', 'rows_per_partition': 'ALL'}
 # Reproduces #14895
 # The test is marked scylla_only because it uses a Scylla-only property "cdc".
-@pytest.mark.parametrize("test_keyspace",
-                         [pytest.param("tablets", marks=[pytest.mark.xfail(reason="issue #16317")]), "vnodes"],
-                         indirect=True)
 def test_whitespaces_in_table_options(cql, test_keyspace, scylla_only):
     regex = "\\{[^}]*[:,][^\\s][^}]*\\}" # looks for any colon or comma without space after it inside a { }
     
@@ -990,15 +975,18 @@ def test_table_options_quoting(cql, test_keyspace):
 
 # We need to hide cdc log tables (more precisely, their CREATE statemtns and/or names)
 # but we are attaching `ALTER TABLE <cdc log table name> WITH <all table's properties>` to description of base table
-@pytest.mark.parametrize("test_keyspace",
-                         [pytest.param("tablets", marks=[pytest.mark.xfail(reason="issue #16317")]), "vnodes"],
-                         indirect=True)
-def test_hide_cdc_table(scylla_only, cql, test_keyspace):
+@pytest.mark.parametrize("cdc_enablement_query",
+                         ["ALTER TABLE {t} WITH cdc = {{'enabled': true}}",
+                          "CREATE INDEX ON {t}(b) USING 'vector_index'"],
+                         ids=["alter", "create_index"])
+def test_hide_cdc_table(scylla_only, cql, test_keyspace, cdc_enablement_query):
     cdc_table_suffix = "_scylla_cdc_log"
-    
-    with new_test_table(cql, test_keyspace, "a int primary key, b int", "WITH cdc = {'enabled': true}") as t:
+    with new_test_table(cql, test_keyspace, "a int primary key, b vector<float, 3>") as t:
         t_name = t.split('.')[1]
         cdc_log_name = t_name + cdc_table_suffix
+
+        # Enable CDC log
+        cql.execute(cdc_enablement_query.format(t=t))
 
         # Check if the log table exists
         cdc_log_table_entry = cql.execute(f"SELECT * FROM system_schema.tables WHERE keyspace_name='{test_keyspace}' AND table_name='{cdc_log_name}'").all()
@@ -1019,16 +1007,16 @@ def test_hide_cdc_table(scylla_only, cql, test_keyspace):
         for row in desc_schema:
             if row.name == cdc_log_name:
                 assert f"ALTER TABLE {test_keyspace}.{cdc_log_name} WITH" in row.create_statement
-        
+
         # Check base table description contains ALTER TABLE statement for cdc log table
         desc_base_table = cql.execute(f"DESC TABLE {t}").all()
-        assert f"ALTER TABLE {test_keyspace}.{cdc_log_name} WITH" in desc_base_table[1].create_statement
-        
+        assert any(f"ALTER TABLE {test_keyspace}.{cdc_log_name} WITH" in row.create_statement for row in desc_base_table)
+
         # Drop current cdc base table and try to recreate it with describe output
         cql.execute(f"DROP TABLE {t}")
         for row in desc_keyspace[1:]: # [1:] because we want to skip first row (keyspace's CREATE STATEMENT)
             cql.execute(row.create_statement)
-        
+
         # Check if base and log tables were recreated
         ks_tables = cql.execute(f"SELECT * FROM system_schema.tables WHERE keyspace_name='{test_keyspace}'").all()
         assert len(ks_tables) == 2
@@ -1037,13 +1025,17 @@ def test_hide_cdc_table(scylla_only, cql, test_keyspace):
 
 # Verify that the format of the result of `DESC TABLE` targeting a CDC log table
 # has the expected format.
-@pytest.mark.parametrize("test_keyspace",
-                         [pytest.param("tablets", marks=[pytest.mark.xfail(reason="issue #16317")]), "vnodes"],
-                         indirect=True)
-def test_describe_cdc_log_table_format(scylla_only, cql, test_keyspace):
-    with new_test_table(cql, test_keyspace, "p int PRIMARY KEY", "WITH cdc = {'enabled': true}") as table:
+@pytest.mark.parametrize("cdc_enablement_query",
+                         ["ALTER TABLE {t} WITH cdc = {{'enabled': true}}",
+                          "CREATE INDEX ON {t}(v) USING 'vector_index'"],
+                         ids=["alter", "create_index"])
+def test_describe_cdc_log_table_format(scylla_only, cql, test_keyspace, cdc_enablement_query):
+    with new_test_table(cql, test_keyspace, "p int PRIMARY KEY, v vector<float, 3>") as table:
         log_table = f"{table}_scylla_cdc_log"
         _, log_table_name = log_table.split(".")
+
+        # Enable CDC log
+        cql.execute(cdc_enablement_query.format(t=table))
 
         [row] = cql.execute(f"DESC TABLE {log_table}")
 
@@ -1061,18 +1053,22 @@ def test_describe_cdc_log_table_format(scylla_only, cql, test_keyspace):
 
 # Verify that the create statement returned by `DESC TABLE` targeting a CDC log table
 # is correct and as expected.
-@pytest.mark.parametrize("test_keyspace",
-                         [pytest.param("tablets", marks=[pytest.mark.xfail(reason="issue #16317")]), "vnodes"],
-                         indirect=True)
-def test_describe_cdc_log_table_create_statement(scylla_only, cql, test_keyspace):
+@pytest.mark.parametrize("cdc_enablement_query",
+                         ["ALTER TABLE {t} WITH cdc = {{'enabled': true}}",
+                          "CREATE INDEX ON {t}(v) USING 'vector_index'"],
+                         ids=["alter", "create_index"])
+def test_describe_cdc_log_table_create_statement(scylla_only, cql, test_keyspace, cdc_enablement_query):
     def format_create_statement(stmt: str) -> str:
         stmt = " ".join(stmt.split("\n"))
         stmt = " ".join(stmt.split())
         stmt = stmt.strip()
         return stmt
 
-    with new_test_table(cql, test_keyspace, "p int PRIMARY KEY", "WITH cdc = {'enabled': true}") as table:
+    with new_test_table(cql, test_keyspace, "p int PRIMARY KEY, v vector<float, 3>") as table:
         log_table = f"{table}_scylla_cdc_log"
+
+        # Enable CDC log
+        cql.execute(cdc_enablement_query.format(t=table))
 
         [row] = cql.execute(f"DESC TABLE {log_table}")
         create_statement = row.create_statement
@@ -1090,10 +1086,12 @@ def test_describe_cdc_log_table_create_statement(scylla_only, cql, test_keyspace
                 "cdc$stream_id" blob,
                 "cdc$time" timeuuid,
                 "cdc$batch_seq_no" int,
+                "cdc$deleted_v" boolean,
                 "cdc$end_of_batch" boolean,
                 "cdc$operation" tinyint,
                 "cdc$ttl" bigint,
                 p int,
+                v vector<float, 3>,
                 PRIMARY KEY ("cdc$stream_id", "cdc$time", "cdc$batch_seq_no")
             ) WITH CLUSTERING ORDER BY ("cdc$time" ASC, "cdc$batch_seq_no" ASC)
                 AND bloom_filter_fp_chance = 0.01
@@ -1107,7 +1105,8 @@ def test_describe_cdc_log_table_create_statement(scylla_only, cql, test_keyspace
                 AND max_index_interval = 2048
                 AND memtable_flush_period_in_ms = 0
                 AND min_index_interval = 128
-                AND speculative_retry = '99.0PERCENTILE';
+                AND speculative_retry = '99.0PERCENTILE'
+                AND tombstone_gc = {{'mode': 'timeout', 'propagation_delay_in_seconds': '3600'}};
             """
         expected = format_create_statement(expected)
 
@@ -1115,13 +1114,17 @@ def test_describe_cdc_log_table_create_statement(scylla_only, cql, test_keyspace
 
 # Verify that the options of a CDC log table specified by the create statement
 # returned by `DESC TABLE` reflect the reality and are present.
-@pytest.mark.parametrize("test_keyspace",
-                         [pytest.param("tablets", marks=[pytest.mark.xfail(reason="issue #16317")]), "vnodes"],
-                         indirect=True)
-def test_describe_cdc_log_table_opts(scylla_only, cql, test_keyspace):
+@pytest.mark.parametrize("cdc_enablement_query",
+                         ["ALTER TABLE {t} WITH cdc = {{'enabled': true}}",
+                          "CREATE INDEX ON {t}(v) USING 'vector_index'"],
+                         ids=["alter", "create_index"])
+def test_describe_cdc_log_table_opts(scylla_only, cql, test_keyspace, cdc_enablement_query):
     def test_config(altered_cdc_log_table_opt):
-        with new_test_table(cql, test_keyspace, "p int PRIMARY KEY", "WITH cdc = {'enabled': true}") as table:
+        with new_test_table(cql, test_keyspace, "p int PRIMARY KEY, v vector<float, 3>") as table:
             log_table = f"{table}_scylla_cdc_log"
+
+            # Enable CDC log
+            cql.execute(cdc_enablement_query.format(t=table))
 
             cql.execute(f"ALTER TABLE {log_table} WITH {altered_cdc_log_table_opt}")
 
@@ -1167,6 +1170,66 @@ def test_describe_cdc_log_table_opts(scylla_only, cql, test_keyspace):
     test_config("speculative_retry = '17.0PERCENTILE'")
     test_config("tombstone_gc = {'mode': 'immediate', 'propagation_delay_in_seconds': '17'}")
 
+# Verify that describing the underlying materialized view of a secondary index
+# produces a `CREATE MATERIALIZED VIEW` statement, and that the statement
+# is commented out with a proper explanation.
+#
+# Reproducer of scylladb/scylladb#24610.
+def test_describe_underlying_mv_of_index(scylla_only, cql, test_keyspace):
+    index_name = unique_name()
+    mv_name = f"{index_name}_index"
+
+    with new_test_table(cql, test_keyspace, "p int PRIMARY KEY, v int") as table:
+        with new_secondary_index(cql, table, "v", index_name):
+            result = cql.execute(f"DESCRIBE MATERIALIZED VIEW {test_keyspace}.{mv_name}").one()
+
+            # Sanity checks.
+            assert result.keyspace_name == test_keyspace
+            assert result.type == "view"
+            assert result.name == mv_name
+
+            assert hasattr(result, "create_statement")
+            assert f"CREATE MATERIALIZED VIEW {test_keyspace}.{mv_name}" in result.create_statement
+
+            prefix = "/* Do NOT execute this statement! It's only for informational purposes.\n" \
+                     "   This materialized view is the underlying materialized view of a secondary\n" \
+                     "   index. It can be restored via restoring the index.\n" \
+                     "\n"
+            suffix = "*/"
+
+            assert result.create_statement.startswith(prefix)
+            assert result.create_statement.endswith(suffix)
+
+# Verify that describing the underlying materialized view of an unnamed secondary index
+# produces a `CREATE MATERIALIZED VIEW` statement, and that the statement
+# is commented out with a proper explanation.
+#
+# Reproducer of scylladb/scylladb#24610.
+def test_describe_underlying_mv_of_unnamed_index(scylla_only, cql, test_keyspace):
+    with new_test_table(cql, test_keyspace, "p int PRIMARY KEY, v int") as table:
+        _, table_name = table.split(".")
+        index_name = f"{table_name}_v_idx"
+        mv_name = f"{index_name}_index"
+
+        cql.execute(f"CREATE INDEX ON {table}(v)")
+        result = cql.execute(f"DESCRIBE MATERIALIZED VIEW {test_keyspace}.{mv_name}").one()
+
+        # Sanity checks.
+        assert result.keyspace_name == test_keyspace
+        assert result.type == "view"
+        assert result.name == mv_name
+
+        assert hasattr(result, "create_statement")
+        assert f"CREATE MATERIALIZED VIEW {test_keyspace}.{mv_name}" in result.create_statement
+
+        prefix = "/* Do NOT execute this statement! It's only for informational purposes.\n" \
+                 "   This materialized view is the underlying materialized view of a secondary\n" \
+                 "   index. It can be restored via restoring the index.\n" \
+                 "\n"
+        suffix = "*/"
+
+        assert result.create_statement.startswith(prefix)
+        assert result.create_statement.endswith(suffix)
 
 ### =========================== UTILITY FUNCTIONS =============================
 
@@ -1533,6 +1596,7 @@ class AuthSLContext:
     def __enter__(self):
         if self.ks:
             self.cql.execute(f"CREATE KEYSPACE {self.ks} WITH REPLICATION = {{ 'class': 'SimpleStrategy', 'replication_factor': 1 }}")
+        self.driver_sl = self.cql.execute("LIST SERVICE LEVEL driver").one()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
@@ -1550,6 +1614,9 @@ class AuthSLContext:
             service_levels = [record.service_level for record in service_levels_iter]
             for sl in service_levels:
                 self.cql.execute(f"DROP SERVICE LEVEL {make_identifier(sl, quotation_mark='"')}")
+            # Restore driver service level if it was removed by the test
+            self.cql.execute(f"CREATE SERVICE LEVEL {self.driver_sl.service_level} WITH WORKLOAD_TYPE = '{self.driver_sl.workload_type}' AND SHARES = {self.driver_sl.shares}")
+
 
 class ServiceLevel:
     default_shares_value = 1000
@@ -1619,8 +1686,8 @@ def test_create_role_with_hashed_password_authorization(cql):
         r3 = "bob"
 
         for r in [r1, r2]:
-            cql.execute(f"CREATE ROLE {r} WITH PASSWORD = '{r}' AND LOGIN = true")
-        cql.execute(f"CREATE ROLE {r3} WITH PASSWORD = '{r3}' AND SUPERUSER = true AND LOGIN = true")
+            cql.execute(f"CREATE ROLE {r} WITH LOGIN = true AND PASSWORD = '{r}'")
+        cql.execute(f"CREATE ROLE {r3} WITH LOGIN = true AND PASSWORD = '{r3}' AND SUPERUSER = true")
 
         # This also grants access to system tables.
         cql.execute(f"GRANT ALL ON ALL KEYSPACES TO {r2}")
@@ -1633,7 +1700,9 @@ def test_create_role_with_hashed_password_authorization(cql):
 
 ###
 
-def test_desc_authorization(cql):
+# Marked as `scylla_only` because we verify `DESCRIBE SCHEMA WITH INTERNALS AND PASSWORDS`,
+# which is not present on Cassandra.
+def test_desc_authorization(cql, scylla_only):
     """
     Verify that Scylla rejects performing `DESC SCHEMA WITH INTERNALS AND PASSWORDS` if the user
     sending the request is not a superuser, even if they have all permissions to relevant system tables.
@@ -1656,7 +1725,9 @@ def test_desc_authorization(cql):
             try_describe_with_passwords(r1)
             try_describe_with_passwords(r2)
 
-def test_desc_roles_format(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_roles_format(cql, scylla_only):
     """
     Verify that the format of the output of `DESC SCHEMA WITH INTERNALS` corresponding to
     creating roles is of the expected form.
@@ -1677,7 +1748,9 @@ def test_desc_roles_format(cql):
         assert result.name == role_name
         assert result.create_statement == stmt
 
-def test_desc_roles_quotation_marks(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_roles_quotation_marks(cql, scylla_only):
     """
     Verify that statements corresponding to creating roles correctly format quotation marks.
     """
@@ -1717,7 +1790,9 @@ def test_desc_roles_quotation_marks(cql):
 
         assert set(desc_iter) == expected_result
 
-def test_desc_roles_uppercase(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_roles_uppercase(cql, scylla_only):
     """
     Verify that statements corresponding to creating roles correctly format uppercase characters,
     i.e. identifiers like that should be wrapped in quotation marks.
@@ -1740,7 +1815,9 @@ def test_desc_roles_uppercase(cql):
 
         assert list(desc_iter) == [f"CREATE ROLE {role} WITH LOGIN = false AND SUPERUSER = false;"]
 
-def test_desc_roles_unicode(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_roles_unicode(cql, scylla_only):
     """
     Verify that statements to creating roles can contain unicode characters.
     """
@@ -1762,7 +1839,9 @@ def test_desc_roles_unicode(cql):
 
         assert list(desc_iter) == [f"CREATE ROLE {role} WITH LOGIN = false AND SUPERUSER = false;"]
 
-def test_desc_roles(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_roles(cql, scylla_only):
     """
     Verify that the output of `DESC SCHEMA WITH INTERNALS` corresponding to creating roles
     is as expected for various different cases.
@@ -1804,7 +1883,9 @@ def test_desc_roles(cql):
 
         assert create_role_stmts == desc_create_role_stmts
 
-def test_desc_roles_with_passwords(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_roles_with_passwords(cql, scylla_only):
     """
     Verify that the output of `DESC SCHEMA WITH INTERNALS AND PASSWORDS` corresponding to creating roles
     is as expected for various different cases.
@@ -1833,7 +1914,9 @@ def test_desc_roles_with_passwords(cql):
 
         assert set(stmts) == set(desc_iter)
 
-def test_desc_role_grants_format(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_role_grants_format(cql, scylla_only):
     """
     Verify that the format of the output of `DESC SCHEMA WITH INTERNALS` corresponding to
     granting roles is of the expected form.
@@ -1858,7 +1941,9 @@ def test_desc_role_grants_format(cql):
         assert result.name == r1
         assert result.create_statement == stmt
 
-def test_desc_role_grants_quotation_marks(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_role_grants_quotation_marks(cql, scylla_only):
     """
     Verify that statements corresponding to granting roles correctly format quotation marks.
     """
@@ -1889,7 +1974,9 @@ def test_desc_role_grants_quotation_marks(cql):
         expected_result = f"GRANT {andrew_double_quote} TO {jane_double_quote};"
         assert [expected_result] == list(desc_iter)
 
-def test_desc_role_grants_uppercase(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_role_grants_uppercase(cql, scylla_only):
     """
     Verify that statements corresponding to granting roles correctly format uppercase characters,
     i.e. identifiers like that should be wrapped in quotation marks.
@@ -1915,7 +2002,9 @@ def test_desc_role_grants_uppercase(cql):
 
         assert list(desc_iter) == [f"GRANT {r1} TO {r2};"]
 
-def test_desc_role_grants_unicode(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_role_grants_unicode(cql, scylla_only):
     """
     Verify that statements corresponding to granting roles correctly format unicode characters,
     i.e. identifiers like that should be wrapped in quotation marks.
@@ -1941,7 +2030,9 @@ def test_desc_role_grants_unicode(cql):
 
         assert list(desc_iter) == [f"GRANT {r1} TO {r2};"]
 
-def test_desc_role_grants(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_role_grants(cql, scylla_only):
     """
     Verify that the output of `DESC SCHEMA WITH INTERNALS` corresponding to granting roles
     is as expected for various different cases.
@@ -1974,7 +2065,9 @@ def test_desc_role_grants(cql):
 
         assert set(expected_grants) == set(desc_grants)
 
-def test_desc_grant_permission_format(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_grant_permission_format(cql, scylla_only):
     """
     Verify that the format of the output of `DESC SCHEMA WITH INTERNALS` corresponding to
     granting permissions is of the expected form.
@@ -2000,7 +2093,9 @@ def test_desc_grant_permission_format(cql):
         assert result.name == role_name
         assert result.create_statement == stmt
 
-def test_desc_grant_permission_quotation_marks(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_grant_permission_quotation_marks(cql, scylla_only):
     """
     Verify that statements corresponding to granting permissions correctly format quotation marks.
     """
@@ -2037,7 +2132,9 @@ def test_desc_grant_permission_quotation_marks(cql):
 
         assert set(desc_iter) == expected_result
 
-def test_desc_auth_different_permissions(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_auth_different_permissions(cql, scylla_only):
     """
     Verify that the output of `DESC SCHEMA WITH INTERNALS` corresponding to granting permissions
     is as expected for various different cases. Here we test different kinds of permissions specifically.
@@ -2069,7 +2166,9 @@ def test_desc_auth_different_permissions(cql):
 
         assert set(grants) == set(desc_iter)
 
-def test_desc_data_permissions_uppercase(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_data_permissions_uppercase(cql, scylla_only):
     """
     Verify that statements corresponding to granting data permissions correctly format uppercase characters,
     i.e. identifiers like that should be wrapped in quotation marks.
@@ -2109,7 +2208,9 @@ def test_desc_data_permissions_uppercase(cql):
         desc_iter = extract_create_statements(desc_elements)
         assert set(desc_iter) == stmts
 
-def test_desc_data_permissions_unicode(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_data_permissions_unicode(cql, scylla_only):
     """
     Verify that statements corresponding to granting permissions to data resources correctly format
     unicode characters, i.e. identifiers like that should be wrapped in quotation marks.
@@ -2148,7 +2249,9 @@ def test_desc_data_permissions_unicode(cql):
         desc_iter = extract_create_statements(desc_elements)
         assert set(desc_iter) == stmts
 
-def test_desc_data_permissions(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_data_permissions(cql, scylla_only):
     """
     Verify that the output of `DESC SCHEMA WITH INTERNALS` corresponding to granting permissions
     is as expected for various different cases. Here we test data resources specifically.
@@ -2182,7 +2285,9 @@ def test_desc_data_permissions(cql):
 
         assert set(stmts) == set(desc_iter)
 
-def test_desc_role_permissions_uppercase(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_role_permissions_uppercase(cql, scylla_only):
     """
     Verify that statements corresponding to granting role permissions correctly format uppercase characters,
     i.e. identifiers like that should be wrapped in quotation marks.
@@ -2216,7 +2321,9 @@ def test_desc_role_permissions_uppercase(cql):
         desc_iter = extract_create_statements(desc_elements)
         assert set(desc_iter) == stmts
 
-def test_desc_role_permissions_unicode(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_role_permissions_unicode(cql, scylla_only):
     """
     Verify that statements corresponding to granting permissions to role resources correctly format
     unicode characters, i.e. identifiers like that should be wrapped in quotation marks.
@@ -2250,7 +2357,9 @@ def test_desc_role_permissions_unicode(cql):
         desc_iter = extract_create_statements(desc_elements)
         assert set(desc_iter) == stmts
 
-def test_desc_role_permissions(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_role_permissions(cql, scylla_only):
     """
     Verify that the output of `DESC SCHEMA WITH INTERNALS` corresponding to granting permissions
     is as expected for various different cases. Here we test role permissions specifically.
@@ -2277,7 +2386,9 @@ def test_desc_role_permissions(cql):
 
         assert set(stmts) == set(desc_iter)
 
-def test_desc_udf_permissions_uppercase(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_udf_permissions_uppercase(cql, scylla_only):
     """
     Verify that statements corresponding to granting permissions to UDFs correctly format uppercase characters,
     i.e. identifiers like that should be wrapped in quotation marks.
@@ -2323,7 +2434,9 @@ def test_desc_udf_permissions_uppercase(cql):
         desc_iter = extract_create_statements(desc_elements)
         assert set(desc_iter) == stmts
 
-def test_desc_udf_permissions_unicode(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_udf_permissions_unicode(cql, scylla_only):
     """
     Verify that statements corresponding to granting permissions to UDFs correctly format
     unicode characters, i.e. identifiers like that should be wrapped in quotation marks.
@@ -2368,7 +2481,9 @@ def test_desc_udf_permissions_unicode(cql):
         desc_iter = extract_create_statements(desc_elements)
         assert set(desc_iter) == stmts
 
-def test_desc_udf_permissions(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about auth. That's not the case in Cassandra.
+def test_desc_udf_permissions(cql, scylla_only):
     """
     Verify that the output of `DESC SCHEMA WITH INTERNALS` corresponding to granting permissions
     is as expected for various different cases. Here we test UDFs specifically.
@@ -2413,7 +2528,9 @@ def test_desc_udf_permissions(cql):
         desc_iter = extract_create_statements(desc_elements)
         assert set(desc_iter) == stmts
 
-def test_desc_service_levels_format(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about service levels. That's not the case in Cassandra.
+def test_desc_service_levels_format(cql, scylla_only):
     """
     Verify that the format of the output of `DESC SCHEMA WITH INTERNALS` corresponding to
     creating service levels is of the expected form.
@@ -2433,7 +2550,9 @@ def test_desc_service_levels_format(cql):
         assert result.name == sl.name
         assert result.create_statement == sl.get_create_stmt(replace_default_shares=True)
 
-def test_desc_service_levels_quotation_marks(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about service levels. That's not the case in Cassandra.
+def test_desc_service_levels_quotation_marks(cql, scylla_only):
     """
     Verify that statements corresponding to creating service levels correctly format quotation marks.
     """
@@ -2466,7 +2585,9 @@ def test_desc_service_levels_quotation_marks(cql):
 
         assert set(desc_iter) == expected_result
 
-def test_desc_service_levels_uppercase(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about service levels. That's not the case in Cassandra.
+def test_desc_service_levels_uppercase(cql, scylla_only):
     """
     Verify that statements corresponding to creating service levels correctly format uppercase characters,
     i.e. identifiers like that should be wrapped in quotation marks.
@@ -2487,7 +2608,9 @@ def test_desc_service_levels_uppercase(cql):
         desc_iter = extract_create_statements(desc_elements)
         assert list(desc_iter) == [sl.get_create_stmt(replace_default_shares=True)]
 
-def test_desc_service_levels_unicode(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about service levels. That's not the case in Cassandra.
+def test_desc_service_levels_unicode(cql, scylla_only):
     """
     Verify that statements corresponding to creating service levels correctly format
     unicode characters, i.e. identifiers like that should be wrapped in quotation marks.
@@ -2508,7 +2631,9 @@ def test_desc_service_levels_unicode(cql):
         desc_iter = extract_create_statements(desc_elements)
         assert list(desc_iter) == [sl.get_create_stmt(replace_default_shares=True)]
 
-def test_desc_auth_service_levels(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about service levels. That's not the case in Cassandra.
+def test_desc_auth_service_levels(cql, scylla_only):
     """
     Verify that the output of `DESC SCHEMA WITH INTERNALS` corresponding to creating service levels
     is as expected for various different cases.
@@ -2541,7 +2666,9 @@ def test_desc_auth_service_levels(cql):
 
         assert sl_create_stmts == set(desc_iter)
 
-def test_desc_service_levels_default_shares(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about service levels. That's not the case in Cassandra.
+def test_desc_service_levels_default_shares(cql, scylla_only):
     """
     Verify that DESCRIBE handles the default value of shares correctly:
     (a) when a service level is created without specifying the number of shares,
@@ -2568,7 +2695,9 @@ def test_desc_service_levels_default_shares(cql):
         stmts[0] = f"CREATE SERVICE LEVEL sl_default WITH SHARES = {default_share_count};"
         assert stmts == list(desc_iter)
 
-def test_desc_attach_service_level_format(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about service levels. That's not the case in Cassandra.
+def test_desc_attach_service_level_format(cql, scylla_only):
     """
     Verify that the format of the output of `DESC SCHEMA WITH INTERNALS` corresponding to
     attaching service levels is of the expected form.
@@ -2594,7 +2723,9 @@ def test_desc_attach_service_level_format(cql):
         assert result.name == sl_name
         assert result.create_statement == stmt
 
-def test_desc_auth_attach_service_levels_quotation_marks(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about service levels. That's not the case in Cassandra.
+def test_desc_auth_attach_service_levels_quotation_marks(cql, scylla_only):
     """
     Verify that statements corresponding to attaching service levels correctly format quotation marks.
     """
@@ -2640,7 +2771,9 @@ def test_desc_auth_attach_service_levels_quotation_marks(cql):
 
         assert set(desc_iter) == expected_result
 
-def test_desc_auth_attach_service_levels_uppercase(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about service levels. That's not the case in Cassandra.
+def test_desc_auth_attach_service_levels_uppercase(cql, scylla_only):
     """
     Verify that statements corresponding to attaching service levels correctly format uppercase characters,
     i.e. identifiers like that should be wrapped in quotation marks.
@@ -2665,7 +2798,9 @@ def test_desc_auth_attach_service_levels_uppercase(cql):
         desc_iter = extract_create_statements(desc_elements)
         assert list(desc_iter) == [f"ATTACH SERVICE LEVEL {sl} TO {role};"]
 
-def test_desc_attach_service_levels_unicode(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about service levels. That's not the case in Cassandra.
+def test_desc_attach_service_levels_unicode(cql, scylla_only):
     """
     Verify that statements corresponding to attaching service levels correctly format
     unicode characters, i.e. identifiers like that should be wrapped in quotation marks.
@@ -2690,7 +2825,9 @@ def test_desc_attach_service_levels_unicode(cql):
         desc_iter = extract_create_statements(desc_elements)
         assert list(desc_iter) == [f"ATTACH SERVICE LEVEL {sl} TO {role};"]
 
-def test_desc_auth_attach_service_levels(cql):
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about service levels. That's not the case in Cassandra.
+def test_desc_auth_attach_service_levels(cql, scylla_only):
     """
     Verify that the output of `DESC SCHEMA WITH INTERNALS` corresponding to attaching service levels
     is as expected for various different cases.
@@ -2722,6 +2859,87 @@ def test_desc_auth_attach_service_levels(cql):
 
         assert set(sl_stmts) == set(desc_iter)
 
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about service levels. That's not the case in Cassandra.
+def test_desc_driver_service_level(cql, scylla_only):
+    """
+    Driver service level is a special service level that is created automatically by
+    the system. Therefore, it requires special handling in DESC SCHEMA WITH INTERNALS -
+    if `sl:driver` exists, instead of just emiting `CREATE SERVICE LEVEL ...` we emit two
+    lines:
+      1. CREATE SERVICE LEVEL IF NOT EXISTS driver ...
+      2. ALTER SERVICE LEVEL driver ...
+
+    The reasons for this are:
+     1. We need to ensure CREATE SERVICE LEVEL doesn't fail if the service level already exists
+        (i.e. IF NOT EXISTS in CREATE) when restoring a backup from `DESC SCHEMA WITH INTERNALS`.
+     2. `ALTER SERVICE...` is needed to fully restore the configuration of `sl:driver`
+    """
+
+    with AuthSLContext(cql):
+        cql.execute(f"ALTER SERVICE LEVEL driver WITH SHARES=123")
+        cql.execute(f"ALTER SERVICE LEVEL driver WITH TIMEOUT=321s")
+
+        desc_iter = cql.execute("DESC SCHEMA WITH INTERNALS")
+        desc_iter = filter_service_levels(desc_iter, filter_driver=False)
+
+        [create, alter] = list(desc_iter)
+
+        assert create.keyspace_name == None
+        assert create.type == "service_level"
+        assert create.name == "driver"
+        assert create.create_statement == "CREATE SERVICE LEVEL IF NOT EXISTS driver WITH TIMEOUT = 321000ms AND WORKLOAD_TYPE = 'batch' AND SHARES = 123;"
+
+        assert alter.keyspace_name == None
+        assert alter.type == "service_level"
+        assert alter.name == "driver"
+        assert alter.create_statement == "ALTER SERVICE LEVEL driver WITH TIMEOUT = 321000ms AND WORKLOAD_TYPE = 'batch' AND SHARES = 123;"
+
+# Marked as `scylla_only` because we verify that the output of `DESCRIBE SCHEMA`
+# contains information about service levels. That's not the case in Cassandra.
+def test_desc_removed_driver_service_level(cql, scylla_only):
+    """
+    Driver service level is a special service level that is created automatically by
+    the system. Therefore, it requires special handling in DESC SCHEMA WITH INTERNALS -
+    if `sl:driver` doesn't exist we emit `DROP SERVICE LEVEL IF EXISTS ...` because that means
+    someone intentionally removed it.
+    """
+    with AuthSLContext(cql):
+        cql.execute("DROP SERVICE LEVEL driver")
+        desc_iter = cql.execute("DESC SCHEMA WITH INTERNALS")
+        desc_iter = filter_service_levels(desc_iter, filter_driver=False)
+
+        [drop] = list(desc_iter)
+
+        assert drop.keyspace_name == None
+        assert drop.type == "service_level"
+        assert drop.name == "driver"
+        assert drop.create_statement == "DROP SERVICE LEVEL IF EXISTS driver;"
+
+        # We need to ensure `DESC SCHEMA WITH INTERNALS` emits the `DROP ... driver` before
+        # any other service level is listed. Otherwise, restoring service level from the output
+        # of `DESC SCHEMA WITH INTERNALS` can fail, if there aren't sufficient slots to create
+        # all service levels. We test it with the following steps:
+        # 1. Create the maximal number of user scheduling groups + one to use the slot after `sl:driver`
+        # 2. Call `DESC SCHEMA WITH INTERNALS`, rembember the output
+        # 3. Drop all service levels
+        # 4. Execute statements from `DESC SCHEMA ...` output
+        for i in range(MAX_USER_SERVICE_LEVELS + 1): # sl:driver removed, so we can use an additional slot
+            # "a_sl" name to make sure "driver" service level will be listed in DESC SCHEMA even
+            # before service levels with lexicographically smaller name
+            cql.execute(f"CREATE SERVICE LEVEL a_sl{i}")
+
+        desc_iter = cql.execute("DESC SCHEMA WITH INTERNALS")
+        desc_iter = filter_service_levels(desc_iter, filter_driver=False)
+
+        service_levels_iter = cql.execute("LIST ALL SERVICE LEVELS")
+        service_levels = [record.service_level for record in service_levels_iter]
+        for sl in service_levels:
+            cql.execute(f"DROP SERVICE LEVEL {make_identifier(sl, quotation_mark='"')}")
+        cql.execute("CREATE SERVICE LEVEL driver WITH shares=200 AND workload_type='batch'")
+        for recreate_statement in desc_iter:
+            cql.execute(recreate_statement.create_statement)
+
 def test_desc_restore(cql):
     """
     Verify that restoring the schema, auth and service levels works correctly. We create entities
@@ -2738,6 +2956,7 @@ def test_desc_restore(cql):
         cql.execute(f"CREATE TYPE {ks}.my_type (value int)")
         cql.execute(f"""CREATE TABLE {ks}.some_other_table (c1 frozen<my_type>, c2 double, c3 int, c4 set<int>,
                         PRIMARY KEY ((c1, c2), c3)) WITH comment = 'some comment'""")
+        cql.execute(f"CREATE TABLE {ks}.vector_table (pk int PRIMARY KEY, v vector<float, 3>)")
 
         cql.execute(f"""CREATE MATERIALIZED VIEW {ks}.mv AS
                             SELECT pk FROM {ks}.my_table
@@ -2747,14 +2966,28 @@ def test_desc_restore(cql):
 
         cql.execute(f"CREATE INDEX myindex ON {ks}.some_other_table (c1)")
 
-        cql.execute(f"""CREATE FUNCTION {ks}.my_udf(val1 int, val2 int)
-                        RETURNS NULL ON NULL INPUT
-                        RETURNS int
-                        LANGUAGE lua
-                        AS $$ return val1 + val2 $$""")
+        # Scylla doesn't support `sai`, while Cassandra doesn't support `vector_index`.
+        vec_class = "vector_index" if is_scylla(cql) else "sai"
+        cql.execute(f"CREATE INDEX custom_index ON {ks}.vector_table (v) USING '{vec_class}'")
+
+        # Scylla supports UDFs with Lua. Cassandra supports UDFs with Java.
+        if is_scylla(cql):
+            cql.execute(f"""CREATE FUNCTION {ks}.my_udf(val1 int, val2 int)
+                            RETURNS NULL ON NULL INPUT
+                            RETURNS int
+                            LANGUAGE lua
+                            AS $$ return val1 + val2 $$""")
+        else:
+            cql.execute(f"""CREATE FUNCTION {ks}.my_udf(val1 int, val2 int)
+                            RETURNS NULL ON NULL INPUT
+                            RETURNS int
+                            LANGUAGE java
+                            AS $$ return val1 + val2; $$""")
+
         cql.execute(f"""CREATE AGGREGATE {ks}.my_aggregate(int)
-                        SFUNC my_udf
-                        STYPE int""")
+                            SFUNC my_udf
+                            STYPE int
+                            INITCOND 0""")
 
         [r1, r2, r3] = ["jack", "'b0b @nd d0b!'", "jane"]
         cql.execute(f"CREATE ROLE {r1} WITH PASSWORD = 'pass1'")
@@ -2766,19 +2999,25 @@ def test_desc_restore(cql):
 
         cql.execute(f"GRANT ALL ON ALL KEYSPACES TO {r2}")
         cql.execute(f"GRANT SELECT ON KEYSPACE {ks} TO {r3}")
-        cql.execute(f"GRANT MODIFY ON TABLE system.roles TO {r1}")
+        cql.execute(f"GRANT MODIFY ON TABLE {ks}.my_table TO {r1}")
         cql.execute(f"GRANT AUTHORIZE ON ALL ROLES TO {r1}")
         cql.execute(f"GRANT DESCRIBE ON ALL ROLES TO {r1}")
 
-        [sl1, sl2] = ["my_service_level", "'s3rv!c3 l3v3l !!!'"]
-        cql.execute(f"CREATE SERVICE LEVEL {sl1} WITH TIMEOUT = 10ms AND WORKLOAD_TYPE = 'batch'")
-        cql.execute(f"CREATE SERVICE LEVEL {sl2} WITH TIMEOUT = 100s")
+        # Only Scylla supports service levels.
+        if is_scylla(cql):
+            [sl1, sl2] = ["my_service_level", "'s3rv!c3 l3v3l !!!'"]
+            cql.execute(f"CREATE SERVICE LEVEL {sl1} WITH TIMEOUT = 10ms AND WORKLOAD_TYPE = 'batch'")
+            cql.execute(f"CREATE SERVICE LEVEL {sl2} WITH TIMEOUT = 100s")
 
-        cql.execute(f"ATTACH SERVICE LEVEL {sl1} TO {r1}")
-        cql.execute(f"ATTACH SERVICE LEVEL {sl1} TO {r2}")
-        cql.execute(f"ATTACH SERVICE LEVEL {sl2} TO {r3}")
+            cql.execute(f"ATTACH SERVICE LEVEL {sl1} TO {r1}")
+            cql.execute(f"ATTACH SERVICE LEVEL {sl1} TO {r2}")
+            cql.execute(f"ATTACH SERVICE LEVEL {sl2} TO {r3}")
 
-        restore_stmts = list(cql.execute("DESC SCHEMA WITH INTERNALS AND PASSWORDS"))
+            # Only Scylla supports the `... WITH PASSWORDS` form of `DESC SCHEMA`.
+        if is_scylla(cql):
+            restore_stmts = list(cql.execute("DESC SCHEMA WITH INTERNALS AND PASSWORDS"))
+        else:
+            restore_stmts = list(cql.execute("DESC SCHEMA WITH INTERNALS"))
 
     def remove_other_keyspaces(rows: Iterable[DescRowType]) -> Iterable[DescRowType]:
         return filter(lambda row: row.keyspace_name == ks or row.keyspace_name == None, rows)
@@ -2792,7 +3031,11 @@ def test_desc_restore(cql):
             for stmt in extract_create_statements(restore_stmts):
                 cql.execute(stmt)
 
-            res = list(cql.execute("DESC SCHEMA WITH INTERNALS AND PASSWORDS"))
+            # Only Scylla supports the `... WITH PASSWORDS` form of `DESC SCHEMA`.
+            if is_scylla(cql):
+                res = list(cql.execute("DESC SCHEMA WITH INTERNALS AND PASSWORDS"))
+            else:
+                res = list(cql.execute("DESC SCHEMA WITH INTERNALS"))
 
             # Other test cases might've created keyspaces that would be included in the result
             # of `DESC SCHEMA`, so we need to filter them out.

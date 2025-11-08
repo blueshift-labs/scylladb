@@ -404,6 +404,21 @@ def test_delete_item_sort(test_table):
     test_table.delete_item(Key=key)
     assert not 'Item' in test_table.get_item(Key=key, ConsistentRead=True)
 
+# DeleteItem should return an empty response object if none of the options
+# ReturnValues, ReturnConsumedCapacity or ReturnItemCollectionMetrics are requested.
+# We have tests elsewhere (see test_returnvalues.py, test_returnconsumedcapacity.py)
+# for testing DeleteItem with those optional features.
+def test_delete_item_return(test_table_s):
+    p = random_string()
+    test_table_s.put_item(Item={'p': p})
+    assert 'Item' in test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
+    ret = test_table_s.delete_item(Key={'p': p})
+    assert not 'Item' in test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
+    # boto3 always adds a "ResponseMetadata" item to the reponse object. Remove
+    # it and verify an empty object is left:
+    del ret['ResponseMetadata']
+    assert ret == {}
+
 # Test that PutItem completely replaces an existing item. It shouldn't merge
 # it with a previously existing value, as UpdateItem does!
 # We test for a table with just hash key, and for a table with both hash and
@@ -846,3 +861,21 @@ def test_update_item_delete_nonexistent_attribute(test_table_s):
     test_table_s.put_item(Item={'p': p, 'a': 'hello'})
     test_table_s.update_item(Key={'p': p}, AttributeUpdates={'b': {'Action': 'DELETE'}})
     assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'a': 'hello'}
+
+# Tests above all used just a few attributes in each item. This test verifies
+# that we can have any number of attributes (e.g., 400) and everything still
+# works well.
+def test_many_attributes(test_table_s):
+    N = 200
+    # PutItem of an item with N attributes:
+    attributes = { 'attr'+str(i): i for i in range(N) }
+    p = random_string()
+    item = {'p': p, **attributes}
+    test_table_s.put_item(Item=item)
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == item
+    # UpdateItem adding N more attributes to the same item:
+    more_attributes = { 'more'+str(i): i for i in range(N) }
+    test_table_s.update_item(Key={'p': p},
+        AttributeUpdates={key: {'Value': more_attributes[key], 'Action': 'PUT'} for key in more_attributes.keys()})
+    item = {**item, **more_attributes}
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == item

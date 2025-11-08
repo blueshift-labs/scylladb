@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <seastar/core/file.hh>
 #include <seastar/core/sharded.hh>
+#include <seastar/core/semaphore.hh>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -25,8 +26,9 @@
 #include "utils/disk-error-handler.hh"
 #include "sstables/generation_type.hh"
 #include "sstables/sstables_registry.hh"
+#include "sstables/object_storage_client.hh"
 
-class compaction_manager;
+namespace compaction { class compaction_manager; }
 namespace s3 { class client; }
 
 namespace sstables {
@@ -51,9 +53,17 @@ public:
     requires std::is_invocable_r_v<future<>, Func, typename std::ranges::range_value_t<Container>&>
     future<> parallel_for_each(Container& c, Func func) {
         co_await max_concurrent_for_each(c, _concurrency, [&] (auto& el) -> future<>{
-            auto units = co_await get_units(_sem, 1);
+            auto units = co_await get_units(1);
             co_await func(el);
         });
+    }
+
+    future<semaphore_units<>> get_units(size_t count) noexcept {
+        return seastar::get_units(_sem, count);
+    }
+
+    future<semaphore_units<>> get_units(size_t count, abort_source& abort) noexcept {
+        return seastar::get_units(_sem, count, abort);
     }
 };
 
@@ -111,7 +121,7 @@ public:
 
         std::filesystem::path _directory;
         std::unique_ptr<scan_state> _state;
-        shared_ptr<s3::client> _client;
+        shared_ptr<object_storage_client> _client;
         sstring _bucket;
 
         future<> garbage_collect(storage&);
@@ -122,7 +132,7 @@ public:
 
     public:
         filesystem_components_lister(std::filesystem::path dir);
-        filesystem_components_lister(std::filesystem::path dir, sstables_manager&, const data_dictionary::storage_options::s3&);
+        filesystem_components_lister(std::filesystem::path dir, sstables_manager&, const data_dictionary::storage_options::object_storage&);
 
         virtual future<> process(sstable_directory& directory, process_flags flags) override;
         virtual future<> commit() override;
@@ -168,7 +178,6 @@ private:
     std::unique_ptr<dht::sharder> _sharder_ptr;
     const dht::sharder& _sharder;
 
-    generation_type _max_generation_seen;
     sstables::sstable_version_types _max_version_seen = sstables::sstable_version_types::ka;
 
     // SSTables that are unshared and belong to this shard. They are already stored as an
@@ -234,13 +243,14 @@ public:
         return _unsorted_sstables;
     }
 
+    bool empty() const noexcept {
+        return _unshared_local_sstables.empty() && _shared_sstable_info.empty() && _unsorted_sstables.empty();
+    }
+
     future<shared_sstable> load_foreign_sstable(foreign_sstable_open_info& info);
 
     // moves unshared SSTables that don't belong to this shard to the right shards.
     future<> move_foreign_sstables(sharded<sstable_directory>& source_directory);
-
-    // returns what is the highest generation seen in this directory.
-    generation_type highest_generation_seen() const;
 
     // returns what is the highest version seen in this directory.
     sstables::sstable_version_types highest_version_seen() const;
@@ -312,7 +322,5 @@ public:
     static bool compare_sstable_storage_prefix(const sstring& a, const sstring& b) noexcept;
     sstable_state state() const noexcept { return _state; }
 };
-
-future<sstables::generation_type> highest_generation_seen(sharded<sstables::sstable_directory>& directory);
 
 }

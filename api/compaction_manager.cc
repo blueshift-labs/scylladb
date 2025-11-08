@@ -14,6 +14,7 @@
 #include "api/api.hh"
 #include "api/api-doc/compaction_manager.json.hh"
 #include "api/api-doc/storage_service.json.hh"
+#include "db/compaction_history_entry.hh"
 #include "db/system_keyspace.hh"
 #include "column_family.hh"
 #include "unimplemented.hh"
@@ -28,9 +29,9 @@ namespace ss = httpd::storage_service_json;
 using namespace json;
 using namespace seastar::httpd;
 
-static future<json::json_return_type> get_cm_stats(sharded<compaction_manager>& cm,
-        int64_t compaction_manager::stats::*f) {
-    return cm.map_reduce0([f](compaction_manager& cm) {
+static future<json::json_return_type> get_cm_stats(sharded<compaction::compaction_manager>& cm,
+        int64_t compaction::compaction_manager::stats::*f) {
+    return cm.map_reduce0([f](compaction::compaction_manager& cm) {
         return cm.get_stats().*f;
     }, int64_t(0), std::plus<int64_t>()).then([](const int64_t& res) {
         return make_ready_future<json::json_return_type>(res);
@@ -46,9 +47,9 @@ static std::unordered_map<std::pair<sstring, sstring>, uint64_t, utils::tuple_ha
     return std::move(a);
 }
 
-void set_compaction_manager(http_context& ctx, routes& r, sharded<compaction_manager>& cm) {
+void set_compaction_manager(http_context& ctx, routes& r, sharded<compaction::compaction_manager>& cm) {
     cm::get_compactions.set(r, [&cm] (std::unique_ptr<http::request> req) {
-        return cm.map_reduce0([](compaction_manager& cm) {
+        return cm.map_reduce0([](compaction::compaction_manager& cm) {
             std::vector<cm::summary> summaries;
 
             for (const auto& c : cm.get_compactions()) {
@@ -57,7 +58,7 @@ void set_compaction_manager(http_context& ctx, routes& r, sharded<compaction_man
                 s.ks = c.ks_name;
                 s.cf = c.cf_name;
                 s.unit = "keys";
-                s.task_type = sstables::compaction_name(c.type);
+                s.task_type = compaction::compaction_name(c.type);
                 s.completed = c.total_keys_written;
                 s.total = c.total_partitions;
                 summaries.push_back(std::move(s));
@@ -71,10 +72,9 @@ void set_compaction_manager(http_context& ctx, routes& r, sharded<compaction_man
     cm::get_pending_tasks_by_table.set(r, [&ctx] (std::unique_ptr<http::request> req) {
         return ctx.db.map_reduce0([](replica::database& db) {
             return do_with(std::unordered_map<std::pair<sstring, sstring>, uint64_t, utils::tuple_hash>(), [&db](std::unordered_map<std::pair<sstring, sstring>, uint64_t, utils::tuple_hash>& tasks) {
-                return db.get_tables_metadata().for_each_table_gently([&tasks] (table_id, lw_shared_ptr<replica::table> table) {
+                return db.get_tables_metadata().for_each_table_gently([&tasks] (table_id, lw_shared_ptr<replica::table> table) -> future<> {
                     replica::table& cf = *table.get();
-                    tasks[std::make_pair(cf.schema()->ks_name(), cf.schema()->cf_name())] = cf.estimate_pending_compactions();
-                    return make_ready_future<>();
+                    tasks[std::make_pair(cf.schema()->ks_name(), cf.schema()->cf_name())] = co_await cf.estimate_pending_compactions();
                 }).then([&tasks] {
                     return std::move(tasks);
                 });
@@ -103,23 +103,20 @@ void set_compaction_manager(http_context& ctx, routes& r, sharded<compaction_man
 
     cm::stop_compaction.set(r, [&cm] (std::unique_ptr<http::request> req) {
         auto type = req->get_query_param("type");
-        return cm.invoke_on_all([type] (compaction_manager& cm) {
+        return cm.invoke_on_all([type] (compaction::compaction_manager& cm) {
             return cm.stop_compaction(type);
         }).then([] {
             return make_ready_future<json::json_return_type>(json_void());
         });
     });
 
-    cm::stop_keyspace_compaction.set(r, [&ctx] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
-        auto ks_name = validate_keyspace(ctx, req);
-        auto tables = parse_table_infos(ks_name, ctx, req->query_parameters, "tables");
+    cm::stop_keyspace_compaction.set(r, [&ctx, &cm] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        auto [ks_name, tables] = parse_table_infos(ctx, *req, "tables");
         auto type = req->get_query_param("type");
-        co_await ctx.db.invoke_on_all([&] (replica::database& db) {
-            auto& cm = db.get_compaction_manager();
+        co_await cm.invoke_on_all([&] (compaction::compaction_manager& cm) {
             return parallel_for_each(tables, [&] (const table_info& ti) {
-                auto& t = db.find_column_family(ti.id);
-                return t.parallel_foreach_table_state([&] (compaction::table_state& ts) {
-                    return cm.stop_compaction(type, &ts);
+                return cm.stop_compaction(type, [id = ti.id] (const compaction::compaction_group_view* x) {
+                    return x->schema()->id() == id;
                 });
             });
         });
@@ -127,13 +124,13 @@ void set_compaction_manager(http_context& ctx, routes& r, sharded<compaction_man
     });
 
     cm::get_pending_tasks.set(r, [&ctx] (std::unique_ptr<http::request> req) {
-        return map_reduce_cf(ctx, int64_t(0), [](replica::column_family& cf) {
+        return map_reduce_cf(ctx.db, int64_t(0), [](replica::column_family& cf) {
             return cf.estimate_pending_compactions();
         }, std::plus<int64_t>());
     });
 
     cm::get_completed_tasks.set(r, [&cm] (std::unique_ptr<http::request> req) {
-        return get_cm_stats(cm, &compaction_manager::stats::completed_tasks);
+        return get_cm_stats(cm, &compaction::compaction_manager::stats::completed_tasks);
     });
 
     cm::get_total_compactions_completed.set(r, [] (std::unique_ptr<http::request> req) {
@@ -151,7 +148,7 @@ void set_compaction_manager(http_context& ctx, routes& r, sharded<compaction_man
     });
 
     cm::get_compaction_history.set(r, [&cm] (std::unique_ptr<http::request> req) {
-        std::function<future<>(output_stream<char>&&)> f = [&cm] (output_stream<char>&& out) -> future<> {
+        noncopyable_function<future<>(output_stream<char>&&)> f = [&cm] (output_stream<char>&& out) -> future<> {
             auto s = std::move(out);
             bool first = true;
             std::exception_ptr ex;
@@ -160,8 +157,11 @@ void set_compaction_manager(http_context& ctx, routes& r, sharded<compaction_man
                 co_await cm.local().get_compaction_history([&s, &first](const db::compaction_history_entry& entry) mutable -> future<> {
                         cm::history h;
                         h.id = fmt::to_string(entry.id);
+                        h.shard_id = entry.shard_id;
                         h.ks = std::move(entry.ks);
                         h.cf = std::move(entry.cf);
+                        h.compaction_type = entry.compaction_type;
+                        h.started_at = entry.started_at;
                         h.compacted_at = entry.compacted_at;
                         h.bytes_in = entry.bytes_in;
                         h.bytes_out =  entry.bytes_out;
@@ -173,6 +173,24 @@ void set_compaction_manager(http_context& ctx, routes& r, sharded<compaction_man
                             e.value = it.second;
                             h.rows_merged.push(std::move(e));
                         }
+                        for (const auto& data : entry.sstables_in) {
+                            httpd::compaction_manager_json::sstableinfo sstable;
+                            sstable.generation = fmt::to_string(data.generation),
+                            sstable.origin = data.origin,
+                            sstable.size = data.size,
+                            h.sstables_in.push(std::move(sstable));
+                        }
+                        for (const auto& data : entry.sstables_out) {
+                            httpd::compaction_manager_json::sstableinfo sstable;
+                            sstable.generation = fmt::to_string(data.generation),
+                            sstable.origin = data.origin,
+                            sstable.size = data.size,
+                            h.sstables_out.push(std::move(sstable));
+                        }
+                        h.total_tombstone_purge_attempt = entry.total_tombstone_purge_attempt;
+                        h.total_tombstone_purge_failure_due_to_overlapping_with_memtable = entry.total_tombstone_purge_failure_due_to_overlapping_with_memtable;
+                        h.total_tombstone_purge_failure_due_to_overlapping_with_uncompacting_sstable = entry.total_tombstone_purge_failure_due_to_overlapping_with_uncompacting_sstable;
+
                         if (!first) {
                             co_await s.write(", ");
                         }

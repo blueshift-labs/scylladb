@@ -20,12 +20,12 @@
 #include <sys/sdt.h>
 #include "read_context.hh"
 #include "real_dirty_memory_accounter.hh"
-#include "readers/delegating_v2.hh"
-#include "readers/forwardable_v2.hh"
+#include "readers/delegating.hh"
+#include "readers/forwardable.hh"
 #include "readers/nonforwardable.hh"
 #include "cache_mutation_reader.hh"
 #include "partition_snapshot_reader.hh"
-#include "clustering_key_filter.hh"
+#include "keys/clustering_key_filter.hh"
 #include "utils/assert.hh"
 #include "utils/updateable_value.hh"
 #include "utils/labels.hh"
@@ -49,7 +49,7 @@ static schema_ptr to_query_domain(const query::partition_slice& slice, schema_pt
 mutation_reader
 row_cache::create_underlying_reader(read_context& ctx, mutation_source& src, const dht::partition_range& pr) {
     schema_ptr entry_schema = to_query_domain(ctx.slice(), _schema);
-    auto reader = src.make_reader_v2(entry_schema, ctx.permit(), pr, ctx.slice(), ctx.trace_state(), streamed_mutation::forwarding::yes);
+    auto reader = src.make_mutation_reader(entry_schema, ctx.permit(), pr, ctx.slice(), ctx.trace_state(), streamed_mutation::forwarding::yes);
     ctx.on_underlying_created();
     return reader;
 }
@@ -593,7 +593,7 @@ public:
     }
 
     future<> fast_forward_to(dht::partition_range&& pr) {
-        if (!pr.start()) {
+        if (!pr.start()) {  
             _last_key = row_cache::previous_entry_pointer();
         } else if (!pr.start()->is_inclusive() && pr.start()->value().has_key()) {
             _last_key = row_cache::previous_entry_pointer(pr.start()->value().as_decorated_key());
@@ -776,12 +776,13 @@ row_cache::make_reader_opt(schema_ptr s,
                        const dht::partition_range& range,
                        const query::partition_slice& slice,
                        const tombstone_gc_state* gc_state,
+                       max_purgeable_fn get_max_purgeable,
                        tracing::trace_state_ptr trace_state,
                        streamed_mutation::forwarding fwd,
                        mutation_reader::forwarding fwd_mr)
 {
     auto make_context = [&] {
-        return std::make_unique<read_context>(*this, s, permit, range, slice, gc_state, trace_state, fwd_mr);
+        return std::make_unique<read_context>(*this, s, permit, range, slice, gc_state, get_max_purgeable, trace_state, fwd_mr);
     };
 
     if (query::is_single_partition(range) && !fwd_mr) {
@@ -857,7 +858,7 @@ mutation_reader row_cache::make_nonpopulating_reader(schema_ptr schema, reader_p
                     streamed_mutation::forwarding::no);
         } else {
             tracing::trace(ts, "Partition {} is not found in cache", pos);
-            return make_empty_flat_reader_v2(std::move(schema), std::move(permit));
+            return make_empty_mutation_reader(std::move(schema), std::move(permit));
         }
     });
 }
@@ -1110,6 +1111,7 @@ future<> row_cache::do_update(external_updater eu, replica::memtable& m, Updater
 }
 
 future<> row_cache::update(external_updater eu, replica::memtable& m, preemption_source& preempt_src) {
+    m._merging_into_cache = true;
     return do_update(std::move(eu), m, [this] (logalloc::allocating_section& alloc,
             row_cache::partitions_type::iterator cache_i, replica::memtable_entry& mem_e, partition_presence_checker& is_present,
             real_dirty_memory_accounter& acc, const partitions_type::bound_hint& hint, preemption_source& preempt_src) mutable {
@@ -1212,13 +1214,13 @@ future<> row_cache::invalidate(external_updater eu, const dht::decorated_key& dk
     return invalidate(std::move(eu), dht::partition_range::make_singular(dk));
 }
 
-future<> row_cache::invalidate(external_updater eu, const dht::partition_range& range) {
-    return invalidate(std::move(eu), dht::partition_range_vector({range}));
+future<> row_cache::invalidate(external_updater eu, const dht::partition_range& range, cache_invalidation_filter filter) {
+    return invalidate(std::move(eu), dht::partition_range_vector({range}), std::move(filter));
 }
 
-future<> row_cache::invalidate(external_updater eu, dht::partition_range_vector&& ranges) {
-    return do_update(std::move(eu), [this, ranges = std::move(ranges)] {
-        return seastar::async([this, ranges = std::move(ranges)] {
+future<> row_cache::invalidate(external_updater eu, dht::partition_range_vector&& ranges, cache_invalidation_filter filter) {
+    return do_update(std::move(eu), [this, ranges = std::move(ranges), filter = std::move(filter)] mutable {
+        return seastar::async([this, ranges = std::move(ranges), filter = std::move(filter)] {
             auto on_failure = defer([this] () noexcept {
                 this->clear_now();
                 _prev_snapshot_pos = {};
@@ -1236,11 +1238,17 @@ future<> row_cache::invalidate(external_updater eu, dht::partition_range_vector&
                         auto end = _partitions.lower_bound(dht::ring_position_view::for_range_end(range), cmp);
                         return with_allocator(_tracker.allocator(), [&] {
                             while (it != end) {
-                                it = it.erase_and_dispose(dht::raw_token_less_comparator{},
-                                    [&] (cache_entry* p) mutable noexcept {
-                                        _tracker.on_partition_erase();
-                                        p->evict(_tracker);
-                                    });
+                                if (filter(it->key())) {
+                                    it = it.erase_and_dispose(dht::raw_token_less_comparator{},
+                                        [&] (cache_entry* p) mutable noexcept {
+                                            _tracker.on_partition_erase();
+                                            p->evict(_tracker);
+                                        });
+                                } else {
+                                    _tracker.clear_continuity(*it);
+                                    ++it;
+                                }
+
                                 // it != end is necessary for correctness. We cannot set _prev_snapshot_pos to end->position()
                                 // because after resuming something may be inserted before "end" which falls into the next range.
                                 if (need_preempt() && it != end) {

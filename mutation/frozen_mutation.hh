@@ -132,9 +132,7 @@ public:
 
     auto on_end_of_partition() {
         flush_rows_and_tombstones(position_in_partition::after_all_clustered_rows());
-        if (_consumer.consume_end_of_partition()) {
-            _stop_consuming = stop_iteration::yes;
-        }
+        _stop_consuming = _consumer.consume_end_of_partition();
         using consume_res_type = decltype(_consumer.consume_end_of_stream());
         if constexpr (std::is_same_v<consume_res_type, void>) {
             _consumer.consume_end_of_stream();
@@ -230,8 +228,8 @@ public:
 };
 
 frozen_mutation freeze(const mutation& m);
-std::vector<frozen_mutation> freeze(const std::vector<mutation>&);
-std::vector<mutation> unfreeze(const std::vector<frozen_mutation>&);
+utils::chunked_vector<frozen_mutation> freeze(const utils::chunked_vector<mutation>&);
+utils::chunked_vector<mutation> unfreeze(const utils::chunked_vector<frozen_mutation>&);
 
 struct frozen_mutation_and_schema {
     frozen_mutation fm;
@@ -282,6 +280,22 @@ public:
 };
 
 frozen_mutation_fragment freeze(const schema& s, const mutation_fragment& mf);
+
+class frozen_mutation_fragment_v2 {
+    bytes_ostream _bytes;
+public:
+    explicit frozen_mutation_fragment_v2(bytes_ostream bytes) : _bytes(std::move(bytes)) { }
+    const bytes_ostream& representation() const { return _bytes; }
+    bytes_ostream&& representation() && { return std::move(_bytes); }
+
+    mutation_fragment_v2 unfreeze(const schema& s, reader_permit permit);
+
+    future<> clear_gently() noexcept {
+        return _bytes.clear_gently();
+    }
+};
+
+frozen_mutation_fragment_v2 freeze(const schema& s, const mutation_fragment_v2& mf);
 
 template<FlattenedConsumerV2 Consumer>
 auto frozen_mutation::consume(schema_ptr s, frozen_mutation_consumer_adaptor<Consumer>& adaptor) const -> frozen_mutation_consume_result<decltype(adaptor.consumer().consume_end_of_stream())> {

@@ -1,6 +1,20 @@
 ### a dictionary of redirections
 #old path: new path
 
+# Redirect 2025.1 upgrade guides that are not on master but were indexed by Google (404 reported)
+
+/master/upgrade/upgrade-guides/upgrade-guide-from-2024.x-to-2025.1/upgrade-guide-from-2024.x-to-2025.1.html: https://docs.scylladb.com/manual/stable/upgrade/index.html
+/master/upgrade/upgrade-guides/upgrade-guide-from-6.2-to-2025.1/index.html: https://docs.scylladb.com/manual/stable/upgrade/index.html
+
+# Remove duplicate pages
+
+/stable/cql/non-reserved-keywords.html: /stable/cql/appendices.html
+/stable/cql/reserved-keywords.html: /stable/cql/appendices.html
+
+# Remove redundant pages
+
+/stable/getting-started/tutorials: https://docs.scylladb.com/stable/get-started/develop-with-scylladb/tutorials-example-projects.html
+/stable/contribute: https://github.com/scylladb/scylladb/blob/master/CONTRIBUTING.md
 
 # Remove an oudated article
 
@@ -157,3 +171,11 @@
 /stable/upgrade/upgrade-opensource/upgrade-guide-from-4.5-to-4.6/upgrade-guide-from-4.5-to-4.6-debian-10.html: /stable/upgrade/index.html
 /stable/upgrade/upgrade-opensource/upgrade-guide-from-4.5-to-4.6/metric-update-4.5-to-4.6.html: /stable/upgrade/index.html
 
+# Divide API reference to smaller files
+# /stable/reference/api-reference.html: /stable/reference/api/index.html
+
+# Fixed typo in the file name
+/stable/operating-scylla/nodetool-commands/enbleautocompaction.html: /stable/operating-scylla/nodetool-commands/enableautocompaction.html
+
+# Rename the CDC Stream Generations page
+/stable/features/cdc/cdc-stream-generations.html: /stable/features/cdc/cdc-stream-changes.html

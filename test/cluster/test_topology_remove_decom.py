@@ -10,16 +10,19 @@ import logging
 import asyncio
 import random
 import time
+from test import pylib
+from test.cluster.conftest import skip_mode
 from test.pylib.util import wait_for
 from test.pylib.manager_client import ManagerClient
 from test.pylib.random_tables import RandomTables
+from test.pylib.scylla_cluster import gather_safely
 from test.cluster.util import check_token_ring_and_group0_consistency,            \
                                wait_for_token_ring_and_group0_consistency
 import pytest
 
 
 logger = logging.getLogger(__name__)
-pytestmark = pytest.mark.prepare_3_nodes_cluster
+pytestmark = pytest.mark.prepare_3_racks_cluster
 
 
 @pytest.mark.asyncio
@@ -27,7 +30,7 @@ async def test_remove_node_add_column(manager: ManagerClient, random_tables: Ran
     """Add a node, remove an original node, add a column"""
     servers = await manager.running_servers()
     table = await random_tables.add_table(ncolumns=5)
-    await manager.server_add()
+    await manager.server_add(property_file=servers[1].property_file())
     await manager.server_stop_gracefully(servers[1].server_id)              # stop     [1]
     await manager.remove_node(servers[0].server_id, servers[1].server_id)   # Remove   [1]
     await check_token_ring_and_group0_consistency(manager)
@@ -53,7 +56,7 @@ async def test_decommission_node_add_column(manager: ManagerClient, random_table
     # 7. If #11780 is not fixed, this will fail the node_ops_verb RPC, causing decommission to fail
     await manager.api.enable_injection(
         decommission_target.ip_addr, 'storage_service_notify_joined_sleep', one_shot=True)
-    bootstrapped_server = await manager.server_add()
+    bootstrapped_server = await manager.server_add(property_file=decommission_target.property_file())
     async def no_joining_nodes():
         joining_nodes = await manager.api.get_joining_nodes(decommission_target.ip_addr)
         return not joining_nodes
@@ -138,7 +141,7 @@ async def test_rebuild_node(manager: ManagerClient, random_tables: RandomTables)
     await check_token_ring_and_group0_consistency(manager)
 
 @pytest.mark.asyncio
-async def test_concurrent_removenode(manager: ManagerClient):
+async def test_concurrent_removenode_two_initiators_one_dead_node(manager: ManagerClient):
     servers = await manager.running_servers()
     assert len(servers) >= 3
 
@@ -152,3 +155,65 @@ async def test_concurrent_removenode(manager: ManagerClient):
     else:
         raise Exception("concurrent removenode request should result in a failure, but unexpectedly succeeded")
 
+@pytest.mark.asyncio
+async def test_concurrent_removenode_one_initiator_two_dead_nodes(manager: ManagerClient):
+    """
+    Tests the execution flow in case of performing remove node
+    operations concurrently for two distinct dead nodes.
+
+    """
+    servers = await manager.running_servers()
+    await manager.servers_add(2, property_file=servers[0].property_file())
+    servers = await manager.running_servers()
+    assert len(servers) >= 5
+
+    await asyncio.gather(*[manager.server_stop_gracefully(servers[2].server_id),
+            manager.server_stop_gracefully(servers[1].server_id)])
+
+    ignore_nodes = [await manager.get_host_id(servers[1].server_id), await manager.get_host_id(servers[2].server_id)]
+    await asyncio.gather(*[manager.remove_node(servers[0].server_id, servers[2].server_id, ignore_dead=ignore_nodes),
+            manager.remove_node(servers[0].server_id, servers[1].server_id, ignore_dead=ignore_nodes)])
+
+@pytest.mark.asyncio
+async def test_concurrent_removenode_two_initiators_two_dead_nodes(manager: ManagerClient):
+    """
+    Tests the execution flow in case of performing remove node
+    operations concurrently for two distinct dead nodes while
+    requests originating from separate intitiating nodes.
+
+    """
+    servers = await manager.running_servers()
+    await manager.servers_add(2, property_file=servers[0].property_file())
+    servers = await manager.running_servers()
+    assert len(servers) >= 5
+
+    await asyncio.gather(*[manager.server_stop_gracefully(servers[2].server_id),
+            manager.server_stop_gracefully(servers[1].server_id)])
+
+    ignore_nodes = [await manager.get_host_id(servers[1].server_id), await manager.get_host_id(servers[2].server_id)]
+    await asyncio.gather(*[manager.remove_node(servers[0].server_id, servers[2].server_id, ignore_dead=ignore_nodes),
+            manager.remove_node(servers[3].server_id, servers[1].server_id, ignore_dead=ignore_nodes)])
+
+@pytest.mark.asyncio
+@skip_mode('release', 'error injection is not supported in release mode')
+async def test_decommission_left_token_ring_retry(manager: ManagerClient):
+    """
+    Tests the execution flow in case of performing decommission node
+    operation in left_token_ring transition state, while retrying the
+    left_token_ring handler due to failures in update_topology_state execution.
+
+    """
+    servers = await manager.running_servers()
+    await manager.servers_add(1, property_file=servers[0].property_file())
+    servers = await manager.running_servers()
+    assert len(servers) >= 4
+
+    await gather_safely(*[manager.api.enable_injection(s.ip_addr, "finish_left_token_ring_transition_throw", one_shot=True) for s in servers])
+
+    await manager.decommission_node(servers[3].server_id)
+
+    servers = await manager.running_servers()
+    logs = [await manager.server_open_log(srv.server_id) for srv in servers]
+
+    matches = [await log.grep("raft_topology - transition_state::left_token_ring, raft_topology_cmd::command::barrier failed") for log in logs]
+    assert sum(len(x) for x in matches) == 0

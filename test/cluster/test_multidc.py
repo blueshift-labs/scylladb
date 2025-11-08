@@ -14,8 +14,9 @@ from cassandra.policies import WhiteListRoundRobinPolicy
 
 from test.cqlpy import nodetool
 from cassandra import ConsistencyLevel
-from cassandra.protocol import InvalidRequest
+from cassandra.protocol import InvalidRequest, ConfigurationException
 from cassandra.query import SimpleStatement
+from test.pylib.async_cql import _wrap_future
 from test.pylib.manager_client import ManagerClient
 from test.pylib.random_tables import RandomTables, TextType, Column
 from test.pylib.util import unique_name
@@ -58,10 +59,10 @@ async def test_putget_2dc_with_rf(
     table_name = "test_table_name"
     columns = [Column("name", TextType), Column("value", TextType)]
     logger.info("Create two servers in different DC's")
-    for i in nodes_list:
+    for rack_idx, dc_idx in enumerate(nodes_list):
         s_info = await manager.server_add(
             config=CONFIG,
-            property_file={"dc": f"dc{i}", "rack": "myrack"},
+            property_file={"dc": f"dc{dc_idx}", "rack": f"rack{rack_idx}"},
         )
         logger.info(s_info)
     conn = manager.get_cql()
@@ -128,9 +129,9 @@ async def test_query_dc_with_rf_0_does_not_crash_db(request: pytest.FixtureReque
             property_file={"dc": f"dc{i}", "rack": "myrack"},
         ))
 
-    dc1_connection = cluster_con([servers[0].ip_addr], 9042, False,
+    dc1_connection = cluster_con([servers[0].ip_addr],
                                  load_balancing_policy=WhiteListRoundRobinPolicy([servers[0].ip_addr])).connect()
-    dc2_connection = cluster_con([servers[1].ip_addr], 9042, False,
+    dc2_connection = cluster_con([servers[1].ip_addr],
                                  load_balancing_policy=WhiteListRoundRobinPolicy([servers[1].ip_addr])).connect()
 
     random_tables = RandomTables(request.node.name, manager, ks, 1, dc_replication)
@@ -168,7 +169,6 @@ async def test_create_and_alter_keyspace_with_altering_rf_and_racks(manager: Man
         else:
             rep_opts = ", ".join([f"'dc{i + 1}': {rf}" for i, rf in enumerate(rfs)])
         opts = f"replication = {{'class': 'NetworkTopologyStrategy', {rep_opts}}} AND tablets = {{'enabled': true}}"
-        print("CREATING KEYSPACE!")
         await cql.run_async(f"CREATE KEYSPACE {ks} WITH {opts}")
 
     async def create_ok(rfs: Union[List[int], int]) -> str:
@@ -178,30 +178,18 @@ async def test_create_and_alter_keyspace_with_altering_rf_and_racks(manager: Man
 
     async def create_fail(rfs: Union[List[int], int], failed_dc: int, rf: int, rack_count: int):
         ks = unique_name()
-        err = r"The option `rf_rack_valid_keyspaces` is enabled. It requires that all keyspaces are RF-rack-valid. " \
+        err = rf"Replication factor {rf} exceeds the number of racks|The option `rf_rack_valid_keyspaces` is enabled. It requires that all keyspaces are RF-rack-valid. " \
               f"That condition is violated: keyspace '{ks}' doesn't satisfy it for DC 'dc{failed_dc}': RF={rf} vs. rack count={rack_count}."
-        with pytest.raises(InvalidRequest, match=err):
-            await create_aux(ks, rfs)
-
-    async def create_fail(rfs: List[int], failed_dc: int, rf: int, rack_count: int) -> None:
-        ks = unique_name()
-        err = r"The option `rf_rack_valid_keyspaces` is enabled. It requires that all keyspaces are RF-rack-valid. " \
-              f"That condition is violated: keyspace '{ks}' doesn't satisfy it for DC 'dc{failed_dc}': RF={rf} vs. rack count={rack_count}."
-
-        with pytest.raises(InvalidRequest, match=err):
+        with pytest.raises((ConfigurationException, InvalidRequest), match=err):
             await create_aux(ks, rfs)
 
     async def alter_ok(ks: str, rfs: List[int]) -> None:
         dcs = ", ".join([f"'dc{i + 1}': {rf}" for i, rf in enumerate(rfs)])
-        print("ALTERING KEYSPACE!")
         await cql.run_async(f"ALTER KEYSPACE {ks} WITH REPLICATION = {{'class': 'NetworkTopologyStrategy', {dcs}}}")
 
     async def alter_fail(ks: str, rfs: List[int], failed_dc: int, rack_count: int) -> None:
         rf = rfs[failed_dc - 1]
-        err = r"The option `rf_rack_valid_keyspaces` is enabled. It requires that all keyspaces are RF-rack-valid. " \
-              f"That condition is violated: keyspace '{ks}' doesn't satisfy it for DC 'dc{failed_dc}': RF={rf} vs. rack count={rack_count}."
-
-        with pytest.raises(InvalidRequest, match=err):
+        with pytest.raises((ConfigurationException, InvalidRequest)):
             await alter_ok(ks, rfs)
 
     # Step 1.
@@ -298,14 +286,16 @@ async def test_create_and_alter_keyspace_with_altering_rf_and_racks(manager: Man
         for task in tasks:
             _ = tg.create_task(task)
 
-    await alter_ok(ks1, [2, 1])
+    # Altering from rack list to numeric not supported.
+    await alter_fail(ks1, [2, 1], 1, 2)
+    # await alter_ok(ks1, [2, 1])
     await alter_fail(ks1, [2, 2], 2, 1)
 
-    await alter_ok(ks2, [2, 1])
+    await alter_fail(ks2, [2, 1], 1, 2)
     await alter_ok(ks3, [2, 1])
-    await alter_ok(ks4, [2, 1])
+    await alter_fail(ks4, [2, 1], 1, 2)
     # RF = 1 is always OK!
-    await alter_ok(ks3, [1, 1])
+    await alter_fail(ks3, [1, 1], 1, 2)
 
 @pytest.mark.asyncio
 async def test_arbiter_dc_rf_rack_valid_keyspaces(manager: ManagerClient):
@@ -340,7 +330,6 @@ async def test_arbiter_dc_rf_rack_valid_keyspaces(manager: ManagerClient):
             rep_opts = f"'dc1': {rfs[0]}, 'dc2': {rfs[1]}"
         opts = f"replication = {{'class': 'NetworkTopologyStrategy', {rep_opts}}} AND tablets = {{'enabled': true}}"
         try:
-            print("CREATING KEYSPACE!")
             await cql.run_async(f"CREATE KEYSPACE {ks} WITH {opts}")
         finally:
             await cql.run_async(f"DROP KEYSPACE IF EXISTS {ks}")
@@ -351,14 +340,16 @@ async def test_arbiter_dc_rf_rack_valid_keyspaces(manager: ManagerClient):
 
     async def create_fail(rfs: Union[List[int], int], failed_dc: int, rf: int, rack_count: int):
         ks = unique_name()
-        err = r"The option `rf_rack_valid_keyspaces` is enabled. It requires that all keyspaces are RF-rack-valid. " \
+        err = rf"Replication factor {rf} exceeds the number of racks|The option `rf_rack_valid_keyspaces` is enabled. It requires that all keyspaces are RF-rack-valid. " \
               f"That condition is violated: keyspace '{ks}' doesn't satisfy it for DC 'dc{failed_dc}': RF={rf} vs. rack count={rack_count}."
-        with pytest.raises(InvalidRequest, match=err):
+        with pytest.raises((ConfigurationException, InvalidRequest), match=err):
             await create_aux(ks, rfs)
+            logger.error(f"create_aux({ks}, {rfs}) should have failed")
 
     valid_keyspaces = [
         create_ok([0, 0]),
         create_ok([1, 0]),
+        create_ok([2, 0]),
         create_ok([3, 0]),
         create_ok(0)
     ]
@@ -367,7 +358,6 @@ async def test_arbiter_dc_rf_rack_valid_keyspaces(manager: ManagerClient):
     # because then we can't predict what error will say.
     invalid_keyspaces = [
         create_fail([4, 0], 1, 4, 3),
-        create_fail([2, 0], 1, 2, 3),
         create_fail([0, 1], 2, 1, 0),
         create_fail([0, 2], 2, 2, 0),
         create_fail([0, 3], 2, 3, 0),
@@ -464,6 +454,49 @@ async def test_startup_with_keyspaces_violating_rf_rack_valid_keyspaces(manager:
     _ = await manager.server_start(s1.server_id)
 
 @pytest.mark.asyncio
+async def test_startup_with_keyspaces_violating_rf_rack_valid_keyspaces_but_not_enforced(manager: ManagerClient):
+    """
+    When the configuration option `rf_rack_valid_keyspaces` is enabled and there is an RF-rack-invalid keyspace,
+    starting a node fails. However, when the configuration option is disabled, but there still is a keyspace
+    that violates the condition, Scylla should print a warning informing the user about the fact. This test
+    verifies that.
+
+    For more context, see issue: scylladb/scylladb#23330.
+    """
+
+    cfg = {"rf_rack_valid_keyspaces": False}
+
+    # One DC, 4 racks.
+    dc = "dc1"
+    s1, _, _, _ = await manager.servers_add(4, config=cfg, auto_rack_dc=dc)
+
+    cql = manager.get_cql()
+    # We need to set `max_schema_agreement_wait` to 0 to speed up this test.
+    assert hasattr(cql.cluster, "max_schema_agreement_wait")
+    cql.cluster.max_schema_agreement_wait = 0
+
+    async def create_ks(name: str, rf: int):
+        await cql.run_async(f"CREATE KEYSPACE {name} WITH replication = {{'class': 'NetworkTopologyStrategy', '{dc}': {rf}}} AND tablets = {{'enabled': true}}")
+
+    await create_ks("ks1", 1)
+    await create_ks("ks2", 2)
+    await create_ks("ks3", 3)
+    await create_ks("ks4", 4)
+
+    await manager.server_stop_gracefully(s1.server_id)
+    await manager.server_start(s1.server_id)
+
+    log = await manager.server_open_log(s1.server_id)
+
+    expected_pattern = r"Some existing keyspaces are not RF-rack-valid, i\.e\. the replication factor " \
+                       r"does not match the number of racks in one of the datacenters. That may reduce " \
+                       r"availability in case of a failure \(cf\. " \
+                       r"https://docs\.scylladb\.com/manual/stable/reference/glossary\.html#term-RF-rack-valid-keyspace\)\. " \
+                       r"Those keyspaces are: (ks2, ks3)|(ks3, ks2)"
+
+    await log.wait_for(expected_pattern)
+
+@pytest.mark.asyncio
 async def test_restart_with_prefer_local(request: pytest.FixtureRequest, manager: ManagerClient) -> None:
     logger.info("Creating a new cluster")
     for i in range(3):
@@ -475,3 +508,126 @@ async def test_restart_with_prefer_local(request: pytest.FixtureRequest, manager
 
     await manager.server_stop_gracefully(s_info.server_id)
     await manager.server_start(s_info.server_id)
+
+@pytest.mark.asyncio
+async def test_warn_create_and_alter_rf_rack_invalid_ks(manager: ManagerClient):
+    """
+    When the configuration option `rf_rack_valid_keyspaces` is enabled, the user is not
+    allowed to create an RF-rack-invalid keyspace. When the option is disabled, that limitation
+    disappears.
+
+    However, since (at some point) we're going to get rid of that option and start always
+    enforcing the restriction, we'd like to let the user know that the keyspace they're
+    creating may not be valid in the future. Verify that the warning really appears.
+
+    For more context, see issue: scylladb/scylladb#23330.
+    """
+
+    cfg = {"rf_rack_valid_keyspaces": False}
+
+    # Setup: DC1: 3 racks, DC2: 2 racks.
+    start_node_tasks = [
+        manager.server_add(config=cfg, property_file={"dc": "dc1", "rack": "r1"}),
+        manager.server_add(config=cfg, property_file={"dc": "dc1", "rack": "r2"}),
+        manager.server_add(config=cfg, property_file={"dc": "dc1", "rack": "r3"}),
+        manager.server_add(config=cfg, property_file={"dc": "dc2", "rack": "r4"}),
+        manager.server_add(config=cfg, property_file={"dc": "dc2", "rack": "r5"}),
+    ]
+    await asyncio.gather(*start_node_tasks)
+
+    cql = manager.get_cql()
+    # We need to set `max_schema_agreement_wait` to 0 to speed up this test.
+    # Without it, the test takes 50 seconds (or 16 seconds if cases run in parallel).
+    # With it, the test takes about 9 seconds. All results on my local machine of course.
+    assert hasattr(cql.cluster, "max_schema_agreement_wait")
+    cql.cluster.max_schema_agreement_wait = 0
+
+    # Scenario 1. Creating an RF-rack-invalid keyspace.
+    ###################################################
+
+    async def do_create_test(rf1: int, rf2: int, tablets: str, ok: bool):
+        ks = unique_name()
+        warning = f"Keyspace '{ks}' is not RF-rack-valid: the replication factor doesn't match " \
+                   "the rack count in at least one datacenter. A rack failure may reduce availability. " \
+                   "For more context, see: " \
+                   "https://docs.scylladb.com/manual/stable/reference/glossary.html#term-RF-rack-valid-keyspace."
+
+        stmt = f"CREATE KEYSPACE {ks} WITH replication = " \
+               f"{{'class': 'NetworkTopologyStrategy', 'dc1': {rf1}, 'dc2': {rf2}}} AND " \
+               f"tablets = {{'enabled': {tablets}}}"
+
+        # We have to use `Session::execute_async` here to be able to obtain `warnings`.
+        # It's pretty convoluted, but we have to live with it...
+        result = cql.execute_async(stmt)
+        await _wrap_future(result)
+
+        if ok:
+            assert not hasattr(result, "warnings") or result.warnings is None or warning not in result.warnings
+        else:
+            assert hasattr(result, "warnings")
+            assert warning in result.warnings
+
+    # All of the statements below are OK: they don't use tablets.
+    await do_create_test(2, 2, "false", True)
+    await do_create_test(3, 3, "false", True)
+    await do_create_test(3, 2, "false", True)
+    await do_create_test(3, 1, "false", True)
+    await do_create_test(1, 2, "false", True)
+    await do_create_test(1, 1, "false", True)
+
+    # BAD: the RF doesn't match the number of racks in DC1.
+    await do_create_test(2, 2, "true", False)
+    # BAD: the RF doesn't match the number of racks in DC2.
+    await do_create_test(3, 3, "true", False)
+    # OK: the RFs match the number of racks in the DCs.
+    await do_create_test(3, 2, "true", True)
+    # OK: RF=#racks for DC1, RF=1 is always accepted.
+    await do_create_test(3, 1, "true", True)
+    # OK: RF=#racks for DC2, RF=1 is always accepted.
+    await do_create_test(1, 2, "true", True)
+    # OK: RF=1 is always accepted.
+    await do_create_test(1, 1, "true", True)
+
+    # Scenario 2. Altering an RF-rack-valid keyspace so that it becomes RF-rack-invalid.
+    ####################################################################################
+
+    async def do_alter_test(rf1: int, rf2: int, tablets: str, ok: bool):
+        ks = unique_name()
+        warning = f"Keyspace '{ks}' is not RF-rack-valid: the replication factor doesn't match " \
+                   "the rack count in at least one datacenter. A rack failure may reduce availability. " \
+                   "For more context, see: " \
+                   "https://docs.scylladb.com/manual/stable/reference/glossary.html#term-RF-rack-valid-keyspace."
+
+        await cql.run_async(f"CREATE KEYSPACE {ks} WITH replication = " \
+                    f"{{'class': 'NetworkTopologyStrategy', 'dc1': 3, 'dc2': 2}} AND " \
+                    f"tablets = {{'enabled': {tablets}}}")
+
+        stmt = f"ALTER KEYSPACE {ks} WITH replication = " \
+               f"{{'class': 'NetworkTopologyStrategy', 'dc1': {rf1}, 'dc2': {rf2}}} AND " \
+               f"tablets = {{'enabled': {tablets}}}"
+
+        # We have to use `Session::execute_async` here to be able to obtain `warnings`.
+        # It's pretty convoluted, but we have to live with it...
+        result = cql.execute_async(stmt)
+        await _wrap_future(result)
+
+        if ok:
+            assert not hasattr(result, "warnings") or result.warnings is None or warning not in result.warnings
+        else:
+            assert hasattr(result, "warnings")
+            assert warning in result.warnings
+
+    # All of the statements below are OK: they don't use tablets.
+    await do_alter_test(2, 2, "false", True)
+    await do_alter_test(3, 3, "false", True)
+    await do_alter_test(3, 2, "false", True)
+    await do_alter_test(3, 1, "false", True)
+
+    # BAD: the RF doesn't match the number of racks in DC1.
+    await do_alter_test(2, 2, "true", False)
+    # BAD: the RF doesn't match the number of racks in DC2.
+    await do_alter_test(3, 3, "true", False)
+    # OK: the RFs match the number of racks in the DCs.
+    await do_alter_test(3, 2, "true", True)
+    # OK: RF=#racks for DC1, RF=1 is always accepted.
+    await do_alter_test(3, 1, "true", True)

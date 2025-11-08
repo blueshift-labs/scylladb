@@ -14,7 +14,6 @@ import pytest
 import urllib3
 from botocore.exceptions import ClientError, HTTPClientError
 
-from test.alternator.conftest import new_dynamodb_session
 from test.alternator.util import random_string, full_query, multiset, scylla_inject_error
 
 
@@ -405,9 +404,9 @@ def test_batch_write_item_large(test_table_sn):
 
 # Test if client breaking connection during HTTP response
 # streaming doesn't break the server.
-def test_batch_write_item_large_broken_connection(test_table_sn, request, dynamodb):
+def test_batch_write_item_large_broken_connection(test_table_sn, new_dynamodb_session):
     fn_name = sys._getframe().f_code.co_name
-    ses = new_dynamodb_session(request, dynamodb)
+    ses = new_dynamodb_session()
 
     p = random_string()
     long_content = random_string(100)*500
@@ -443,17 +442,17 @@ def test_batch_write_item_large_broken_connection(test_table_sn, request, dynamo
 # DynamoDB limits the number of items written by a BatchWriteItem operation
 # to 25, even if they are small. Exceeding this limit results in a
 # ValidationException error - and none of the items in the batch are written.
+# Default limit for ScyllaDB is set to 100, hence we check against 105.
 # Reproduces #5057
-@pytest.mark.xfail(reason="Issue #5057")
 def test_batch_write_item_too_many(test_table_sn):
     p = random_string()
     with pytest.raises(ClientError, match='ValidationException.*length'):
         test_table_sn.meta.client.batch_write_item(RequestItems = {
-            test_table_sn.name: [{'PutRequest': {'Item': {'p': p, 'c': i}}} for i in range(30)]
+            test_table_sn.name: [{'PutRequest': {'Item': {'p': p, 'c': i}}} for i in range(105)]
     })
     with pytest.raises(ClientError, match='ValidationException.*length'):
         test_table_sn.meta.client.batch_write_item(RequestItems = {
-            test_table_sn.name: [{'DeleteRequest': {'Key': {'p': p, 'c': i}}} for i in range(30)]
+            test_table_sn.name: [{'DeleteRequest': {'Key': {'p': p, 'c': i}}} for i in range(105)]
     })
 
 # According to the DynamoDB documentation, a single BatchGetItem operation is

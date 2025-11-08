@@ -23,22 +23,6 @@ using namespace seastar::httpd;
 namespace sp = httpd::storage_proxy_json;
 namespace ss = httpd::storage_service_json;
 
-template<class T>
-json::json_return_type get_json_return_type(const T& val) {
-    return json::json_return_type(val);
-}
-
-/*
- * As commented on db::seed_provider_type is not used
- * and probably never will.
- *
- * Just in case, we will return its name
- */
-template<>
-json::json_return_type get_json_return_type(const db::seed_provider_type& val) {
-    return json::json_return_type(val.class_name);
-}
-
 std::string_view format_type(std::string_view type) {
     if (type == "int") {
         return "integer";
@@ -187,7 +171,7 @@ void set_config(std::shared_ptr < api_registry_builder20 > rb, http_context& ctx
     });
 
     ss::get_all_data_file_locations.set(r, [&cfg](const_req req) {
-        return container_to_vec(cfg.data_file_directories());
+        return cfg.data_file_directories();
     });
 
     ss::get_saved_caches_location.set(r, [&cfg](const_req req) {

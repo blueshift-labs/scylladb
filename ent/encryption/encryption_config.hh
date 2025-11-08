@@ -9,7 +9,7 @@
 
 #pragma once
 
-#include "../../utils/config_file.hh"
+#include "utils/config_file.hh"
 
 namespace encryption {
 
@@ -26,6 +26,7 @@ public:
     named_value<string_string_map> kmip_hosts;
     named_value<string_string_map> kms_hosts;
     named_value<string_string_map> gcp_hosts;
+    named_value<string_string_map> azure_hosts;
     named_value<string_map> user_info_encryption;
     named_value<bool> allow_per_table_encryption;
 };

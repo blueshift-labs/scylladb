@@ -21,16 +21,16 @@
 #include "unimplemented.hh"
 
 #include "cql3/operation_impl.hh"
-#include "cql3/type_json.hh"
 #include "cql3/lists.hh"
 #include "cql3/maps.hh"
 #include "cql3/sets.hh"
 #include "cql3/user_types.hh"
+#include "types/json_utils.hh"
 #include "types/list.hh"
 #include "types/map.hh"
 #include "types/set.hh"
 #include "types/user.hh"
-#include "concrete_types.hh"
+#include "types/concrete_types.hh"
 #include "validation.hh"
 #include "dht/i_partitioner.hh"
 #include <optional>

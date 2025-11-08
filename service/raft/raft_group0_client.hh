@@ -22,7 +22,7 @@
 #include "service/raft/group0_fwd.hh"
 #include "service/raft/raft_timeout.hh"
 #include "utils/UUID.hh"
-#include "timestamp.hh"
+#include "mutation/timestamp.hh"
 #include "gc_clock.hh"
 #include "service/raft/group0_state_machine.hh"
 #include "service/maintenance_mode.hh"
@@ -120,7 +120,9 @@ class raft_group0_client {
 
     template <typename Command>
     void validate_change(const Command& change) {}
-    void validate_change(const topology_change& change);
+    template<typename Command>
+    requires std::same_as<Command, topology_change> || std::same_as<Command, mixed_change>
+    void validate_change(const Command& change);
 
 public:
     raft_group0_client(service::raft_group_registry&, db::system_keyspace&, locator::shared_token_metadata&, maintenance_mode_enabled);
@@ -228,7 +230,7 @@ class group0_batch {
 public:
     using generator_func = std::function<mutations_generator(api::timestamp_type t)>;
 private:
-    std::vector<mutation> _muts;
+    utils::chunked_vector<mutation> _muts;
     std::vector<generator_func> _generators;
     std::vector<sstring> _descriptions;
     std::optional<::service::group0_guard> _guard;
@@ -257,13 +259,13 @@ public:
     utils::UUID new_group0_state_id() const;
 
     void add_mutation(mutation m, std::string_view description = "");
-    void add_mutations(std::vector<mutation> ms, std::string_view description = "");
+    void add_mutations(utils::chunked_vector<mutation> ms, std::string_view description = "");
     void add_generator(generator_func f, std::string_view description = "");
 
     // Commits the data, nop if there was no guard provided.
     future<> commit(::service::raft_group0_client& group0_client, seastar::abort_source& as, std::optional<::service::raft_timeout> timeout) &&;
     // For rare cases where collector is used but announce logic is replaced with a custom one.
-    future<std::pair<std::vector<mutation>, ::service::group0_guard>> extract() &&;
+    future<std::pair<utils::chunked_vector<mutation>, ::service::group0_guard>> extract() &&;
 
     // Checks if any mutations or generators were added. Note that when generator is
     // added it still can return no mutations.

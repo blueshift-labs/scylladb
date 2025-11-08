@@ -26,6 +26,13 @@ def random_string(length=10, chars=string.ascii_uppercase + string.digits):
 def random_bytes(length=10):
     return bytearray(random.getrandbits(8) for _ in range(length))
 
+# sleep to let a ttl (of `seconds`) expire and
+# the commitlog minimum gc time, in seconds,
+# to be greater than the tombstone deletion time
+def sleep_till_whole_second(seconds=1):
+    t = time.time()
+    time.sleep(seconds - (t - int(t)))
+
 # A function for picking a unique name for test keyspace or table.
 # This name doesn't need to be quoted in CQL - it only contains
 # lowercase letters, numbers, and underscores, and starts with a letter.
@@ -194,7 +201,7 @@ def index_table_name(index_name : str):
 
 # Helper function for establishing a connection with given username and password
 @contextmanager
-def cql_session(host, port, is_ssl, username, password, request_timeout=120):
+def cql_session(host, port, is_ssl, username, password, request_timeout=120, protocol_version=4):
     profile = ExecutionProfile(
         load_balancing_policy=RoundRobinPolicy(),
         consistency_level=ConsistencyLevel.LOCAL_QUORUM,
@@ -214,10 +221,7 @@ def cql_session(host, port, is_ssl, username, password, request_timeout=120):
     cluster = Cluster(execution_profiles={EXEC_PROFILE_DEFAULT: profile},
         contact_points=[host],
         port=int(port),
-        # TODO: make the protocol version an option, to allow testing with
-        # different versions. If we drop this setting completely, it will
-        # mean pick the latest version supported by the client and the server.
-        protocol_version=4,
+        protocol_version=protocol_version,
         auth_provider=PlainTextAuthProvider(username=username, password=password),
         ssl_context=ssl_context,
         # The default timeout for new connections is 5 seconds, and for

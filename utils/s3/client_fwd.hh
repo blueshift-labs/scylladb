@@ -9,11 +9,9 @@
 #pragma once
 #include <cstddef>
 
+#include "utils/upload_progress.hh"
+
 namespace s3 {
 class client;
-
-struct upload_progress {
-    size_t total;
-    size_t uploaded;
-};
+using upload_progress = utils::upload_progress;
 }

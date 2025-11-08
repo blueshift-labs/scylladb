@@ -23,9 +23,13 @@ from botocore.exceptions import ClientError
 import requests
 import json
 from cassandra.auth import PlainTextAuthProvider
+import threading
+import random
 
+from test.cluster.util import get_replication
 from test.pylib.manager_client import ManagerClient
 from test.pylib.util import wait_for
+from test.pylib.tablets import get_all_tablet_replicas
 from test.cluster.conftest import skip_mode
 
 logger = logging.getLogger(__name__)
@@ -89,7 +93,7 @@ async def test_alternator_ttl_scheduling_group(manager: ManagerClient):
        in the wrong scheduling group. We can assume this because we don't
        run multiple tests in parallel on the same cluster.
     """
-    servers = await manager.servers_add(3, config=alternator_config)
+    servers = await manager.servers_add(3, config=alternator_config, auto_rack_dc='dc1')
     alternator = get_alternator(servers[0].ip_addr)
     table = alternator.create_table(TableName=unique_table_name(),
         BillingMode='PAY_PER_REQUEST',
@@ -303,6 +307,7 @@ async def test_localnodes_down_normal_node(manager: ManagerClient):
 
 
 @pytest.mark.asyncio
+@pytest.mark.nightly
 @skip_mode('release', 'error injections are not supported in release mode')
 async def test_localnodes_joining_nodes(manager: ManagerClient):
     """Test that if a cluster is being enlarged and a node is coming up but
@@ -346,13 +351,16 @@ async def test_localnodes_joining_nodes(manager: ManagerClient):
     # tasks_history will wait for it anyway. For the same reason we can't
     # task.cancel() (this will cause ScyllaClusterManager's tasks_history
     # to report the ScyllaClusterManager got BROKEN and fail the next test).
-    # Sadly even abruptly killing the servers (with manager.server_stop())
-    # (with the intention to then "await task" quickly) doesn't work,
-    # probably because of a bug in the library. So we "await task"
-    # anyway, and this test takes 2 minutes :-(
-    #for server in await manager.all_servers():
-    #    await manager.server_stop(server.server_id)
-    await task
+    # The solution is kill (with SIGKILL) the server currently starting and
+    # then the "await task" will quickly finish (and report a "Failed to add
+    # server" error).
+    # Without this trick, this test will take 2 minutes of wait to finish.
+    for server in await manager.starting_servers():
+        await manager.server_stop(server.server_id)
+    try:
+        await task
+    except Exception as e:
+        assert 'Failed to add server' in str(e)
 
 @pytest.mark.asyncio
 async def test_localnodes_multi_dc_multi_rack(manager: ManagerClient):
@@ -508,7 +516,8 @@ def get_secret_key(cql, user):
             pass
     pytest.fail(f"Couldn't get secret key for user {user}")
 
-@pytest.mark.skip("flaky, needs to be fixed, see https://github.com/scylladb/scylladb/pull/20135")
+#flaky, see https://github.com/scylladb/scylladb/issues/20135")
+@pytest.mark.unstable
 @pytest.mark.asyncio
 async def test_alternator_enforce_authorization_true(manager: ManagerClient):
     """A basic test for how Alternator authentication and authorization
@@ -558,3 +567,405 @@ async def test_alternator_enforce_authorization_true(manager: ManagerClient):
             AttributeDefinitions=[ {'AttributeName': 'p', 'AttributeType': 'N' } ])
     # We could further test how GRANT works, but this would be unnecessary
     # repeating of the tests in test/alternator/test_cql_rbac.py.
+
+# Unfortunately by default a Python thread print the exception that kills
+# it (e.g., pytest assert failures) but it doesn't propagate the exception
+# to the join() - so the overall test doesn't fail. The following ThreadWrapper
+# causes join() to rethrow the exception, so the test will fail.
+class ThreadWrapper(threading.Thread):
+    def run(self):
+        try:
+            self.ret = self._target(*self._args, **self._kwargs)
+        except BaseException as e:
+            self.exception = e
+    def join(self, timeout=None):
+        super().join(timeout)
+        if hasattr(self, 'exception'):
+            raise self.exception
+        return self.ret
+
+# The following tests reproduce issue #13152, where if two schema changes
+# are attempted concurrently, one of them may fail with:
+#   "Internal server error: service::group0_concurrent_modification
+#    (Failed to apply group 0 change due to concurrent modification)."
+# We had this problem in six different operations - CreateTable, DeleteTable,
+# UpdateTable, TagResource, UntagResource and UpdateTimeToLive - so we have
+# several tests (the last three can be tested with almost identical code,
+# so they share one parameterized test).
+# Each of these tests checks concurrent invocation of just one operation
+# (e.g., CreateTable), to allow us to reproduce the missing code in that
+# specific operation. We assume that the correct code will use the same
+# lock for all operations, so we don't need to test collision of diffent
+# operations (e.g., CreateTable and DeleteTable) after we already test that
+# CreateTable and DeleteTable each does the locking and retry correctly.
+#
+# This issue can only be reproduced on a cluster of multiple nodes when
+# the operations are sent to different nodes - because a single node
+# serializes its own schema modifications. This is why these tests must
+# be here, in test/cluster, and not in the single-node test/alternator.
+
+async def test_concurrent_createtable(manager: ManagerClient):
+    """A reproducer for issue #13152 for the CreateTable operation:
+       concurrent CreateTable operations shouldn't fail "due to concurrent
+       "modification".
+    """
+    servers = await manager.servers_add(3, config=alternator_config)
+    # In boto3, "resources", the object returned by get_alternator(), are
+    # not thread-safe. However, we will create 3 threads each will write to
+    # a different alternators[i], so we're fine.
+    alternators = [get_alternator(server.ip_addr) for server in servers]
+
+    # Run the CreateTable operation, once, in each thread. There is no point
+    # in running multiple CreateTable operations, since only the very first
+    # CreateTable operation (before the table exists) will be slow and have
+    # an appreciatable chance of colliding with another concurrent operation.
+    # We'll use a barrier to increase the chance that the 3 threads start
+    # together and collide - on my test machine, before #15132 was fixed one
+    # attempt here fails around 80% of the time, which is good enough to
+    # reproduce the bug and test its fix. Nevertheless, we'll run (below)
+    # the whole check a "ntries" times in a loop, to bring number of test
+    # false-negatives even closer to zero.
+    table_name = unique_table_name()
+    barrier = threading.Barrier(len(servers), timeout=120)
+    def run_op(dynamodb):
+        barrier.wait()
+        try:
+            dynamodb.create_table(TableName=table_name,
+                BillingMode='PAY_PER_REQUEST',
+                KeySchema=[{'AttributeName': 'p', 'KeyType': 'HASH' }],
+                AttributeDefinitions=[{'AttributeName': 'p', 'AttributeType': 'N' }])
+        # Expect either a success or a ResourceInUseException.
+        # Anything else (e.g., InternalServerError) is a bug
+        except ClientError as e:
+            assert 'ResourceInUseException' in str(e)
+    ntries = 5
+    for i in range(ntries):
+        threads = [ThreadWrapper(target=run_op, args=[dynamodb]) for dynamodb in alternators]
+        for t in threads:
+            t.start()
+        try:
+            for t in threads:
+                t.join()
+            # If we're here, all the threads were successful, and the
+            # test passed. Actually it needs to pass ntries times before
+            # we really declare it successful.
+        finally:
+            barrier.reset()
+            # In theory (and in DynamoDB), delete_table() isn't possible
+            # until create_table() completed its asynchronous work, so
+            # we may need to try delete_table() multiple times.
+            timeout = time.time() + 120
+            while time.time() < timeout:
+                try:
+                    alternators[0].meta.client.delete_table(TableName=table_name)
+                    break
+                except ClientError as ce:
+                    if ce.response['Error']['Code'] == 'ResourceInUseException':
+                        time.sleep(1)
+                        continue
+                    elif ce.response['Error']['Code'] == 'ResourceNotFoundException':
+                        # The table was never created, probably we had an
+                        # exception from the table-creation threads, let's
+                        # not add more error messages here.
+                        break
+                    raise
+
+async def test_concurrent_deletetable(manager: ManagerClient):
+    """A reproducer for issue #13152 for the DeleteTable operation:
+       concurrent DeleteTable operations shouldn't fail "due to concurrent
+       "modification".
+    """
+    servers = await manager.servers_add(3, config=alternator_config)
+    alternators = [get_alternator(server.ip_addr) for server in servers]
+    table_name = unique_table_name()
+    barrier = threading.Barrier(len(servers), timeout=120)
+    def run_op(dynamodb):
+        barrier.wait()
+        try:
+            dynamodb.meta.client.delete_table(TableName=table_name)
+        # Expect either a success or a ResourceNotFoundException
+        # (indicating another thread deleted the table).
+        # Anything else (e.g., InternalServerError) is a bug
+        except ClientError as e:
+            assert 'ResourceNotFoundException' in str(e)
+    ntries = 5
+    try:
+        for i in range(ntries):
+            alternators[0].create_table(TableName=table_name,
+                BillingMode='PAY_PER_REQUEST',
+                KeySchema=[{'AttributeName': 'p', 'KeyType': 'HASH' }],
+                AttributeDefinitions=[{'AttributeName': 'p', 'AttributeType': 'N' }])
+            alternators[0].meta.client.get_waiter('table_exists').wait(TableName=table_name)
+            threads = [ThreadWrapper(target=run_op, args=[dynamodb]) for dynamodb in alternators]
+            for t in threads:
+                t.start()
+            try:
+                for t in threads:
+                    t.join()
+            finally:
+                barrier.reset()
+                try:
+                    alternators[0].meta.client.delete_table(TableName=table_name)
+                except ClientError as e:
+                    # If we got ResourceNotFoundException, the table was
+                    # already deleted by the threads, that's expected.
+                    if not 'ResourceNotFoundException' in str(e):
+                        raise
+    finally:
+        # Delete the table, if an exception above caused us not to do it.
+        try:
+            alternators[0].meta.client.delete_table(TableName=table_name)
+        except ClientError as e:
+            if not 'ResourceNotFoundException' in str(e):
+                raise
+
+async def test_concurrent_updatetable(manager: ManagerClient):
+    """A reproducer for issue #13152 for the UpdateTable operation:
+       concurrent UpdateTable operations shouldn't fail "due to concurrent
+       "modification".
+    """
+    servers = await manager.servers_add(3, config=alternator_config)
+    alternators = [get_alternator(server.ip_addr) for server in servers]
+    table_name = unique_table_name()
+    barrier = threading.Barrier(len(servers), timeout=120)
+    def run_op(dynamodb):
+        barrier.wait()
+        try:
+            # Pick a slow use case of UpdateTable (adding a GSI) to increase
+            # the likelihood of a collision.
+            dynamodb.meta.client.update_table(TableName=table_name,
+                AttributeDefinitions=[{ 'AttributeName': 'x', 'AttributeType': 'S' }],
+                GlobalSecondaryIndexUpdates=[ {  'Create':
+                    {  'IndexName': 'hello',
+                        'KeySchema': [{ 'AttributeName': 'x', 'KeyType': 'HASH' }],
+                        'Projection': { 'ProjectionType': 'ALL' }
+                    }}])
+        # Expect either a success or an error indicating another thread
+        # already added this GSI.
+        # Anything else (e.g., InternalServerError) is a bug
+        except ClientError as e:
+            assert 'GSI hello already exists' in str(e)
+    ntries = 5
+    try:
+        for i in range(ntries):
+            alternators[0].create_table(TableName=table_name,
+                BillingMode='PAY_PER_REQUEST',
+                KeySchema=[{'AttributeName': 'p', 'KeyType': 'HASH' }],
+                AttributeDefinitions=[{'AttributeName': 'p', 'AttributeType': 'N' }])
+            alternators[0].meta.client.get_waiter('table_exists').wait(TableName=table_name)
+            threads = [ThreadWrapper(target=run_op, args=[dynamodb]) for dynamodb in alternators]
+            for t in threads:
+                t.start()
+            try:
+                for t in threads:
+                    t.join()
+            finally:
+                barrier.reset()
+                alternators[0].meta.client.delete_table(TableName=table_name)
+    finally:
+        # Delete the table, if an exception above caused us not to do it.
+        try:
+            alternators[0].meta.client.delete_table(TableName=table_name)
+        except ClientError as e:
+            if not 'ResourceNotFoundException' in str(e):
+                raise
+
+@pytest.mark.parametrize('op', ['TagResource', 'UntagResource', 'UpdateTimeToLive'])
+async def test_concurrent_modify_tags(manager: ManagerClient, op):
+    """A reproducer for issue #13152 for the TagResource, UntagResource
+       and UpdateTimeToLive operation (each one in a separate parametrization
+       of the test). Concurrent operations shouldn't fail "due to concurrent
+       "modification".
+       The name of this test is named after db::modify_tags(), which all
+       three of these operations use to implement the change to the table.
+    """
+    servers = await manager.servers_add(3, config=alternator_config)
+    alternators = [get_alternator(server.ip_addr) for server in servers]
+    table_name = unique_table_name()
+    barrier = threading.Barrier(len(servers), timeout=120)
+    def run_op(dynamodb):
+        barrier.wait()
+        if op == 'TagResource':
+            arn = dynamodb.meta.client.describe_table(TableName=table_name)['Table']['TableArn']
+            dynamodb.meta.client.tag_resource(ResourceArn=arn, Tags=[{'Key': 'animal', 'Value': 'dog'}])
+        elif op == 'UntagResource':
+            arn = dynamodb.meta.client.describe_table(TableName=table_name)['Table']['TableArn']
+            dynamodb.meta.client.untag_resource(ResourceArn=arn, TagKeys=['animal'])
+        elif op == 'UpdateTimeToLive':
+            # For the UpdateTimeToLive operation to actually attempt a write
+            # (and possibly notice a collision), we need to set Enabled to
+            # the opposite of what it is right now. Let's just pick a random
+            # boolean - 50% of the time it will do the right thing and
+            # we may see the collision.
+            try:
+                dynamodb.meta.client.update_time_to_live(TableName=table_name,
+                    TimeToLiveSpecification={'AttributeName': 'xxx', 'Enabled': bool(random.getrandbits(1))})
+            except ClientError as e:
+                if not 'TTL is already' in str(e):
+                    raise
+        else:
+            pytest.fail(f'oops, bad op {op}')
+    alternators[0].create_table(TableName=table_name,
+        BillingMode='PAY_PER_REQUEST',
+        KeySchema=[{'AttributeName': 'p', 'KeyType': 'HASH' }],
+        AttributeDefinitions=[{'AttributeName': 'p', 'AttributeType': 'N' }])
+    alternators[0].meta.client.get_waiter('table_exists').wait(TableName=table_name)
+    ntries = 5
+    try:
+        for i in range(ntries):
+            threads = [ThreadWrapper(target=run_op, args=[dynamodb]) for dynamodb in alternators]
+            for t in threads:
+                t.start()
+            try:
+                for t in threads:
+                    t.join()
+            finally:
+                barrier.reset()
+    finally:
+        alternators[0].meta.client.delete_table(TableName=table_name)
+
+async def nodes_with_data(manager, ks, cf, host):
+    """Retrieves a set of node uuids which contain *any* data for the given
+       table. If the table uses tablets, we use the system.tablets (via
+       the convenience function get_all_tablet_replicas()). But if the table
+       uses vnodes, we use a REST API request /storage_service/tokens_endpoint
+       which returns the primary node for each token (with vnodes, if a node
+       has any data at all, it is also primary for some of the data).
+       The information is retrieved using requests to the given "host",
+       which can be any live node.
+    """
+    r = await get_all_tablet_replicas(manager, host, ks, cf)
+    if r:
+        # If table uses tablets it will have a non-empty list of tablets (r)
+        # and we return it here.
+        return { item[0] for entry in r for item in entry.replicas }
+    else:
+        # Otherwise, the table uses vnodes. Use the REST API that only
+        # makes sense with vnodes. Convert the host IP addresses that this
+        # API returns to uuids like we have in the system tables
+        j = await manager.api.client.get_json('/storage_service/tokens_endpoint', host=host.ip_addr)
+        return { await manager.api.get_host_id(entry['value']) for entry in j }
+
+@pytest.mark.parametrize("tablets", [True, False])
+@pytest.mark.asyncio
+async def test_zero_token_node_load_balancer(manager, tablets):
+    """Test that a zero-token node (a.k.a. coordinator-only or proxy node),
+       can be used as an Alternator server-side load balancer as proposed in
+       issue #6527. We set up a cluster with four ordinary nodes (one DC and
+       one rack), and a fifth node which doesn't have any data (a zero-token
+       node), and make different Alternator requests (CreateTable, PutItem,
+       GetItem) to this data-less fifth node, and they should work. Finally
+       we verify that the fifth node really does not have any data (and
+       wasn't just created as a normal data-holding node).
+       Because the implementation of zero-token nodes is very different
+       for the tablets and vnodes cases, this test has two parametrized
+       versions - tablets=True and tablets=False.
+    """
+    if tablets:
+        tags = [{'Key': 'experimental:initial_tablets', 'Value': '0'}]
+    else:
+        tags = [{'Key': 'experimental:initial_tablets', 'Value': 'none'}]
+    # Start a cluster with 4 nodes. Alternator uses RF=3, so with 4 nodes
+    # the assignment of data (tablets or vnodes) to nodes isn't trivial,
+    # which will allow us to check that non-trivial request forwarding works.
+    servers = await manager.servers_add(4, config=alternator_config, auto_rack_dc="dc1")
+    # Add a fifth node, with zero tokens (no data), by setting join_ring=false:
+    zero_token_server = await manager.server_add(config=alternator_config | {'join_ring': False},
+                                                 property_file={'dc': 'dc1', 'rack': 'rack-zero-token'})
+
+    # Get an Alternator connection to the zero-token node:
+    alternator = get_alternator(zero_token_server.ip_addr)
+
+    # Create a new table, write 10 different items to it and then read them
+    # back - doing all of this through the zero-token node:
+    table = alternator.create_table(TableName=unique_table_name(),
+        Tags=tags,
+        BillingMode='PAY_PER_REQUEST',
+        KeySchema=[
+            {'AttributeName': 'p', 'KeyType': 'HASH' },
+        ],
+        AttributeDefinitions=[
+            {'AttributeName': 'p', 'AttributeType': 'N' },
+        ])
+    items = [{'p': i, 'x': f'hello {i}'} for i in range(10)]
+    for item in items:
+        table.put_item(Item=item)
+    for item in items:
+        assert item == table.get_item(Key={'p': item['p']}, ConsistentRead=True)['Item']
+    # Verify that the zero-token node is really "zero-token", i.e., does not
+    # have any data for our table. The nodes_with_data() function returns
+    # the list of node uuids which contain *any* data for the given table -
+    # we want this to be just the first four nodes in "servers", not the
+    # fifth node zero_token_server.
+    ks = f"alternator_{table.name}"
+    repl = get_replication(manager.get_cql(), ks)
+    if type(repl["dc1"]) is list:
+        expected = { await manager.get_host_id(s.server_id) for s in servers if s.rack in repl["dc1"] }
+    else:
+        expected = { await manager.get_host_id(s.server_id) for s in servers }
+    got = await nodes_with_data(manager, 'alternator_'+table.name, table.name, zero_token_server)
+    assert got == expected
+    table.delete()
+
+@pytest.mark.xfail(reason="#16261")
+async def test_alternator_concurrent_rmw_same_partition_different_server(manager: ManagerClient):
+    """A reproducer for issue #16261: When sending RMW (read-modify-write)
+       operations to the same partition (different item) on different server
+       nodes (coordinators), our LWT implementation can reach an
+       "uncertainty" situation where it doesn't know whether the update
+       succceeded or passed, and returns a failure (InternalServerError)
+       almost immediately, not after a cas_contention_timeout_in_ms timeout
+       (1 second).
+    """
+    servers = await manager.servers_add(3, config=alternator_config)
+    alternator = get_alternator(servers[0].ip_addr)
+    ips = [server.ip_addr for server in await manager.running_servers()]
+    table = alternator.create_table(TableName=unique_table_name(),
+        BillingMode='PAY_PER_REQUEST',
+        KeySchema=[
+            {'AttributeName': 'p', 'KeyType': 'HASH' },
+            {'AttributeName': 'c', 'KeyType': 'RANGE' },
+        ],
+        AttributeDefinitions=[
+            {'AttributeName': 'p', 'AttributeType': 'N' },
+            {'AttributeName': 'c', 'AttributeType': 'N' },
+        ])
+
+    # All threads write to one partition 1, each to a different item
+    # in that partition (its clustering key is the thread's number).
+    # Each update gets sent to a random node (we have 3 nodes in ips).
+    nthreads = 3
+    def run_rmw(i):
+        rand = random.Random()
+        rand.seed(i)
+        alternators = [get_alternator(ip) for ip in ips]
+        # In about 1/10 runs, just one write from each thread is enough
+        # to elicit the error. But if I want to get the error in almost
+        # every run, I need to repeat the write more times, until two
+        # of the writes collide and cause the bug.
+        for n in range(150):
+            alternator_i = rand.randrange(len(alternators))
+            alternator = alternators[alternator_i]
+            tbl = alternator.Table(table.name)
+            start = time.time()
+            try:
+                tbl.update_item(Key={'p': 1, 'c': i},
+                    UpdateExpression='SET v = if_not_exists(v, :init) + :incr',
+                    ExpressionAttributeValues={':init': 0, ':incr': 1})
+            except ClientError:
+                # The "raise" will cause this thread to fail, and eventually
+                # the join() and therefore the whole test will fail. We also
+                # print the time it took for the failure, because it
+                # demonstrates that issue #16261 involves an immediate
+                # error (in less than 20ms), NOT a normal timeout.
+                print(f"In incrementing 1,{i} on node {alternator_i}: error after {time.time()-start}")
+                raise
+
+    threads = [ThreadWrapper(target=run_rmw, args=(i,)) for i in range(nthreads)]
+    for t in threads:
+        t.start()
+    try:
+        for t in threads:
+            t.join()
+    finally:
+        table.delete()

@@ -12,7 +12,7 @@
 #include "db/system_keyspace.hh"
 #include "readers/mutation_reader.hh"
 #include "mutation/mutation_fragment_v2.hh"
-#include "query-request.hh"
+#include "query/query-request.hh"
 #include "schema/schema_fwd.hh"
 #include "secondary_index_manager.hh"
 #include "view_info.hh"
@@ -53,8 +53,8 @@ class built_indexes_virtual_reader {
                 const schema& built_indexes_schema)
         {
             bool singular = range.is_singular();
-            auto start = range.start();
-            auto end = range.end();
+            auto start = range.start_copy();
+            auto end = range.end_copy();
             if (start) {
                 *start = query::clustering_range::bound(
                     index_name_to_view_name(start->value(), built_views_schema, built_indexes_schema),
@@ -113,7 +113,7 @@ class built_indexes_virtual_reader {
                 , _db(db)
                 , _schema(std::move(schema))
                 , _view_names_slice(index_slice_to_view_slice(slice, *built_views.schema(), *_schema))
-                , _underlying(built_views.make_reader_v2(
+                , _underlying(built_views.make_mutation_reader(
                         built_views.schema(),
                         std::move(permit),
                         range,

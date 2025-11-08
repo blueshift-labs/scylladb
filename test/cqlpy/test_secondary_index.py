@@ -15,7 +15,7 @@ from cassandra.protocol import SyntaxException, AlreadyExists, InvalidRequest, C
 from cassandra.query import SimpleStatement
 from .cassandra_tests.porting import assert_rows, assert_row_count, assert_rows_ignoring_order, assert_empty
 
-from .util import new_test_table, unique_name, unique_key_int, is_scylla
+from .util import new_test_table, unique_name, unique_key_int, is_scylla, ScyllaMetrics
 
 # A reproducer for issue #7443: Normally, when the entire table is SELECTed,
 # the partitions are returned sorted by the partitions' token. When there
@@ -1981,6 +1981,55 @@ def test_index_in_system_tables(cql, test_keyspace):
         res = cql.execute(f'select * from system."IndexInfo" where table_name = \'{test_keyspace}\' AND index_name = \'{index_name}\'').one()
         assert (test_keyspace, index_name) == (res.table_name, res.index_name)
 
+# The following test needs an index that we know is already built. We
+# create here an index on an empty table, so it should be built almost
+# immediately, but nevertheless we use wait_for_index() to ensure that
+# it is (we assume that wait_for_index() works somehow, possibly differently
+# on different versions of Scylla and Cassandra).
+@pytest.fixture(scope="module")
+def built_index(cql, test_keyspace):
+    with new_test_table(cql, test_keyspace, "p int PRIMARY KEY, v int") as table:
+        index_name = unique_name()
+        cql.execute(f"CREATE INDEX {index_name} ON {table}(v)")
+        wait_for_index(cql, test_keyspace, index_name)
+        yield (table, index_name)
+
+# Check that a built index is listed in system."IndexInfo". This system
+# table was first introduced in Cassandra 2.1.
+# This test does not check that a created but not-yet-built index is not
+# in IndexInfo.
+def test_built_index_in_system_indexinfo(cql, built_index):
+    table, index_name = built_index
+    keyspace_name, table_name = table.split('.')
+    index_info = [ (r.table_name, r.index_name) for r in cql.execute('select * from system."IndexInfo"')]
+    # Note that confusingly, the "table_name"  column in IndexInfo is
+    # NOT the table's name - it's the keyspace name!
+    assert (keyspace_name, index_name) in index_info
+
+# Check that an index is listed in system_schema.indexes. This system
+# table was first introduced in Cassandra 3.0, and we also test the
+# extra "kind" and "options" fields it contains.
+# Note that this table lists all created indexes - not just fully-built
+# indexes - but this test doesn't verify that - the index we test on is
+# already built.
+def test_index_in_system_schema_indexes(cql, built_index):
+    table, index_name = built_index
+    keyspace_name, table_name = table.split('.')
+    res = [r for r in cql.execute('select * from system_schema.indexes') if r.index_name == index_name ]
+    assert len(res) == 1
+    assert res[0].index_name == index_name
+    assert res[0].keyspace_name == keyspace_name
+    assert res[0].table_name == table_name
+    # While it's not clearly documented anywhere what the "kind" and "options"
+    # columns in this table mean, and why, we see that in both Scylla and
+    # Cassandra, "kind" is always "COMPOSITES" (for a non-custom index on
+    # a non-compact table), and the only thing that "options" contains is
+    # a "target" which (in the case of a global index of a single column)
+    # contains just the column name, here "v". Let's check that this continues
+    # to be the true, and doesn't accidentally regress.
+    assert res[0].kind == 'COMPOSITES'
+    assert res[0].options == {'target': 'v'}
+
 # Test index representation in REST API
 def test_index_in_API(cql, test_keyspace):
     with new_test_table(cql, test_keyspace, "p int PRIMARY KEY, v int") as table:
@@ -2027,7 +2076,7 @@ def test_limit_partition(cql, test_keyspace):
         assert rs.has_more_pages == False
         # Test LIMIT across partitions - reproduces #22158.
         rs = cql.execute(f'SELECT pk1, ck FROM {table} WHERE pk2 = 1 LIMIT 3')
-        assert sorted(list(rs)) == [(1,1), (1,2), (2,1)]
+        assert sorted(list(rs)) == [(1,1), (2,1), (2,2)]
         assert rs.has_more_pages == False
 
 
@@ -2051,3 +2100,102 @@ def test_limit_partition_slice(cql, test_keyspace):
         rs = cql.execute(f'SELECT pk, ck2 FROM {table} WHERE ck1 = 1 LIMIT 3')
         assert sorted(list(rs)) == [(1,1), (1,2), (2,1)]
         assert rs.has_more_pages == False
+
+def test_index_metrics(cql, test_keyspace, scylla_only):
+    with new_test_table(cql, test_keyspace, "p int PRIMARY KEY, v int") as table:
+        index_name = unique_name()
+        cql.execute(f"CREATE INDEX {index_name} ON {table}(v)")
+        wait_for_index(cql, test_keyspace, index_name)
+        initial_metrics = ScyllaMetrics.query(cql)
+        initial_count = initial_metrics.get(f'scylla_index_query_latencies_count', {"idx": index_name, "ks": test_keyspace})
+        if initial_count is None:
+            initial_count = 0
+        cql.execute(f"SELECT * FROM {table} WHERE v=1")
+        current_metrics = ScyllaMetrics.query(cql)
+        current_count = current_metrics.get(f'scylla_index_query_latencies_count', {"idx": index_name, "ks": test_keyspace})
+        assert current_count - initial_count == 1
+
+# Test combination of indexing, paging and aggregation.
+# Indexed queries used to erroneously return partial per-page results
+# for aggregation queries, as described in issue #4540. This test
+# (originally written in C++ in commit 3d9a37f28fe) reproduced that bug.
+def test_indexing_paging_and_aggregation(cql, test_keyspace):
+    # from cql3/statements/select_statement.cc:
+    DEFAULT_COUNT_PAGE_SIZE = 10000
+    row_count = 2 * DEFAULT_COUNT_PAGE_SIZE + 120
+    with new_test_table(cql, test_keyspace, 'id int primary key, v int') as table:
+        cql.execute(f'CREATE INDEX ON {table}(v)')
+        stmt = cql.prepare(f'INSERT INTO {table} (id, v) VALUES (?, ?)')
+        for i in range(row_count):
+            cql.execute(stmt, [i + 1, i % 2])
+        # In Scylla, in a single-node test materialized views and therefore
+        # secondary indexes have synchronous updates, so we can read the
+        # indexed data immediately. In Cassandra, secondary indexes are
+        # always synchronously updated (they don't use materialized views).
+        res = list(cql.execute(f'SELECT sum(id) FROM {table} WHERE v = 1'))
+        # Aggregation (like sum(id)) internally pages through the data
+        # DEFAULT_COUNT_PAGE_SIZE (=10,000) rows at a time, but even though
+        # we have more rows than that in the table, it must only return a
+        # single result row when all the data was aggregated - the CQL API
+        # doesn't allow it to return return partial, per-page, results.
+        # The expression in the following assert computes the sum of the
+        # v=1 entries, which are the even-numbered ids up to row_count.
+        # A short proof sketch (remember that row_count is even):
+        #  2 + 4 + 6 + ... row_count
+        #           = 2 * (1 + 2 + 3 + ... row_count/2)
+        # According to Gauss's summation formula (easily proved by a child),
+        #           = 2 * (row_count/2 * (row_count/2 + 1)) / 2
+        #           = row_count/2 * (row_count/2 + 1)
+        #           = row_count*row_count/4 + row_count/2
+        # We have below several other similar formulas, the margin is too
+        # narrow to include the proofs for all of them :-)
+        assert res == [(row_count * row_count // 4 + row_count // 2,)]
+        # If we specify a page size ("fetch_size") on the request, it is not
+        # expected to change anything, since the output is just one row.
+        # The aggregation doesn't use this page size to control its internal
+        # paging through the data - for that DEFAULT_COUNT_PAGE_SIZE is still
+        # used.
+        # This test doesn't actually check that internally the tiny page
+        # size = 2 doesn't get used, so it doesn't add much...
+        stmt = SimpleStatement(f'SELECT sum(id) FROM {table} WHERE v = 0', fetch_size=2)
+        assert list(cql.execute(stmt)) == [(row_count * row_count // 4,)]
+        # Same check as we did for sum(), but for avg()
+        res = list(cql.execute(f'SELECT avg(id) FROM {table} WHERE v = 1'))
+        assert res == [(row_count // 2 + 1,)]
+
+    # Test the same thing again, but this time the indexed column is a
+    # clustering key column, not the first one. After issue #3405 we
+    # have a special code path for indexing composite non-prefix clustering
+    # keys, so we want to exercise it too.
+    with new_test_table(cql, test_keyspace, 'id int, c1 int, c2 int, primary key(id, c1, c2)') as table:
+        cql.execute(f'CREATE INDEX ON {table}(c2)')
+        stmt = cql.prepare(f'INSERT INTO {table} (id, c1, c2) VALUES (?, ?, ?)')
+        for i in range(row_count):
+            cql.execute(stmt, [i + 1, i + 1, i % 2])
+        stmt = SimpleStatement(f'SELECT sum(id) FROM {table} WHERE c2 = 0', fetch_size=2)
+        assert list(cql.execute(stmt)) == [(row_count * row_count // 4,)]
+        stmt = SimpleStatement(f'SELECT avg(id) FROM {table} WHERE c2 = 1', fetch_size=3)
+        assert list(cql.execute(stmt)) == [(row_count / 2 + 1,)]
+
+# Verify that a newly created secondary index has
+# the property `tombstone_gc` set to some value.
+#
+# Reproducer of scylladb/scylladb#26542
+def test_tombstone_gc_property(cql, test_keyspace, scylla_only):
+    with new_test_table(cql, test_keyspace, "p int PRIMARY KEY, v int") as table:
+        index_name = unique_name()
+        cql.execute(f"CREATE INDEX {index_name} ON {table}(v)")
+
+        desc_row = cql.execute(f"DESCRIBE MATERIALIZED VIEW {test_keyspace}.{index_name}_index").one()
+        assert "tombstone_gc = {" in desc_row.create_statement
+
+# Verify that a newly created unnamed secondary index has
+# the property `tombstone_gc` set to some value.
+#
+# Reproducer of scylladb/scylladb#26542
+def test_tombstone_gc_property_unnamed_index(cql, test_keyspace, scylla_only):
+    with new_test_table(cql, test_keyspace, "p int PRIMARY KEY, v int") as table:
+        cql.execute(f"CREATE INDEX ON {table}(v)")
+
+        desc_row = cql.execute(f"DESCRIBE MATERIALIZED VIEW {table}_v_idx_index").one()
+        assert "tombstone_gc = {" in desc_row.create_statement

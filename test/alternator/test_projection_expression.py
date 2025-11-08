@@ -22,17 +22,17 @@ from test.alternator.util import random_string, full_scan, full_query, multiset
 # attributes as well, one needs to select them explicitly. When no key
 # attributes are selected, an item may have *none* of the selected
 # attributes, and returned as an empty item.
-def test_projection_expression_toplevel(test_table):
+def test_projection_expression_toplevel(test_table_ss):
     p = random_string()
     c = random_string()
     item = {'p': p, 'c': c, 'a': 'hello', 'b': 'hi'}
-    test_table.put_item(Item=item)
+    test_table_ss.put_item(Item=item)
     for wanted in [ ['a'],             # only non-key attribute
                     ['c', 'a'],        # a key attribute (sort key) and non-key
                     ['p', 'c'],        # entire key
                     ['nonexistent']    # Our item doesn't have this
                    ]:
-        got_item = test_table.get_item(Key={'p': p, 'c': c}, ProjectionExpression=",".join(wanted), ConsistentRead=True)['Item']
+        got_item = test_table_ss.get_item(Key={'p': p, 'c': c}, ProjectionExpression=",".join(wanted), ConsistentRead=True)['Item']
         expected_item = {k: item[k] for k in wanted if k in item}
         assert expected_item == got_item
 
@@ -84,10 +84,10 @@ def test_projection_expression_scan(filled_test_table):
         expected_items = [{k: x[k] for k in wanted if k in x} for x in items]
         assert multiset(expected_items) == multiset(got_items)
 
-def test_projection_expression_query(test_table):
+def test_projection_expression_query(test_table_ss):
     p = random_string()
     items = [{'p': p, 'c': str(i), 'a': str(i*10), 'b': str(i*100) } for i in range(10)]
-    with test_table.batch_writer() as batch:
+    with test_table_ss.batch_writer() as batch:
         for item in items:
             batch.put_item(item)
     for wanted in [ ['a'],             # only non-key attributes
@@ -95,7 +95,7 @@ def test_projection_expression_query(test_table):
                     ['p', 'c'],        # entire key
                     ['nonexistent']    # none of the items have this attribute!
                    ]:
-        got_items = full_query(test_table, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, ProjectionExpression=",".join(wanted))
+        got_items = full_query(test_table_ss, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, ProjectionExpression=",".join(wanted))
         expected_items = [{k: x[k] for k in wanted if k in x} for x in items]
         assert multiset(expected_items) == multiset(got_items)
 
@@ -261,27 +261,27 @@ def test_projection_expression_path_conflict(test_table_s):
 
 # Above we nested paths in ProjectionExpression, but just for the GetItem
 # request. Let's verify they also work in Query and Scan requests:
-def test_query_projection_expression_path(test_table):
+def test_query_projection_expression_path(test_table_ss):
     p = random_string()
     items = [{'p': p, 'c': str(i), 'a': {'x': str(i*10), 'y': 'hi'}, 'b': 'hello' } for i in range(10)]
-    with test_table.batch_writer() as batch:
+    with test_table_ss.batch_writer() as batch:
         for item in items:
             batch.put_item(item)
-    got_items = full_query(test_table, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, ProjectionExpression="a.x")
+    got_items = full_query(test_table_ss, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, ProjectionExpression="a.x")
     expected_items = [{'a': {'x': x['a']['x']}} for x in items]
     assert multiset(expected_items) == multiset(got_items)
 
-def test_scan_projection_expression_path(test_table):
+def test_scan_projection_expression_path(test_table_ss):
     # This test is similar to test_query_projection_expression_path above,
     # but uses a scan instead of a query. The scan will generate unrelated
     # partitions created by other tests (hopefully not too many...) that we
     # need to ignore. We also need to ask for "p" too, so we can filter by it.
     p = random_string()
     items = [{'p': p, 'c': str(i), 'a': {'x': str(i*10), 'y': 'hi'}, 'b': 'hello' } for i in range(10)]
-    with test_table.batch_writer() as batch:
+    with test_table_ss.batch_writer() as batch:
         for item in items:
             batch.put_item(item)
-    got_items = [ x for x in full_scan(test_table, ProjectionExpression="p, a.x") if x['p'] == p]
+    got_items = [ x for x in full_scan(test_table_ss, ProjectionExpression="p, a.x") if x['p'] == p]
     expected_items = [{'p': p, 'a': {'x': x['a']['x']}} for x in items]
     assert multiset(expected_items) == multiset(got_items)
 
@@ -347,3 +347,34 @@ def test_projection_expression_path_nesting_levels(test_table_s):
     # nesting levels: 33".
     with pytest.raises(ClientError, match='ValidationException.*nesting levels'):
         test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='a'+('.b'*32))
+
+# Above we already checked different cases of reading individual elements
+# from a list - the expression a[i]. The following test exercises these
+# list indexes more rigourously, including testing what happens when the
+# index overflows an integer (reproducing #25947).
+def test_projection_expression_list_index(test_table_s):
+    p = random_string()
+    test_table_s.put_item(Item={'p': p, 'a': [7, 42]})
+    # a[0] and a[1] return the elements from the list, as expected
+    # (note that a[i] actually returns an array with a single element a[i])
+    assert {'a': [7]} == test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='a[0]')['Item']
+    assert {'a': [42]} == test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='a[1]')['Item']
+    # If the index is beyond the length of the array, such as a[2] or a[999],
+    # we expect to get back an empty Item - not an error, and not missing Item.
+    assert {} == test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='a[2]')['Item']
+    assert {} == test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='a[999]')['Item']
+    # If the index is so high that it can't be parsed as an integer, it isn't
+    # silently ignored like 999 above, but causes a parse error. DynamoDB
+    # reports: "Invalid ProjectionExpression: List index is not within the
+    # allowable range; index: [99999999999999]". After fixing #25947,
+    # Alternator reports: "Failed parsing ProjectionExpression
+    # 'a[99999999999999]': list index out of integer range".
+    with pytest.raises(ClientError, match='ValidationException.*ProjectionExpression.*index'):
+        test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='a[99999999999999]')['Item']
+    # Trying to use a negative number as an index, like a[-1], is just a
+    # syntax error - the parser expects to see digits, not "-".
+    with pytest.raises(ClientError, match='ValidationException.*ProjectionExpression.*[Ss]yntax error'):
+        test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='a[-1]')['Item']
+    # A completely missing index - a[] - is also a syntax error:
+    with pytest.raises(ClientError, match='ValidationException.*ProjectionExpression.*[Ss]yntax error'):
+        test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='a[]')['Item']

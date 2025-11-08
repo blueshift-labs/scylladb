@@ -7,11 +7,9 @@
 from __future__ import annotations
 
 import logging
-import os
-import xml.etree.ElementTree as ET
 from typing import TYPE_CHECKING
 
-from test.pylib.suite.base import  Test, TestSuite,run_test
+from test.pylib.suite.base import Test, TestSuite, run_test
 from test.pylib.util import LogPrefixAdapter
 
 if TYPE_CHECKING:
@@ -46,7 +44,7 @@ class ToolTest(Test):
         super().__init__(test_no, shortname, suite)
         launcher = self.suite.cfg.get("launcher", "pytest")
         self.path = launcher.split(maxsplit=1)[0]
-        self.xmlout = os.path.join(self.suite.options.tmpdir, self.mode, "xml", self.uname + ".xunit.xml")
+        self.xmlout = self.suite.log_dir / "xml" / f"{self.uname}.xunit.xml"
 
     def _prepare_pytest_params(self, options: argparse.Namespace):
         launcher = self.suite.cfg.get("launcher", "pytest")
@@ -61,6 +59,8 @@ class ToolTest(Test):
             "--mode={}".format(self.mode),
             "--run_id={}".format(self.id)
         ]
+        if options.gather_metrics:
+            self.args.append("--gather-metrics")
         self.args.append(f"--alluredir={self.allure_dir}")
         if not options.save_log_on_success:
             self.args.append("--allure-no-capture")
@@ -83,6 +83,3 @@ class ToolTest(Test):
         self.success = await run_test(self, options)
         logger.info("Test %s %s", self.uname, "succeeded" if self.success else "failed ")
         return self
-
-    def write_junit_failure_report(self, xml_res: ET.Element) -> None:
-        super().write_junit_failure_report(xml_res)

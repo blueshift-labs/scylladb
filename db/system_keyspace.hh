@@ -14,22 +14,25 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include "db/view/view_build_status.hh"
 #include "gms/gossiper.hh"
 #include "schema/schema_fwd.hh"
 #include "utils/UUID.hh"
-#include "query-result-set.hh"
+#include "query/query-result-set.hh"
 #include "db_clock.hh"
 #include "mutation_query.hh"
 #include "system_keyspace_view_types.hh"
 #include "sstables/sstables_registry.hh"
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include "cdc/generation_id.hh"
+#include "cdc/generation.hh"
 #include "locator/host_id.hh"
 #include "virtual_tables.hh"
 #include "types/types.hh"
 #include "auth_version.hh"
+#include "db/view/view_building_state.hh"
 
-namespace utils {
+namespace netw {
     class shared_dict;
 };
 
@@ -110,18 +113,7 @@ class system_keyspace_view_build_progress;
 struct replay_position;
 typedef std::vector<db::replay_position> replay_positions;
 
-
-struct compaction_history_entry {
-    utils::UUID id;
-    sstring ks;
-    sstring cf;
-    int64_t compacted_at = 0;
-    int64_t bytes_in = 0;
-    int64_t bytes_out = 0;
-    // Key: number of rows merged
-    // Value: counter
-    std::unordered_map<int32_t, int64_t> rows_merged;
-};
+struct compaction_history_entry;
 
 class system_keyspace : public seastar::peering_sharded_service<system_keyspace>, public seastar::async_sharded_service<system_keyspace> {
     cql3::query_processor& _qp;
@@ -142,6 +134,7 @@ class system_keyspace : public seastar::peering_sharded_service<system_keyspace>
     static schema_ptr large_partitions();
     static schema_ptr large_rows();
     static schema_ptr large_cells();
+    static schema_ptr corrupt_data();
     static schema_ptr scylla_local();
     future<> force_blocking_flush(sstring cfname);
     // This function is called when the system.peers table is read,
@@ -153,6 +146,17 @@ class system_keyspace : public seastar::peering_sharded_service<system_keyspace>
     //  and this node crashes after adding a new IP but before removing the old one. The
     //  record with older timestamp is removed, the warning is written to the log.
     future<> peers_table_read_fixup();
+
+    struct peers_cache: public enable_lw_shared_from_this<peers_cache> {
+        std::unordered_map<gms::inet_address, locator::host_id> inet_ip_to_host_id;
+        std::unordered_map<locator::host_id, gms::inet_address> host_id_to_inet_ip;
+        lowres_clock::time_point expiration_time;
+    };
+    lw_shared_ptr<peers_cache> _peers_cache;
+    semaphore _peers_cache_lock{1};
+    peers_cache* get_peers_cache();
+    future<lw_shared_ptr<const peers_cache>> get_or_load_peers_cache();
+
 public:
     static schema_ptr size_estimates();
 public:
@@ -174,6 +178,7 @@ public:
     static constexpr auto LARGE_PARTITIONS = "large_partitions";
     static constexpr auto LARGE_ROWS = "large_rows";
     static constexpr auto LARGE_CELLS = "large_cells";
+    static constexpr auto CORRUPT_DATA = "corrupt_data";
     static constexpr auto SCYLLA_LOCAL = "scylla_local";
     static constexpr auto RAFT = "raft";
     static constexpr auto RAFT_SNAPSHOTS = "raft_snapshots";
@@ -186,10 +191,13 @@ public:
     static constexpr auto TOPOLOGY_REQUESTS = "topology_requests";
     static constexpr auto SSTABLES_REGISTRY = "sstables";
     static constexpr auto CDC_GENERATIONS_V3 = "cdc_generations_v3";
+    static constexpr auto CDC_STREAMS_STATE = "cdc_streams_state";
+    static constexpr auto CDC_STREAMS_HISTORY = "cdc_streams_history";
     static constexpr auto TABLETS = "tablets";
     static constexpr auto SERVICE_LEVELS_V2 = "service_levels_v2";
     static constexpr auto VIEW_BUILD_STATUS_V2 = "view_build_status_v2";
     static constexpr auto DICTS = "dicts";
+    static constexpr auto VIEW_BUILDING_TASKS = "view_building_tasks";
 
     // auth
     static constexpr auto ROLES = "roles";
@@ -281,10 +289,13 @@ public:
     static schema_ptr topology_requests();
     static schema_ptr sstables_registry();
     static schema_ptr cdc_generations_v3();
+    static schema_ptr cdc_streams_state();
+    static schema_ptr cdc_streams_history();
     static schema_ptr tablets();
     static schema_ptr service_levels_v2();
     static schema_ptr view_build_status_v2();
     static schema_ptr dicts();
+    static schema_ptr view_building_tasks();
 
     // auth
     static schema_ptr roles();
@@ -317,6 +328,12 @@ public:
 
     future<> update_peer_info(gms::inet_address ep, locator::host_id hid, const peer_info& info);
 
+    // Return ip of the peers table entry with given host id
+    future<std::optional<gms::inet_address>> get_ip_from_peers_table(locator::host_id id);
+
+    using host_id_to_ip_map_t = std::unordered_map<locator::host_id, gms::inet_address>;
+    future<host_id_to_ip_map_t> get_host_id_to_ip_map();
+
     future<> remove_endpoint(gms::inet_address ep);
 
     // Saves the key-value pair into system.scylla_local table.
@@ -346,16 +363,16 @@ public:
     /// overloads
 
     future<foreign_ptr<lw_shared_ptr<reconcilable_result>>>
-    static query_mutations(distributed<replica::database>& db,
+    static query_mutations(sharded<replica::database>& db,
                     schema_ptr schema);
 
     future<foreign_ptr<lw_shared_ptr<reconcilable_result>>>
-    static query_mutations(distributed<replica::database>& db,
+    static query_mutations(sharded<replica::database>& db,
                     const sstring& ks_name,
                     const sstring& cf_name);
 
     future<foreign_ptr<lw_shared_ptr<reconcilable_result>>>
-    static query_mutations(distributed<replica::database>& db,
+    static query_mutations(sharded<replica::database>& db,
                     const sstring& ks_name,
                     const sstring& cf_name,
                     const dht::partition_range& partition_range,
@@ -363,14 +380,14 @@ public:
 
     // Returns all data from given system table.
     // Intended to be used by code which is not performance critical.
-    static future<lw_shared_ptr<query::result_set>> query(distributed<replica::database>& db,
+    static future<lw_shared_ptr<query::result_set>> query(sharded<replica::database>& db,
                     const sstring& ks_name,
                     const sstring& cf_name);
 
     // Returns a slice of given system table.
     // Intended to be used by code which is not performance critical.
     static future<lw_shared_ptr<query::result_set>> query(
-        distributed<replica::database>& db,
+        sharded<replica::database>& db,
         const sstring& ks_name,
         const sstring& cf_name,
         const dht::decorated_key& key,
@@ -389,8 +406,7 @@ public:
         DECOMMISSIONED
     };
 
-    future<> update_compaction_history(utils::UUID uuid, sstring ksname, sstring cfname, int64_t compacted_at, int64_t bytes_in, int64_t bytes_out,
-                                       std::unordered_map<int32_t, int64_t> rows_merged);
+    future<> update_compaction_history(compaction_history_entry);
     using compaction_history_consumer = noncopyable_function<future<>(const compaction_history_entry&)>;
     future<> get_compaction_history(compaction_history_consumer f);
 
@@ -407,13 +423,17 @@ public:
     struct topology_requests_entry {
         utils::UUID id;
         utils::UUID initiating_host;
-        std::optional<service::topology_request> request_type;
+        std::variant<std::monostate, service::topology_request, service::global_topology_request> request_type;
         db_clock::time_point start_time;
         bool done;
         sstring error;
         db_clock::time_point end_time;
         db_clock::time_point ts;
         table_id truncate_table_id;
+        // The name of the KS that is being the target of the scheduled ALTER KS statement
+        std::optional<sstring> new_keyspace_rf_change_ks_name;
+        // The KS options to be used when executing the scheduled ALTER KS statement
+        std::optional<std::unordered_map<sstring, sstring>> new_keyspace_rf_change_data;
     };
     using topology_requests_entries = std::unordered_map<utils::UUID, system_keyspace::topology_requests_entry>;
 
@@ -424,6 +444,7 @@ public:
     future<> save_truncation_record(const replica::column_family&, db_clock::time_point truncated_at, db::replay_position);
     future<replay_positions> get_truncated_positions(table_id);
     future<> drop_truncation_rp_records();
+    future<> remove_truncation_records(table_id);
 
     // Converts a `dht::token_range` object to the left-open integer range (x,y] form.
     //
@@ -497,7 +518,7 @@ public:
      */
     future<std::unordered_set<dht::token>> get_local_tokens();
 
-    future<std::unordered_map<gms::inet_address, sstring>> load_peer_features();
+    future<std::unordered_map<locator::host_id, sstring>> load_peer_features();
     future<std::set<sstring>> load_local_enabled_features();
     // This function stores the features in the system.scylla_local table.
     // We pass visible_before_cl_replay=true iff the features should be available before
@@ -519,11 +540,13 @@ public:
     struct local_info {
         locator::host_id host_id;
         sstring cluster_name;
+        sstring dc;
+        sstring rack;
         gms::inet_address listen_address;
     };
 
     future<local_info> load_local_info();
-    future<> save_local_info(local_info, locator::endpoint_dc_rack, gms::inet_address broadcast_address, gms::inet_address broadcast_rpc_address);
+    future<> save_local_info(local_info, gms::inet_address broadcast_address, gms::inet_address broadcast_rpc_address);
 public:
     static api::timestamp_type schema_creation_timestamp();
 
@@ -533,6 +556,7 @@ public:
     static mutation make_size_estimates_mutation(const sstring& ks, std::vector<range_estimates> estimates);
 
     future<> register_view_for_building(sstring ks_name, sstring view_name, const dht::token& token);
+    future<> register_view_for_building_for_all_shards(sstring ks_name, sstring view_name, const dht::token& token);
     future<> update_view_build_progress(sstring ks_name, sstring view_name, const dht::token& token);
     future<> remove_view_build_progress(sstring ks_name, sstring view_name);
     future<> remove_view_build_progress_across_all_shards(sstring ks_name, sstring view_name);
@@ -541,13 +565,25 @@ public:
     future<std::vector<view_name>> load_built_views();
     future<std::vector<view_build_progress>> load_view_build_progress();
 
-    // Paxos related functions
-    future<service::paxos::paxos_state> load_paxos_state(partition_key_view key, schema_ptr s, gc_clock::time_point now,
-            db::timeout_clock::time_point timeout);
-    future<> save_paxos_promise(const schema& s, const partition_key& key, const utils::UUID& ballot, db::timeout_clock::time_point timeout);
-    future<> save_paxos_proposal(const schema& s, const service::paxos::proposal& proposal, db::timeout_clock::time_point timeout);
-    future<> save_paxos_decision(const schema& s, const service::paxos::proposal& decision, db::timeout_clock::time_point timeout);
-    future<> delete_paxos_decision(const schema& s, const partition_key& key, const utils::UUID& ballot, db::timeout_clock::time_point timeout);
+    // system.view_build_status_v2
+    using view_build_status_map = std::map<system_keyspace_view_name, std::map<locator::host_id, view::build_status>>;
+    future<view_build_status_map> get_view_build_status_map();
+    future<mutation> make_view_build_status_mutation(api::timestamp_type ts, system_keyspace_view_name view_name, locator::host_id host_id, view::build_status status);
+    future<mutation> make_view_build_status_update_mutation(api::timestamp_type ts, system_keyspace_view_name view_name, locator::host_id host_id, view::build_status status);
+    future<mutation> make_remove_view_build_status_mutation(api::timestamp_type ts, system_keyspace_view_name view_name);
+    future<mutation> make_remove_view_build_status_on_host_mutation(api::timestamp_type ts, system_keyspace_view_name view_name, locator::host_id host_id);
+
+    // system.view_building_tasks
+    future<db::view::building_tasks> get_view_building_tasks();
+    future<mutation> make_view_building_task_mutation(api::timestamp_type ts, const db::view::view_building_task& task);
+    future<mutation> make_update_view_building_task_state_mutation(api::timestamp_type ts, utils::UUID id, db::view::view_building_task::task_state state);
+    future<mutation> make_remove_view_building_task_mutation(api::timestamp_type ts, utils::UUID id);
+
+    // system.scylla_local, view_building_processing_base key
+    future<std::optional<table_id>> get_view_building_processing_base_id();
+    future<std::optional<mutation>> get_view_building_processing_base_id_mutation();
+    future<mutation> make_view_building_processing_base_id_mutation(api::timestamp_type ts, table_id base_id);
+    future<mutation> make_remove_view_building_processing_base_id_mutation(api::timestamp_type ts);
 
     // CDC related functions
 
@@ -564,6 +600,9 @@ public:
 
     future<bool> cdc_is_rewritten();
     future<> cdc_set_rewritten(std::optional<cdc::generation_id_v1>);
+
+    future<> read_cdc_streams_state(std::optional<table_id> table, noncopyable_function<future<>(table_id, db_clock::time_point, utils::chunked_vector<cdc::stream_id>)> f);
+    future<> read_cdc_streams_history(table_id table, std::optional<db_clock::time_point> from, noncopyable_function<future<>(table_id, db_clock::time_point, cdc::cdc_stream_diff)> f);
 
     // Load Raft Group 0 id from scylla.local
     future<utils::UUID> get_raft_group0_id();
@@ -610,7 +649,7 @@ public:
 
     // Obtain the contents of the group 0 history table in mutation form.
     // Assumes that the history table exists, i.e. Raft feature is enabled.
-    static future<mutation> get_group0_history(distributed<replica::database>&);
+    static future<mutation> get_group0_history(sharded<replica::database>&);
 
     // If the `group0_schema_version` key in `system.scylla_local` is present (either live or tombstone),
     // returns the corresponding mutation. Otherwise returns nullopt.
@@ -653,17 +692,23 @@ public:
     future<topology_requests_entries> get_node_ops_request_entries(db_clock::time_point end_time_limit);
 
 public:
+    future<std::optional<bool>> get_service_level_driver_created();
+    future<mutation> make_service_level_driver_created_mutation(bool is_created, api::timestamp_type timestamp);
+    future<std::optional<mutation>> get_service_level_driver_created_mutation();
+
     future<std::optional<int8_t>> get_service_levels_version();
-    
     future<mutation> make_service_levels_version_mutation(int8_t version, api::timestamp_type timestamp);
     future<std::optional<mutation>> get_service_levels_version_mutation();
 
     // Publishes a new compression dictionary to `dicts`,
     // with the current timestamp.
     future<mutation> get_insert_dict_mutation(
-            bytes dict, locator::host_id self, db_clock::time_point dict_ts, api::timestamp_type write_ts) const;
+            std::string_view name, bytes dict, locator::host_id self, db_clock::time_point dict_ts, api::timestamp_type write_ts) const;
+    static mutation get_delete_dict_mutation(std::string_view name, api::timestamp_type write_ts);
     // Queries `dicts` for the most recent compression dictionary.
-    future<utils::shared_dict> query_dict() const;
+    future<netw::shared_dict> query_dict(std::string_view name) const;
+    future<std::optional<db_clock::time_point>> query_dict_timestamp(std::string_view name) const;
+    future<std::vector<sstring>> query_all_dict_names() const;
 
 private:
     static std::optional<service::topology_features> decode_topology_features_state(::shared_ptr<cql3::untyped_result_set> rs);
@@ -686,6 +731,10 @@ public:
     future<::shared_ptr<cql3::untyped_result_set>> execute_cql(sstring req, Args&&... args) {
         return execute_cql(req, { data_value(std::forward<Args>(args))... });
     }
+
+    // Apply write as mutation to the system keyspace.
+    // Mutation has to belong to a table int he system keyspace.
+    future<> apply_mutation(mutation m);
 
     friend future<column_mapping> db::schema_tables::get_column_mapping(db::system_keyspace& sys_ks, ::table_id table_id, table_schema_version version);
     friend future<bool> db::schema_tables::column_mapping_exists(db::system_keyspace& sys_ks, table_id table_id, table_schema_version version);

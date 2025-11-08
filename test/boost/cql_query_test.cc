@@ -21,6 +21,7 @@
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
 #include "test/lib/log.hh"
+#include "test/lib/test_utils.hh"
 
 #include <seastar/core/future-util.hh>
 #include <seastar/core/sleep.hh>
@@ -50,11 +51,15 @@
 #include "db/paxos_grace_seconds_extension.hh"
 #include "db/per_partition_rate_limit_extension.hh"
 #include "replica/schema_describe_helper.hh"
+#include "sstables/sstables.hh"
+#include "replica/distributed_loader.hh"
+#include "compaction/compaction_manager.hh"
 
 
 BOOST_AUTO_TEST_SUITE(cql_query_test)
 
 using namespace std::literals::chrono_literals;
+using namespace tests;
 
 SEASTAR_TEST_CASE(test_create_keyspace_statement) {
     return do_with_cql_env_thread([] (cql_test_env& e) {
@@ -248,6 +253,8 @@ SEASTAR_TEST_CASE(test_twcs_restrictions_mixed) {
 }
 
 SEASTAR_TEST_CASE(test_drop_table_with_si_and_mv) {
+    cql_test_config cfg;
+    cfg.need_remote_proxy = true;
     return do_with_cql_env_thread([](cql_test_env& e) {
         e.execute_cql("CREATE TABLE tbl (a int, b int, c float, PRIMARY KEY (a))").get();
         e.execute_cql("CREATE INDEX idx1 ON tbl (b)").get();
@@ -265,7 +272,7 @@ SEASTAR_TEST_CASE(test_drop_table_with_si_and_mv) {
         e.execute_cql("CREATE MATERIALIZED VIEW tbl_view AS SELECT c FROM tbl WHERE c IS NOT NULL PRIMARY KEY (c, a)").get();
         // dropping whole keyspace with MV and SI is fine too
         e.execute_cql("DROP KEYSPACE ks").get();
-    });
+    }, std::move(cfg));
 }
 
 SEASTAR_TEST_CASE(test_list_elements_validation) {
@@ -1921,7 +1928,8 @@ SEASTAR_TEST_CASE(test_select_multiple_ranges) {
 SEASTAR_TEST_CASE(test_validate_keyspace) {
     return do_with_cql_env([] (cql_test_env& e) {
         return make_ready_future<>().then([&e] {
-            return e.execute_cql("create keyspace kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkssssssssssssssssssssssssssssssssssssssssssssss with replication = { 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1 };");
+            sstring keyspace_name(schema::NAME_LENGTH + 1, 'k');
+            return e.execute_cql(format("create keyspace {} with replication = {{ 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1 }};", keyspace_name));
         }).then_wrapped([&e] (future<shared_ptr<cql_transport::messages::result_message>> f) {
             assert_that_failed(f);
             return e.execute_cql("create keyspace ks3-1 with replication = { 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1 };");
@@ -1929,7 +1937,7 @@ SEASTAR_TEST_CASE(test_validate_keyspace) {
             assert_that_failed(f);
             return e.execute_cql("create keyspace ks3 with replication = { 'replication_factor' : 1 };");
         }).then_wrapped([&e] (future<shared_ptr<cql_transport::messages::result_message>> f) {
-            assert_that_failed(f);
+            BOOST_ASSERT(!f.failed());
             return e.execute_cql("create keyspace ks3 with rreplication = { 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1 };");
         }).then_wrapped([&e] (future<shared_ptr<cql_transport::messages::result_message>> f) {
             assert_that_failed(f);
@@ -1943,7 +1951,8 @@ SEASTAR_TEST_CASE(test_validate_keyspace) {
 SEASTAR_TEST_CASE(test_validate_table) {
     return do_with_cql_env([] (cql_test_env& e) {
         return make_ready_future<>().then([&e] {
-            return e.execute_cql("create table ttttttttttttttttttttttttttttttttttttttttbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb (foo text PRIMARY KEY, bar text);");
+            sstring table_name(schema::NAME_LENGTH + 1, 't');
+            return e.execute_cql(format("create table {} (foo text PRIMARY KEY, bar text);", table_name));
         }).then_wrapped([&e] (future<shared_ptr<cql_transport::messages::result_message>> f) {
             assert_that_failed(f);
             return e.execute_cql("create table tb (foo text PRIMARY KEY, foo text);");
@@ -1975,11 +1984,11 @@ SEASTAR_TEST_CASE(test_table_compression) {
     return do_with_cql_env_thread([] (cql_test_env& e) {
         e.execute_cql("create table tb1 (foo text PRIMARY KEY, bar text) with compression = { };").get();
         BOOST_REQUIRE(e.local_db().has_schema("ks", "tb1"));
-        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb1")->get_compressor_params().get_compressor() == nullptr);
+        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb1")->get_compressor_params().get_algorithm() == compression_parameters::algorithm::none);
 
         e.execute_cql("create table tb5 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : '' };").get();
         BOOST_REQUIRE(e.local_db().has_schema("ks", "tb5"));
-        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb5")->get_compressor_params().get_compressor() == nullptr);
+        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb5")->get_compressor_params().get_algorithm() == compression_parameters::algorithm::none);
 
         BOOST_REQUIRE_THROW(e.execute_cql(
                 "create table tb2 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : 'LossyCompressor' };").get(),
@@ -1993,20 +2002,20 @@ SEASTAR_TEST_CASE(test_table_compression) {
 
         e.execute_cql("create table tb2 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : 'LZ4Compressor', 'chunk_length_kb' : 2 };").get();
         BOOST_REQUIRE(e.local_db().has_schema("ks", "tb2"));
-        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb2")->get_compressor_params().get_compressor() == compressor::lz4);
+        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb2")->get_compressor_params().get_algorithm() == compression_parameters::algorithm::lz4);
         BOOST_REQUIRE(e.local_db().find_schema("ks", "tb2")->get_compressor_params().chunk_length() == 2 * 1024);
 
         e.execute_cql("create table tb3 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : 'DeflateCompressor' };").get();
         BOOST_REQUIRE(e.local_db().has_schema("ks", "tb3"));
-        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb3")->get_compressor_params().get_compressor() == compressor::deflate);
+        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb3")->get_compressor_params().get_algorithm() == compression_parameters::algorithm::deflate);
 
         e.execute_cql("create table tb4 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : 'org.apache.cassandra.io.compress.DeflateCompressor' };").get();
         BOOST_REQUIRE(e.local_db().has_schema("ks", "tb4"));
-        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb4")->get_compressor_params().get_compressor() == compressor::deflate);
+        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb4")->get_compressor_params().get_algorithm() == compression_parameters::algorithm::deflate);
 
         e.execute_cql("create table tb6 (foo text PRIMARY KEY, bar text);").get();
         BOOST_REQUIRE(e.local_db().has_schema("ks", "tb6"));
-        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb6")->get_compressor_params().get_compressor() == compressor::lz4);
+        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb6")->get_compressor_params().get_algorithm() == e.local_db().get_config().sstable_compression_user_table_options().get_algorithm());
     });
 }
 
@@ -4130,7 +4139,7 @@ SEASTAR_TEST_CASE(test_view_with_two_regular_base_columns_in_key) {
                 .with_column(to_bytes("v2"), int32_type, column_kind::clustering_key)
                 .with_column(to_bytes("p"), int32_type, column_kind::clustering_key)
                 .with_column(to_bytes("c"), int32_type, column_kind::clustering_key)
-                .with_view_info(*schema, false, "v1 IS NOT NULL AND v2 IS NOT NULL AND p IS NOT NULL AND c IS NOT NULL");
+                .with_view_info(schema, false, "v1 IS NOT NULL AND v2 IS NOT NULL AND p IS NOT NULL AND c IS NOT NULL");
 
         schema_ptr view_schema = view_builder.build();
         auto& mm = e.migration_manager().local();
@@ -4354,13 +4363,12 @@ SEASTAR_TEST_CASE(test_describe_simple_schema) {
             "country_code int,"
             "number text)"
         ).get();
-        replica::schema_describe_helper describe_helper{e.data_dictionary()};
         for (auto &&ct : cql_create_tables) {
             e.execute_cql(ct.second).get();
             auto schema = e.local_db().find_schema("ks", ct.first);
-            auto schema_desc = schema->describe(describe_helper, cql3::describe_option::STMTS);
+            auto schema_desc = schema->describe(replica::make_schema_describe_helper(schema, e.data_dictionary()), cql3::describe_option::STMTS);
 
-            BOOST_CHECK_EQUAL(normalize_white_space(*schema_desc.create_statement), normalize_white_space(ct.second));
+            BOOST_CHECK_EQUAL(normalize_white_space(schema_desc.create_statement.value().linearize()), normalize_white_space(ct.second));
         }
     }, describe_test_config());
 }
@@ -4421,20 +4429,17 @@ SEASTAR_TEST_CASE(test_describe_view_schema) {
 
         e.execute_cql("CREATE KEYSPACE \"KS\" WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3}").get();
         e.execute_cql(base_table).get();
-
-        replica::schema_describe_helper describe_helper{e.data_dictionary()};
-
         for (auto &&ct : cql_create_tables) {
             e.execute_cql(ct.second).get();
             auto schema = e.local_db().find_schema("KS", ct.first);
-            auto schema_desc = schema->describe(describe_helper, cql3::describe_option::STMTS);
+            auto schema_desc = schema->describe(replica::make_schema_describe_helper(schema, e.data_dictionary()), cql3::describe_option::STMTS);
 
-            BOOST_CHECK_EQUAL(normalize_white_space(*schema_desc.create_statement), normalize_white_space(ct.second));
+            BOOST_CHECK_EQUAL(normalize_white_space(schema_desc.create_statement.value().linearize()), normalize_white_space(ct.second));
 
             auto base_schema = e.local_db().find_schema("KS", "cF");
-            auto base_schema_desc = base_schema->describe(describe_helper, cql3::describe_option::STMTS);
+            auto base_schema_desc = base_schema->describe(replica::make_schema_describe_helper(base_schema, e.data_dictionary()), cql3::describe_option::STMTS);
 
-            BOOST_CHECK_EQUAL(normalize_white_space(*base_schema_desc.create_statement), normalize_white_space(base_table));
+            BOOST_CHECK_EQUAL(normalize_white_space(base_schema_desc.create_statement.value().linearize()), normalize_white_space(base_table));
         }
     }, describe_test_config());
 }
@@ -5197,14 +5202,16 @@ SEASTAR_TEST_CASE(test_user_based_sla_queries) {
         e.execute_cql("ALTER SERVICE_LEVEL sl_1 WITH SHARES = 111;").get();
         msg = e.execute_cql("LIST ALL SERVICE_LEVELS;").get();
         assert_that(msg).is_rows().with_rows({
-            {utf8_type->decompose("sl_1"), {}, {}, int32_type->decompose(111), utf8_type->decompose("35.69%")},
-            {utf8_type->decompose("sl_2"), {}, {}, int32_type->decompose(200), utf8_type->decompose("64.31%")},
+            {utf8_type->decompose("driver"), {}, {utf8_type->decompose("batch")}, int32_type->decompose(200), utf8_type->decompose("39.14%")},
+            {utf8_type->decompose("sl_1"), {}, {}, int32_type->decompose(111), utf8_type->decompose("21.72%")},
+            {utf8_type->decompose("sl_2"), {}, {}, int32_type->decompose(200), utf8_type->decompose("39.14%")},
         });
         //drop service levels
         e.execute_cql("DROP SERVICE_LEVEL sl_1;").get();
         msg = e.execute_cql("LIST ALL SERVICE_LEVELS;").get();
         assert_that(msg).is_rows().with_rows({
-            {utf8_type->decompose("sl_2"), {}, {}, int32_type->decompose(200), utf8_type->decompose("100.00%")},
+            {utf8_type->decompose("driver"), {}, {utf8_type->decompose("batch")}, int32_type->decompose(200), utf8_type->decompose("50.00%")},
+            {utf8_type->decompose("sl_2"), {}, {}, int32_type->decompose(200), utf8_type->decompose("50.00%")},
         });
 
         // validate exceptions (illegal requests)
@@ -5892,7 +5899,7 @@ SEASTAR_TEST_CASE(test_setting_synchronous_updates_property) {
 static
 cql_test_config tablet_cql_test_config() {
     cql_test_config c;
-    c.db_config->enable_tablets.set(true);
+    c.db_config->tablets_mode_for_new_keyspaces.set(db::tablets_mode_t::mode::enabled);
     return c;
 }
 
@@ -6066,6 +6073,45 @@ SEASTAR_TEST_CASE(test_schema_change_events) {
         res = e.execute_cql("create type if not exists my_type (first text);").get();
         BOOST_REQUIRE(dynamic_pointer_cast<event_t>(res));
      });
+}
+
+// check that we can load sstable with mixed numerical and uuid generation types
+SEASTAR_TEST_CASE(test_sstable_load_mixed_generation_type) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        // Create table
+        e.execute_cql("create table ks.test (k int PRIMARY KEY, v int);").get();
+
+        auto& tbl = e.local_db().find_column_family("ks", "test");
+        auto upload_dir = table_dir(tbl) / sstables::upload_dir;
+
+        // Load sstables with mixed generation types
+        copy_directory("test/resource/sstables/mixed_generation_type", upload_dir);
+        replica::distributed_loader::process_upload_dir(e.db(), e.view_builder(), e.view_building_worker(), "ks", "test", false, false).get();
+
+        // Verify the expected data is present
+        assert_that(e.execute_cql("SELECT * FROM ks.test").get()).is_rows()
+            .with_size(3)
+            .with_rows_ignore_order({
+                {int32_type->decompose(0), int32_type->decompose(0)},
+                {int32_type->decompose(1), int32_type->decompose(1)},
+                {int32_type->decompose(2), int32_type->decompose(2)}
+            });
+
+        // Run major compaction to ensure that the mixed generation types are handled correctly
+        auto& compaction_module = e.local_db().get_compaction_manager().get_task_manager_module();
+        std::vector<table_info> table_infos({{"test", tbl.schema()->id()}});
+        auto task = compaction_module.make_and_start_task<compaction::major_keyspace_compaction_task_impl>({}, "ks", tasks::task_id::create_null_id(), e.db(), table_infos, compaction::flush_mode::skip, false).get();
+        task->done().get();
+
+        // Verify the expected data again
+        assert_that(e.execute_cql("SELECT * FROM ks.test").get()).is_rows()
+            .with_size(3)
+            .with_rows_ignore_order({
+                {int32_type->decompose(0), int32_type->decompose(0)},
+                {int32_type->decompose(1), int32_type->decompose(1)},
+                {int32_type->decompose(2), int32_type->decompose(2)}
+            });
+    });
 }
 
 BOOST_AUTO_TEST_SUITE_END()

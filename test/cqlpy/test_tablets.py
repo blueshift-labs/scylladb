@@ -313,53 +313,6 @@ def test_tablets_are_dropped_when_dropping_index(cql, test_keyspace, drop_index,
         raise e
 
 
-# FIXME: LWT is not supported with tablets yet. See #18066
-# Until the issue is fixed, test that a LWT query indeed fails as expected
-def test_lwt_support_with_tablets(cql, test_keyspace, skip_without_tablets):
-    with new_test_table(cql, test_keyspace, "key int PRIMARY KEY, val int") as table:
-        cql.execute(f"INSERT INTO {table} (key, val) VALUES(1, 0)")
-        with pytest.raises(InvalidRequest, match=f"{table}.*LWT is not yet supported with tablets"):
-            cql.execute(f"INSERT INTO {table} (key, val) VALUES(1, 1) IF NOT EXISTS")
-        # The query is rejected during the execution phase,
-        # so preparing the LWT query is expected to succeed.
-        stmt = cql.prepare(f"UPDATE {table} SET val = 1 WHERE KEY = ? IF EXISTS")
-        with pytest.raises(InvalidRequest, match=f"{table}.*LWT is not yet supported with tablets"):
-            cql.execute(stmt, [1])
-        with pytest.raises(InvalidRequest, match=f"{table}.*LWT is not yet supported with tablets"):
-            cql.execute(f"DELETE FROM {table} WHERE key = 1 IF EXISTS")
-        res = cql.execute(f"SELECT val FROM {table} WHERE key = 1").one()
-        assert res.val == 0
-
-
-# We want to ensure that we can only change the RF of any DC by at most 1 at a time
-# if we use tablets. That provides us with the guarantee that the old and the new QUORUM
-# overlap by at least one node.
-def test_alter_tablet_keyspace_rf(cql, this_dc, skip_without_tablets):
-    with new_test_keyspace(cql, f"WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', '{this_dc}' : 1 }} "
-                                f"AND TABLETS = {{ 'enabled': true, 'initial': 128 }}") as keyspace:
-        def change_opt_rf(rf_opt, new_rf):
-            cql.execute(f"ALTER KEYSPACE {keyspace} "
-                        f"WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', '{rf_opt}' : {new_rf} }}")
-
-        def change_dc_rf(new_rf):
-            change_opt_rf(this_dc, new_rf)
-
-        change_dc_rf(2)  # increase RF by 1 should be OK
-        change_dc_rf(3)  # increase RF by 1 again should be OK
-        change_dc_rf(3)  # setting the same RF shouldn't cause problems
-        change_dc_rf(4)  # increase RF by 1 again should be OK
-        change_dc_rf(3)  # decrease RF by 1 should be OK
-
-        with pytest.raises(InvalidRequest):
-            change_dc_rf(5)  # increase RF by 2 should fail
-        with pytest.raises(InvalidRequest):
-            change_dc_rf(1)  # decrease RF by 2 should fail
-        with pytest.raises(InvalidRequest):
-            change_dc_rf(10)  # increase RF by 2+ should fail
-        with pytest.raises(InvalidRequest):
-            change_dc_rf(0)  # decrease RF by 2+ should fail
-
-
 def test_tablet_options(cql, skip_without_tablets):
     def describe_table(cql, table):
         return cql.execute(f"DESC TABLE {table}").one().create_statement

@@ -10,7 +10,6 @@
 
 #include <filesystem>
 #include <seastar/core/file.hh>
-#include <seastar/core/queue.hh>
 #include <seastar/util/bool_class.hh>
 #include "enum_set.hh"
 #include "seastarx.hh"
@@ -122,20 +121,22 @@ private:
     future<> visit(directory_entry de);
 
     /**
-     * Validates that the input parameter has its "type" optional field engaged.
+     * Try to get entry "type" if it's missing
      *
      * This helper method is called before further processing the @param de in order
-     * to ensure that its "type" field is engaged.
+     * to have its "type" field engaged.
      *
      * If it is engaged - returns the input value as is.
      * If "type"  isn't engaged - calls the file_type() for file represented by @param de and sets
-     * "type" field of @param de to the returned value and then returns @param de.
+     * "type" field of @param de to the returned value and then returns @param de. The "type" may
+     * still be disengaged after it, meaning that the corresponding file is now missing (because it
+     * was removed or renamed).
      *
      * @param de entry to check and return
      * @return a future that resolves with the @param de with the engaged de.type field or an
      * exceptional future with std::system_error exception if type of the file represented by @param de may not be retrieved.
      */
-    future<directory_entry> guarantee_type(directory_entry de);
+    future<directory_entry> refresh_type(directory_entry de);
 };
 
 class abstract_lister {
@@ -189,9 +190,9 @@ class directory_lister final : public abstract_lister::impl {
     lister::dir_entry_types _type;
     lister::filter_type _filter;
     lister::show_hidden _do_show_hidden;
-    seastar::queue<std::optional<directory_entry>> _queue;
-    std::unique_ptr<lister> _lister;
-    std::optional<future<>> _opt_done_fut;
+    file _opened;
+    std::optional<coroutine::experimental::generator<directory_entry>> _gen;
+
 public:
     directory_lister(fs::path dir,
             lister::dir_entry_types type = lister::dir_entry_types::full(),
@@ -201,7 +202,6 @@ public:
         , _type(type)
         , _filter(std::move(filter))
         , _do_show_hidden(do_show_hidden)
-        , _queue(512 / sizeof(std::optional<directory_entry>))
     { }
 
     directory_lister(directory_lister&&) noexcept = default;

@@ -12,13 +12,15 @@
 
 #include <concepts>
 #include <initializer_list>
-#include "timestamp.hh"
+#include "mutation/timestamp.hh"
 #include "bytes.hh"
 #include "db/consistency_level_type.hh"
 #include "service/query_state.hh"
 #include "service/pager/paging_state.hh"
 #include "cql3/values.hh"
+#include "utils/result.hh"
 #include "utils/small_vector.hh"
+#include "service/storage_proxy_fwd.hh"
 
 namespace cql3 {
 
@@ -74,6 +76,7 @@ public:
         const lw_shared_ptr<service::pager::paging_state> state;
         const std::optional<db::consistency_level> serial_consistency;
         const api::timestamp_type timestamp;
+        const service::node_local_only node_local_only;
     };
 private:
     const cql_config& _cql_config;
@@ -202,7 +205,7 @@ public:
     }
 
     /**  Return serial consistency for conditional updates. Throws if the consistency is not set. */
-    db::consistency_level check_serial_consistency() const;
+    utils::result_with_exception_ptr<db::consistency_level> check_serial_consistency() const;
 
     api::timestamp_type get_timestamp(service::query_state& state) const {
         auto tstamp = get_specific_options().timestamp;

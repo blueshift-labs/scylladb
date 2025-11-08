@@ -18,7 +18,7 @@
 #include <seastar/coroutine/all.hh>
 
 #include "message/messaging_service.hh"
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include "gms/gossiper.hh"
 #include "service/storage_service.hh"
 #include "service/qos/service_level_controller.hh"
@@ -26,25 +26,25 @@
 #include "gms/gossip_digest_syn.hh"
 #include "gms/gossip_digest_ack.hh"
 #include "gms/gossip_digest_ack2.hh"
-#include "query-result.hh"
+#include "query/query-result.hh"
 #include <seastar/rpc/rpc.hh>
 #include "mutation/canonical_mutation.hh"
 #include "db/config.hh"
 #include "db/view/view_update_backlog.hh"
 #include "dht/i_partitioner.hh"
-#include "interval.hh"
-#include "frozen_schema.hh"
+#include "utils/interval.hh"
+#include "schema/frozen_schema.hh"
 #include "repair/repair.hh"
 #include "node_ops/node_ops_ctl.hh"
 #include "service/paxos/proposal.hh"
 #include "service/paxos/prepare_response.hh"
-#include "query-request.hh"
+#include "query/query-request.hh"
 #include "mutation_query.hh"
 #include "repair/repair.hh"
 #include "streaming/stream_reason.hh"
 #include "streaming/stream_mutation_fragments_cmd.hh"
 #include "streaming/stream_blob.hh"
-#include "cache_temperature.hh"
+#include "replica/cache_temperature.hh"
 #include "raft/raft.hh"
 #include "service/raft/group0_fwd.hh"
 #include "replica/exceptions.hh"
@@ -54,6 +54,7 @@
 #include "service/topology_state_machine.hh"
 #include "service/topology_guard.hh"
 #include "service/raft/join_node.hh"
+#include "db/view/view_building_state.hh"
 #include "idl/consistency_level.dist.hh"
 #include "idl/tracing.dist.hh"
 #include "idl/result.dist.hh"
@@ -151,8 +152,8 @@ using namespace std::chrono_literals;
 
 class messaging_service::compressor_factory_wrapper {
     struct advanced_rpc_compressor_factory : rpc::compressor::factory {
-        utils::walltime_compressor_tracker& _tracker;
-        advanced_rpc_compressor_factory(utils::walltime_compressor_tracker& tracker)
+        walltime_compressor_tracker& _tracker;
+        advanced_rpc_compressor_factory(walltime_compressor_tracker& tracker)
             : _tracker(tracker)
         {}
         const sstring& supported() const override {
@@ -274,7 +275,7 @@ messaging_service::messaging_service(
     gms::feature_service& feature_service,
     gms::gossip_address_map& address_map,
     gms::generation_type generation,
-    utils::walltime_compressor_tracker& wct,
+    walltime_compressor_tracker& wct,
     qos::service_level_controller& sl_controller)
     : messaging_service(config{std::move(id), ip, ip, port},
                         scheduling_config{{{{}, "$default"}}, {}, {}},
@@ -479,7 +480,7 @@ void messaging_service::do_start_listen() {
 }
 
 messaging_service::messaging_service(config cfg, scheduling_config scfg, std::shared_ptr<seastar::tls::credentials_builder> credentials, gms::feature_service& feature_service,
-                                     gms::gossip_address_map& address_map, gms::generation_type generation, utils::walltime_compressor_tracker& arct, qos::service_level_controller& sl_controller)
+                                     gms::gossip_address_map& address_map, gms::generation_type generation, walltime_compressor_tracker& arct, qos::service_level_controller& sl_controller)
     : _cfg(std::move(cfg))
     , _rpc(new rpc_protocol_wrapper(serializer { }))
     , _credentials_builder(credentials ? std::make_unique<seastar::tls::credentials_builder>(*credentials) : nullptr)
@@ -662,6 +663,18 @@ static constexpr unsigned do_get_rpc_client_idx(messaging_verb verb) {
     case messaging_verb::JOIN_NODE_RESPONSE:
     case messaging_verb::JOIN_NODE_QUERY:
     case messaging_verb::TASKS_GET_CHILDREN:
+    case messaging_verb::RAFT_SEND_SNAPSHOT:
+    case messaging_verb::RAFT_APPEND_ENTRIES:
+    case messaging_verb::RAFT_APPEND_ENTRIES_REPLY:
+    case messaging_verb::RAFT_VOTE_REQUEST:
+    case messaging_verb::RAFT_VOTE_REPLY:
+    case messaging_verb::RAFT_TIMEOUT_NOW:
+    case messaging_verb::RAFT_READ_QUORUM:
+    case messaging_verb::RAFT_READ_QUORUM_REPLY:
+    case messaging_verb::RAFT_EXECUTE_READ_BARRIER_ON_LEADER:
+    case messaging_verb::RAFT_ADD_ENTRY:
+    case messaging_verb::RAFT_MODIFY_CONFIG:
+    case messaging_verb::RAFT_PULL_SNAPSHOT:
         // See comment above `TOPOLOGY_INDEPENDENT_IDX`.
         // DO NOT put any 'hot' (e.g. data path) verbs in this group,
         // only verbs which are 'rare' and 'cheap'.
@@ -692,14 +705,18 @@ static constexpr unsigned do_get_rpc_client_idx(messaging_verb verb) {
     case messaging_verb::REPAIR_GET_FULL_ROW_HASHES_WITH_RPC_STREAM:
     case messaging_verb::REPAIR_UPDATE_SYSTEM_TABLE:
     case messaging_verb::REPAIR_FLUSH_HINTS_BATCHLOG:
+    case messaging_verb::REPAIR_UPDATE_COMPACTION_CTRL:
+    case messaging_verb::REPAIR_UPDATE_REPAIRED_AT_FOR_MERGE:
     case messaging_verb::NODE_OPS_CMD:
     case messaging_verb::HINT_MUTATION:
     case messaging_verb::TABLET_STREAM_FILES:
     case messaging_verb::TABLET_STREAM_DATA:
     case messaging_verb::TABLET_CLEANUP:
     case messaging_verb::TABLET_REPAIR:
+    case messaging_verb::TABLET_REPAIR_COLOCATED:
     case messaging_verb::TABLE_LOAD_STATS_V1:
     case messaging_verb::TABLE_LOAD_STATS:
+    case messaging_verb::WORK_ON_VIEW_BUILDING_TASKS:
         return 1;
     case messaging_verb::CLIENT_ID:
     case messaging_verb::MUTATION:
@@ -709,6 +726,8 @@ static constexpr unsigned do_get_rpc_client_idx(messaging_verb verb) {
     case messaging_verb::DEFINITIONS_UPDATE:
     case messaging_verb::TRUNCATE:
     case messaging_verb::TRUNCATE_WITH_TABLETS:
+    case messaging_verb::ESTIMATE_SSTABLE_VOLUME:
+    case messaging_verb::SAMPLE_SSTABLES:
     case messaging_verb::MIGRATION_REQUEST:
     case messaging_verb::SCHEMA_CHECK:
     case messaging_verb::COUNTER_MUTATION:
@@ -718,19 +737,7 @@ static constexpr unsigned do_get_rpc_client_idx(messaging_verb verb) {
     case messaging_verb::PAXOS_ACCEPT:
     case messaging_verb::PAXOS_LEARN:
     case messaging_verb::PAXOS_PRUNE:
-    case messaging_verb::RAFT_SEND_SNAPSHOT:
-    case messaging_verb::RAFT_APPEND_ENTRIES:
-    case messaging_verb::RAFT_APPEND_ENTRIES_REPLY:
-    case messaging_verb::RAFT_VOTE_REQUEST:
-    case messaging_verb::RAFT_VOTE_REPLY:
-    case messaging_verb::RAFT_TIMEOUT_NOW:
-    case messaging_verb::RAFT_READ_QUORUM:
-    case messaging_verb::RAFT_READ_QUORUM_REPLY:
-    case messaging_verb::RAFT_EXECUTE_READ_BARRIER_ON_LEADER:
-    case messaging_verb::RAFT_ADD_ENTRY:
-    case messaging_verb::RAFT_MODIFY_CONFIG:
     case messaging_verb::DIRECT_FD_PING:
-    case messaging_verb::RAFT_PULL_SNAPSHOT:
         return 2;
     case messaging_verb::MUTATION_DONE:
     case messaging_verb::MUTATION_FAILED:

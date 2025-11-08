@@ -32,11 +32,13 @@ static auto copy_sst_to_tmpdir(fs::path tmp_path, test_env& env, sstables::schem
 
 SEASTAR_THREAD_TEST_CASE(test_sstable_move) {
     tmpdir tmp;
-    auto env = test_env();
+
+    auto scf = make_sstable_compressor_factory_for_tests_in_thread();
+    auto env = test_env({}, *scf);
     auto stop_env = defer([&env] { env.stop().get(); });
 
-    sstables::sstable_generation_generator gen_generator{0};
-    auto [ sst, cur_dir ] = copy_sst_to_tmpdir(tmp.path(), env, uncompressed_schema(), fs::path(uncompressed_dir()), gen_generator());
+    sstables::sstable_generation_generator gen_generator;
+    auto [ sst, cur_dir ] = copy_sst_to_tmpdir(tmp.path(), env, uncompressed_schema(), fs::path(uncompressed_dir()), sstables::generation_type(1));
 
     generation_type gen{0};
     for (auto i = 0; i < 2; i++) {
@@ -56,11 +58,12 @@ SEASTAR_THREAD_TEST_CASE(test_sstable_move) {
 
 SEASTAR_THREAD_TEST_CASE(test_sstable_move_idempotent) {
     tmpdir tmp;
-    auto env = test_env();
-    auto stop_env = defer([&env] { env.stop().get(); });
-    sstables::sstable_generation_generator gen_generator{0};
 
-    auto [ sst, cur_dir ] = copy_sst_to_tmpdir(tmp.path(), env, uncompressed_schema(), fs::path(uncompressed_dir()), gen_generator());
+    auto scf = make_sstable_compressor_factory_for_tests_in_thread();
+    auto env = test_env({}, *scf);
+    auto stop_env = defer([&env] { env.stop().get(); });
+
+    auto [ sst, cur_dir ] = copy_sst_to_tmpdir(tmp.path(), env, uncompressed_schema(), fs::path(uncompressed_dir()), sstables::generation_type(1));
     sstring old_path = sst->get_storage().prefix();
     touch_directory(format("{}/{}", old_path, sstables::staging_dir)).get();
     sst->change_state(sstables::sstable_state::staging).get();
@@ -100,11 +103,12 @@ static bool partial_create_links(sstable_ptr sst, fs::path dst_path, sstables::g
 
 SEASTAR_THREAD_TEST_CASE(test_sstable_move_replay) {
     tmpdir tmp;
-    auto env = test_env();
+    auto scf = make_sstable_compressor_factory_for_tests_in_thread();
+    auto env = test_env({}, *scf);
     auto stop_env = defer([&env] { env.stop().get(); });
 
-    sstables::sstable_generation_generator gen_generator{0};
-    auto [ sst, cur_dir ] = copy_sst_to_tmpdir(tmp.path(), env, uncompressed_schema(), fs::path(uncompressed_dir()), gen_generator());
+    sstables::sstable_generation_generator gen_generator;
+    auto [ sst, cur_dir ] = copy_sst_to_tmpdir(tmp.path(), env, uncompressed_schema(), fs::path(uncompressed_dir()), sstables::generation_type(1));
 
     bool done;
     int count = 0;
@@ -121,7 +125,9 @@ SEASTAR_THREAD_TEST_CASE(test_sstable_move_replay) {
 
 SEASTAR_THREAD_TEST_CASE(test_sstable_move_exists_failure) {
     tmpdir tmp;
-    auto env = test_env();
+
+    auto scf = make_sstable_compressor_factory_for_tests_in_thread();
+    auto env = test_env({}, *scf);
     auto stop_env = defer([&env] { env.stop().get(); });
 
     // please note, the SSTables used by this test are stored under

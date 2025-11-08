@@ -16,10 +16,13 @@
 #include "service/topology_guard.hh"
 #include "tasks/task_manager.hh"
 #include "locator/abstract_replication_strategy.hh"
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/util/bool_class.hh>
+#include <seastar/core/rwlock.hh>
 #include "utils/user_provided_param.hh"
 #include "locator/tablet_metadata_guard.hh"
+#include "utils/chunked_vector.hh"
+#include "utils/disk_space_monitor.hh"
 
 using namespace seastar;
 
@@ -35,6 +38,10 @@ namespace db {
 class system_keyspace;
 class system_distributed_keyspace;
 class batchlog_manager;
+
+namespace view {
+class view_building_worker;
+}
 
 }
 
@@ -94,13 +101,14 @@ using host2ip_t = std::function<future<gms::inet_address> (locator::host_id)>;
 
 class repair_service : public seastar::peering_sharded_service<repair_service> {
     sharded<service::topology_state_machine>& _tsm;
-    distributed<gms::gossiper>& _gossiper;
+    sharded<gms::gossiper>& _gossiper;
     netw::messaging_service& _messaging;
     sharded<replica::database>& _db;
     sharded<service::storage_proxy>& _sp;
     sharded<db::batchlog_manager>& _bm;
     sharded<db::system_keyspace>& _sys_ks;
     db::view::view_builder& _view_builder;
+    sharded<db::view::view_building_worker>& _view_building_worker;
     shared_ptr<repair::task_manager_module> _repair_module;
     service::migration_manager& _mm;
     node_ops_metrics _node_ops_metrics;
@@ -110,11 +118,27 @@ class repair_service : public seastar::peering_sharded_service<repair_service> {
     std::unordered_map<tasks::task_id, repair_history> _finished_ranges_history;
 
     shared_ptr<row_level_repair_gossip_helper> _gossip_helper;
-    bool _stopped = false;
+    uint32_t _disabled_repair_tablet_count = 0;
+
+    // Possible states in which the repair service can be found.
+    //
+    // none: started, but not yet enabled. Once the repair service moves out of "none", it can
+    //       never legally move back
+    // stopped: stop() was called. The repair service will never be enabled or disabled again
+    //          and can no longer be used
+    // running: running, started and enabled at least once. Whether new repair requests are
+    //          accepted or not is determined by the counter
+    enum class state { none, stopped, running };
+    // The repair service is initiated in the none state. It is moved to the running state when
+    // start() is invoked and the service is immediately enabled.
+    state _state = state::none;
+    uint32_t _disabled_state_count = 0;
 
     size_t _max_repair_memory;
     seastar::semaphore _memory_sem;
     seastar::named_semaphore _load_parallelism_semaphore = {16, named_semaphore_exception_factory{"Load repair history parallelism"}};
+
+    utils::disk_space_monitor::subscription _out_of_space_subscription;
 
     future<> _load_history_done = make_ready_future<>();
 
@@ -125,23 +149,29 @@ class repair_service : public seastar::peering_sharded_service<repair_service> {
 
     seastar::semaphore _flush_hints_batchlog_sem{1};
     gc_clock::time_point _flush_hints_batchlog_time;
-    future<std::tuple<bool, gc_clock::time_point>> flush_hints(repair_uniq_id id,
+    future<std::tuple<bool, bool, gc_clock::time_point>> flush_hints(repair_uniq_id id,
             sstring keyspace, std::vector<sstring> cfs,
             std::unordered_set<locator::host_id> ignore_nodes);
 
 public:
+    std::unordered_map<service::session_id, std::vector<seastar::rwlock::holder>> _repair_compaction_locks;
+
+public:
     repair_service(sharded<service::topology_state_machine>& tsm,
-            distributed<gms::gossiper>& gossiper,
+            sharded<gms::gossiper>& gossiper,
             netw::messaging_service& ms,
             sharded<replica::database>& db,
             sharded<service::storage_proxy>& sp,
             sharded<db::batchlog_manager>& bm,
             sharded<db::system_keyspace>& sys_ks,
             db::view::view_builder& vb,
+            sharded<db::view::view_building_worker>& vbw,
             tasks::task_manager& tm,
-            service::migration_manager& mm, size_t max_repair_memory);
+            service::migration_manager& mm,
+            size_t max_repair_memory
+            );
     ~repair_service();
-    future<> start();
+    future<> start(utils::disk_space_monitor* dsm);
     future<> stop();
 
     // shutdown() stops all ongoing repairs started on this node (and
@@ -150,6 +180,16 @@ public:
     // quickly as possible (we do not wait for repairs to finish but rather
     // stop them abruptly).
     future<> shutdown();
+
+    // Enable the repair service.
+    void enable();
+
+    // Abort all running local repairs and moves the repair service into disabled state.
+    // The repair service is still alive after drain, i.e. accepts global repair requests
+    // but it will not accept new local repairs unless it is moved back to enabled state.
+    future<> drain();
+
+    bool is_disabled() const { return _state != state::running || _disabled_state_count > 0; }
 
     future<std::optional<gc_clock::time_point>> update_history(tasks::task_id repair_id, table_id table_id, dht::token_range range, gc_clock::time_point repair_time, bool is_tablet);
     future<> cleanup_history(tasks::task_id repair_id);
@@ -162,12 +202,12 @@ public:
     future<> bootstrap_with_repair(locator::token_metadata_ptr tmptr, std::unordered_set<dht::token> bootstrap_tokens);
     future<> decommission_with_repair(locator::token_metadata_ptr tmptr);
     future<> removenode_with_repair(locator::token_metadata_ptr tmptr, locator::host_id leaving_node, shared_ptr<node_ops_info> ops);
-    future<> rebuild_with_repair(std::unordered_map<sstring, locator::vnode_effective_replication_map_ptr> ks_erms, locator::token_metadata_ptr tmptr, utils::optional_param source_dc);
-    future<> replace_with_repair(std::unordered_map<sstring, locator::vnode_effective_replication_map_ptr> ks_erms, locator::token_metadata_ptr tmptr, std::unordered_set<dht::token> replacing_tokens, std::unordered_set<locator::host_id> ignore_nodes, locator::host_id replaced_node);
+    future<> rebuild_with_repair(std::unordered_map<sstring, locator::static_effective_replication_map_ptr> ks_erms, locator::token_metadata_ptr tmptr, utils::optional_param source_dc);
+    future<> replace_with_repair(std::unordered_map<sstring, locator::static_effective_replication_map_ptr> ks_erms, locator::token_metadata_ptr tmptr, std::unordered_set<dht::token> replacing_tokens, std::unordered_set<locator::host_id> ignore_nodes, locator::host_id replaced_node);
 private:
-    future<> do_decommission_removenode_with_repair(locator::token_metadata_ptr tmptr, locator::host_id leaving_node, shared_ptr<node_ops_info> ops);
+    future<> do_decommission_removenode_with_repair(locator::token_metadata_ptr tmptr, locator::host_id leaving_node, shared_ptr<node_ops_info> ops, streaming::stream_reason reason);
 
-    future<> do_rebuild_replace_with_repair(std::unordered_map<sstring, locator::vnode_effective_replication_map_ptr> ks_erms, locator::token_metadata_ptr tmptr, sstring op, utils::optional_param source_dc, streaming::stream_reason reason, std::unordered_set<locator::host_id> ignore_nodes = {}, locator::host_id replaced_node = {});
+    future<> do_rebuild_replace_with_repair(std::unordered_map<sstring, locator::static_effective_replication_map_ptr> ks_erms, locator::token_metadata_ptr tmptr, sstring op, utils::optional_param source_dc, streaming::stream_reason reason, std::unordered_set<locator::host_id> ignore_nodes = {}, locator::host_id replaced_node = {});
 
     // Must be called on shard 0
     future<> sync_data_using_repair(sstring keyspace,
@@ -177,10 +217,11 @@ private:
             streaming::stream_reason reason,
             shared_ptr<node_ops_info> ops_info);
 
-public:
-    future<> repair_tablets(repair_uniq_id id, sstring keyspace_name, std::vector<sstring> table_names, bool primary_replica_only = true, dht::token_range_vector ranges_specified = {}, std::vector<sstring> dcs = {}, std::unordered_set<locator::host_id> hosts = {}, std::unordered_set<locator::host_id> ignore_nodes = {}, std::optional<int> ranges_parallelism = std::nullopt);
+    future<> reset_node_ops_progress(streaming::stream_reason reason);
 
-    future<gc_clock::time_point> repair_tablet(gms::gossip_address_map& addr_map, locator::tablet_metadata_guard& guard, locator::global_tablet_id gid, tasks::task_info global_tablet_repair_task_info, service::frozen_topology_guard topo_guard);
+public:
+    future<gc_clock::time_point> repair_tablet(gms::gossip_address_map& addr_map, locator::tablet_metadata_guard& guard, locator::global_tablet_id gid, tasks::task_info global_tablet_repair_task_info, service::frozen_topology_guard topo_guard, std::optional<locator::tablet_replica_set> rebuild_replicas, locator::tablet_transition_stage stage);
+
 private:
 
     future<repair_update_system_table_response> repair_update_system_table_handler(
@@ -196,6 +237,7 @@ public:
     sharded<replica::database>& get_db() noexcept { return _db; }
     service::migration_manager& get_migration_manager() noexcept { return _mm; }
     db::view::view_builder& get_view_builder() noexcept { return _view_builder; }
+    sharded<db::view::view_building_worker>& get_view_building_worker() noexcept { return _view_building_worker; }
     gms::gossiper& get_gossiper() noexcept { return _gossiper.local(); }
     size_t max_repair_memory() const { return _max_repair_memory; }
     seastar::semaphore& memory_sem() { return _memory_sem; }
@@ -245,14 +287,17 @@ public:
             streaming::stream_reason reason,
             gc_clock::time_point compaction_time,
             abort_source& as,
-            service::frozen_topology_guard topo_guard);
+            service::frozen_topology_guard topo_guard,
+            std::optional<int64_t> repaired_at,
+            locator::tablet_repair_incremental_mode incremental_mode);
 
     future<>
     remove_repair_meta(const locator::host_id& from,
             uint32_t repair_meta_id,
             sstring ks_name,
             sstring cf_name,
-            dht::token_range range);
+            dht::token_range range,
+            bool mark_incremental_repair);
 
     future<> remove_repair_meta(locator::host_id from);
 

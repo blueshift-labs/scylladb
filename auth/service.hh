@@ -26,6 +26,7 @@
 #include "cql3/description.hh"
 #include "seastarx.hh"
 #include "service/raft/raft_group0_client.hh"
+#include "utils/alien_worker.hh"
 #include "utils/observable.hh"
 #include "utils/serialized_action.hh"
 #include "service/maintenance_mode.hh"
@@ -126,7 +127,8 @@ public:
             ::service::migration_notifier&,
             ::service::migration_manager&,
             const service_config&,
-            maintenance_socket_enabled);
+            maintenance_socket_enabled,
+            utils::alien_worker&);
 
     future<> start(::service::migration_manager&, db::system_keyspace&);
 
@@ -224,6 +226,17 @@ struct command_desc {
     const ::auth::resource& resource; ///< Resource impacted by this command.
     enum class type {
         ALTER_WITH_OPTS, ///< Command is ALTER ... WITH ...
+        ALTER_SYSTEM_WITH_ALLOWED_OPTS,
+        OTHER
+    } type_ = type::OTHER;
+};
+
+/// Similar to command_desc, but used in cases where multiple permissions allow the access to the resource.
+struct command_desc_with_permission_set {
+    permission_set permission;
+    const ::auth::resource& resource;
+    enum class type {
+        ALTER_WITH_OPTS,
         ALTER_SYSTEM_WITH_ALLOWED_OPTS,
         OTHER
     } type_ = type::OTHER;

@@ -8,9 +8,9 @@
 
 #pragma once
 
-#include "column_computation.hh"
+#include "schema/column_computation.hh"
 #include "mutation/atomic_cell.hh"
-#include "timestamp.hh"
+#include "mutation/timestamp.hh"
 #include <type_traits>
 
 class row_marker;

@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "cql3/statements/property_definitions.hh"
 #include "utils/assert.hh"
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
@@ -158,16 +159,16 @@ future<> table_helper::setup_keyspace(cql3::query_processor& qp, service::migrat
 
     data_dictionary::database db = qp.db();
 
-    std::map<sstring, sstring> opts;
+    locator::replication_strategy_config_options opts;
     opts["replication_factor"] = replication_factor;
-    auto ksm = keyspace_metadata::new_keyspace(keyspace_name, "org.apache.cassandra.locator.SimpleStrategy", std::move(opts), std::nullopt);
+    auto ksm = keyspace_metadata::new_keyspace(keyspace_name, "org.apache.cassandra.locator.SimpleStrategy", std::move(opts), std::nullopt, std::nullopt);
 
     while (!db.has_keyspace(keyspace_name)) {
         auto group0_guard = co_await mm.start_group0_operation();
         auto ts = group0_guard.write_timestamp();
 
         if (!db.has_keyspace(keyspace_name)) {
-            std::map<sstring, sstring> opts;
+            locator::replication_strategy_config_options opts;
             if (replication_strategy_name == "org.apache.cassandra.locator.NetworkTopologyStrategy") {
                 for (const auto &dc: qp.proxy().get_token_metadata_ptr()->get_topology().get_datacenters())
                     opts[dc] = replication_factor;
@@ -175,7 +176,7 @@ future<> table_helper::setup_keyspace(cql3::query_processor& qp, service::migrat
             else {
                 opts["replication_factor"] = replication_factor;
             }
-            auto ksm = keyspace_metadata::new_keyspace(keyspace_name, replication_strategy_name, std::move(opts), std::nullopt, true);
+            auto ksm = keyspace_metadata::new_keyspace(keyspace_name, replication_strategy_name, std::move(opts), std::nullopt, std::nullopt, true);
             try {
                 co_await mm.announce(service::prepare_new_keyspace_announcement(db.real_database(), ksm, ts),
                         std::move(group0_guard), seastar::format("table_helper: create {} keyspace", keyspace_name));
@@ -190,7 +191,7 @@ future<> table_helper::setup_keyspace(cql3::query_processor& qp, service::migrat
     while (std::any_of(tables.begin(), tables.end(), [db] (table_helper* t) { return !db.has_schema(t->_keyspace, t->_name); })) {
         auto group0_guard = co_await mm.start_group0_operation();
         auto ts = group0_guard.write_timestamp();
-        std::vector<mutation> table_mutations;
+        utils::chunked_vector<mutation> table_mutations;
 
         co_await coroutine::parallel_for_each(tables, [&] (auto&& table) -> future<> {
             auto schema = parse_new_cf_statement(qp, table->_create_cql);

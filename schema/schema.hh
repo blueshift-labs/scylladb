@@ -17,21 +17,23 @@
 #include <boost/dynamic_bitset.hpp>
 
 #include "cql3/column_specification.hh"
+#include "cql3/statements/index_prop_defs.hh"
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/util/backtrace.hh>
 #include <seastar/core/sstring.hh>
 #include "types/types.hh"
-#include "compound.hh"
+#include "keys/compound.hh"
 #include "gc_clock.hh"
-#include "compress.hh"
+#include "sstables/compressor.hh"
 #include "compaction/compaction_strategy_type.hh"
 #include "caching_options.hh"
 #include "column_computation.hh"
-#include "timestamp.hh"
+#include "mutation/timestamp.hh"
 #include "tombstone_gc_options.hh"
 #include "db/per_partition_rate_limit_options.hh"
 #include "db/tablet_options.hh"
 #include "schema_fwd.hh"
+#include "db/view/base_info.hh"
 
 namespace dht {
 
@@ -173,8 +175,6 @@ public:
     }
     bool operator==(const speculative_retry& other) const = default;
 };
-
-typedef std::unordered_map<sstring, sstring> index_options_map;
 
 enum class index_metadata_kind {
     keys,
@@ -501,12 +501,12 @@ struct schema_static_props {
     bool is_group0_table = false; // the table is a group 0 table
 };
 
-class schema_describe_helper {
-public:
-    virtual bool is_global_index(const table_id& base_id, const schema& view_s) const = 0;
-    virtual bool is_index(const table_id& base_id, const schema& view_s) const = 0;
-    virtual schema_ptr find_schema(const table_id& id) const = 0;
-    virtual ~schema_describe_helper() = default;
+struct schema_describe_helper {
+    enum class type { table, view, index };
+    type type;
+    bool is_global_index;
+    std::optional<sstring> custom_index_class;
+    schema_ptr base_schema; // relevant for view and index
 };
 
 /*
@@ -558,7 +558,7 @@ private:
         int32_t _memtable_flush_period = 0;
         ::speculative_retry _speculative_retry = ::speculative_retry(speculative_retry::type::PERCENTILE, 0.99);
         // This is the compaction strategy that will be used by default on tables which don't have one explicitly specified.
-        sstables::compaction_strategy_type _compaction_strategy = sstables::compaction_strategy_type::incremental;
+        compaction::compaction_strategy_type _compaction_strategy = compaction::compaction_strategy_type::incremental;
         std::map<sstring, sstring> _compaction_strategy_options;
         bool _compaction_enabled = true;
         ::caching_options _caching_options;
@@ -612,8 +612,22 @@ public:
     typedef std::ranges::subrange<iterator> iterator_range_type;
     typedef std::ranges::subrange<const_iterator> const_iterator_range_type;
 
-    static constexpr int32_t NAME_LENGTH = 48;
-
+    // The maximum allowed length for any schema name (table, keyspace, view, or index).
+    // This limit is primarily determined by the maximum table name length.
+    //
+    // When a new table is created, sstables::init_table_storage() generates a directory name
+    // by concatenating the full table name, a dash ('-'), and a 32-byte UUID. Since most Linux
+    // filesystems restrict a single filename component to 255 bytes, any table name longer than
+    // 222 bytes would result in a directory name exceeding this limit, causing mkdir() to fail.
+    //
+    // Additionally, we reserve 15 bytes for the "_scylla_cdc_log" suffix, which is appended to
+    // CDC-enabled table names (see cdc_log_suffix in cdc/log.cc). While this suffix
+    // only applies to table names, for simplicity, the same length restriction is enforced for
+    // keyspace, view, and index names as well.
+    // We also reserve 15 bytes for future use, allowing for potential future extensions without
+    // breaking existing schemas.
+    // Hence the length is: 255 - 32 (UUID) - 1 (dash) - 15 (CDC suffix) - 15 (reserved) = 192.
+    static constexpr size_t NAME_LENGTH = 192;
 
     struct column {
         bytes name;
@@ -628,7 +642,7 @@ private:
     schema(const schema&, const std::function<void(schema&)>&);
     class private_tag{};
 public:
-    schema(private_tag, const raw_schema&, const schema_static_props& props);
+    schema(private_tag, const raw_schema&, const schema_static_props& props, std::optional<std::variant<schema_ptr, db::view::base_dependent_view_info>> base = std::nullopt);
     schema(const schema&);
     // See \ref make_reversed().
     schema(reversed_tag, const schema&);
@@ -715,12 +729,12 @@ public:
         return _raw._memtable_flush_period;
     }
 
-    sstables::compaction_strategy_type configured_compaction_strategy() const {
+    compaction::compaction_strategy_type configured_compaction_strategy() const {
         return _raw._compaction_strategy;
     }
 
-    sstables::compaction_strategy_type compaction_strategy() const {
-        return _raw._compaction_enabled ? _raw._compaction_strategy : sstables::compaction_strategy_type::null;
+    compaction::compaction_strategy_type compaction_strategy() const {
+        return _raw._compaction_enabled ? _raw._compaction_strategy : compaction::compaction_strategy_type::null;
     }
 
     const std::map<sstring, sstring>& compaction_strategy_options() const {
@@ -909,7 +923,7 @@ public:
 
     // Generate ALTER TABLE/MATERIALIZED VIEW statement containing all properties with current values.
     // The method cannot be used on index, as indexes don't support alter statement.
-    std::ostream& describe_alter_with_properties(const schema_describe_helper& helper, std::ostream& os) const;
+    fragmented_ostringstream& describe_alter_with_properties(const schema_describe_helper& helper, fragmented_ostringstream& os) const;
     friend bool operator==(const schema&, const schema&);
     const column_mapping& get_column_mapping() const;
     friend class schema_registry_entry;
@@ -930,9 +944,9 @@ public:
     static table_schema_version calculate_digest(const raw_schema& r);
 private:
     // Print all schema properties in CQL syntax
-    std::ostream& schema_properties(const schema_describe_helper& helper, std::ostream& os) const;
+    fragmented_ostringstream& schema_properties(const schema_describe_helper& helper, fragmented_ostringstream& os) const;
 
-    sstring get_create_statement(const schema_describe_helper& helper, bool with_internals) const;
+    managed_string get_create_statement(const schema_describe_helper& helper, bool with_internals) const;
 public:
     const v3_columns& v3() const {
         return _v3_columns;

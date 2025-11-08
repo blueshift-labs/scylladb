@@ -15,12 +15,14 @@
 #include <seastar/core/sharded.hh>
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/with_scheduling_group.hh>
+#include <seastar/core/lowres_clock.hh>
 
 #include "seastarx.hh"
 #include "auth/service.hh"
 #include "cql3/description.hh"
 #include <map>
 #include "qos_common.hh"
+#include "mutation/mutation.hh"
 #include "service/endpoint_lifecycle_subscriber.hh"
 #include "qos_configuration_change_subscriber.hh"
 #include "service/raft/raft_group0_client.hh"
@@ -104,6 +106,7 @@ using update_both_cache_levels = bool_class<class update_both_cache_levels_tag>;
 class service_level_controller : public peering_sharded_service<service_level_controller>, public service::endpoint_lifecycle_subscriber {
 public:
     static inline const int32_t default_shares = 1000;
+    static constexpr auto driver_service_level_name = "driver";
 
     class service_level_distributed_data_accessor {
     public:
@@ -114,10 +117,69 @@ public:
         virtual future<> commit_mutations(service::group0_batch&& mc, abort_source& as) const = 0;
 
         virtual bool is_v2() const = 0;
+        // Returns whether effective service level cache can be populated and used.
+        // This is equivalent to checking whether auth + raft have been migrated to raft.
+        virtual bool can_use_effective_service_level_cache() const = 0;
         // Returns v2(raft) data accessor. If data accessor is already a raft one, returns nullptr.
         virtual ::shared_ptr<service_level_distributed_data_accessor> upgrade_to_v2(cql3::query_processor& qp, service::raft_group0_client& group0_client) const = 0;
     };
     using service_level_distributed_data_accessor_ptr = ::shared_ptr<service_level_distributed_data_accessor>;
+
+    class auth_integration {
+    private:
+        friend class service_level_controller;
+
+    private:
+        service_level_controller& _sl_controller;
+        auth::service& _auth_service;
+
+        /// Mappings `role name` -> `service level options`.
+        std::map<sstring, service_level_options> _cache;
+        /// This gate is supposed to synchronize `stop` with other tasks that
+        /// this interface performs. Because of that, EVERY coroutine function
+        /// of this class should hold it throughout its execution.
+        ///
+        /// Failing to do so may result in a segmentation fault and the like.
+        seastar::named_gate _stop_gate;
+
+    public:
+        auth_integration(service_level_controller&, auth::service&);
+
+        future<> stop();
+
+        /// Find the effective service level for a given role.
+        /// If there is no applicable service level for it, `std::nullopt` is returned instead.
+        future<std::optional<service_level_options>> find_effective_service_level(const sstring& role_name);
+        /// Synchronous version of `find_effective_service_level` that only checks the cache.
+        std::optional<service_level_options> find_cached_effective_service_level(const sstring& role_name);
+
+        future<scheduling_group> get_user_scheduling_group(const std::optional<auth::authenticated_user>& usr);
+
+        template <typename Func, typename Ret = std::invoke_result_t<Func>>
+            requires std::invocable<Func>
+        futurize_t<Ret> with_user_service_level(const std::optional<auth::authenticated_user>& user, Func&& func) {
+            // No need to hold `_stop_gate` here. It'll be held during the call to `find_effective_service_level`,
+            // and after that it's not necessary. We do NOT hold it here to avoid postpoing finishing `stop`.
+
+            if (user && user->name) {
+                const std::optional<service_level_options> maybe_sl_opts = co_await find_effective_service_level(*user->name);
+                const sstring& sl_name = maybe_sl_opts && maybe_sl_opts->shares_name
+                        ? *maybe_sl_opts->shares_name
+                        : service_level_controller::default_service_level_name;
+
+                co_return co_await _sl_controller.with_service_level(sl_name, std::forward<Func>(func));
+            } else {
+                co_return co_await _sl_controller.with_service_level(service_level_controller::default_service_level_name, std::forward<Func>(func));
+            }
+        }
+
+        future<std::vector<cql3::description>> describe_attached_service_levels();
+
+        /// Must be executed on shard 0.
+        future<> reload_cache(qos::query_context ctx);
+
+        void clear_cache();
+    };
 
 private:
     struct global_controller_data {
@@ -147,8 +209,10 @@ private:
 
     // service level name -> service_level object
     std::map<sstring, service_level> _service_levels_db;
-    // role name -> effective service_level_options 
-    std::map<sstring, service_level_options> _effective_service_levels_db;
+
+    // Invariant: Non-null strictly within the lifetime of `auth::service`.
+    std::unique_ptr<auth_integration> _auth_integration = nullptr;
+
     // Keeps names of effectively dropped service levels. Those service levels exits in the table but are not present in _service_levels_db cache
     std::set<sstring> _effectively_dropped_sls;
     std::pair<const sstring*, service_level*> _sl_lookup[max_scheduling_groups()];
@@ -160,6 +224,7 @@ private:
     unsigned _logged_intervals;
     atomic_vector<qos_configuration_change_subscriber*> _subscribers;
     optimized_optional<abort_source::subscription> _early_abort_subscription;
+    seastar::lowres_clock::time_point _last_unsuccessful_driver_sl_creation_attemp = seastar::lowres_clock::time_point::min();
     void do_abort() noexcept;
 public:
     service_level_controller(sharded<auth::service>& auth_service, locator::shared_token_metadata& tm, abort_source& as, service_level_options default_service_level_config,
@@ -171,6 +236,10 @@ public:
      * @return a future that resolves when the initialization is over.
      */
     future<> start();
+
+    void register_auth_integration(auth::service&);
+
+    future<> unregister_auth_integration();
 
     void set_distributed_data_accessor(service_level_distributed_data_accessor_ptr sl_data_accessor);
 
@@ -219,14 +288,8 @@ public:
     template <typename Func, typename Ret = std::invoke_result_t<Func>>
     requires std::invocable<Func>
     futurize_t<Ret> with_user_service_level(const std::optional<auth::authenticated_user>& usr, Func&& func) {
-        if (usr && usr->name) {
-            return find_effective_service_level(*usr->name).then([this, func = std::move(func)] (std::optional<service_level_options> opts) mutable {
-                auto& service_level_name = (opts && opts->shares_name) ? *opts->shares_name : default_service_level_name;
-                return with_service_level(service_level_name, std::move(func));
-            });
-        } else {
-            return with_service_level(default_service_level_name, std::move(func));
-        }
+        SCYLLA_ASSERT(_auth_integration != nullptr);
+        return _auth_integration->with_user_service_level(usr, std::forward<Func>(func));
     }
 
     /**
@@ -286,6 +349,18 @@ public:
     void maybe_start_legacy_update_from_distributed_data(std::function<steady_clock_type::duration()> interval_f, service::storage_service& storage_service, service::raft_group0_client& group0_client);
 
     /**
+     * Get mutations required to:
+     * 1. create `sl:driver`
+     * 2. store information that `sl:driver` was created in `system.scylla_local`
+     */
+    static future<utils::chunked_vector<mutation>> get_create_driver_service_level_mutations(db::system_keyspace& sys_ks, api::timestamp_type timestamp);
+    /**
+     * Create `sl:driver` using _sl_data_accessor if possible. If `sl:driver` exists or it's created, store
+       the information it was created in `system.scylla_local`.
+     */
+    future<std::optional<service::group0_guard>> migrate_to_driver_service_level(service::group0_guard guard, db::system_keyspace& sys_ks);
+
+    /**
      * Request abort of update loop.
      * Must be called on shard 0.
      */
@@ -297,15 +372,6 @@ public:
      * @return a future that is resolved when the update is done
      */
     future<> update_service_levels_cache(qos::query_context ctx = qos::query_context::unspecified);
-
-    /**
-     * Updates effective service levels cache.
-     * The method uses service levels cache (_service_levels_db)
-     * and data from auth tables.
-     * Must be executed on shard 0.
-     * @return a future that is resolved when the update is done
-     */
-    future<> update_effective_service_levels_cache();
 
     /**
      * Service levels cache consists of two levels: service levels cache and effective service levels cache

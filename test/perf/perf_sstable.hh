@@ -16,7 +16,7 @@
 #include "sstables/sstables.hh"
 #include "compaction/compaction_manager.hh"
 #include "compaction/time_window_compaction_strategy.hh"
-#include "cell_locking.hh"
+#include "replica/cell_locking.hh"
 #include "test/lib/simple_schema.hh"
 #include "test/lib/sstable_utils.hh"
 #include "test/lib/test_services.hh"
@@ -97,7 +97,7 @@ public:
         unsigned sstables;
         size_t buffer_size;
         sstring dir;
-        sstables::compaction_strategy_type compaction_strategy;
+        compaction::compaction_strategy_type compaction_strategy;
         api::timestamp_type timestamp_range;
     };
 
@@ -129,7 +129,7 @@ private:
     lw_shared_ptr<replica::memtable> _mt;
     std::vector<shared_sstable> _sst;
 
-    schema_ptr create_schema(sstables::compaction_strategy_type type) {
+    schema_ptr create_schema(compaction::compaction_strategy_type type) {
         schema_builder builder("ks", "perf-test", generate_legacy_id("ks", "perf-test"));
         builder.with_column("name", utf8_type, column_kind::partition_key);
         for (unsigned i = 0; i < _cfg.num_columns; ++i) {
@@ -154,7 +154,8 @@ private:
         const auto start = perf_sstable_test_env::now();
 
         // mimic the behavior of sstable_streamer::stream_sstable_mutations()
-        auto sst_set = make_lw_shared<sstables::sstable_set>(sstables::make_partitioned_sstable_set(s, false));
+        auto full_token_range = dht::token_range::make(dht::first_token(), dht::last_token());
+        auto sst_set = make_lw_shared<sstables::sstable_set>(sstables::make_partitioned_sstable_set(s, std::move(full_token_range)));
         // stream all previously loaded sstables
         for (auto& sst : _sst) {
             sst_set->insert(sst);
@@ -194,7 +195,9 @@ private:
     }
 
 public:
-    perf_sstable_test_env(conf cfg) : _cfg(std::move(cfg))
+    perf_sstable_test_env(conf cfg, sstable_compressor_factory& scf)
+           : _env({}, scf)
+           , _cfg(std::move(cfg))
            , s(create_schema(cfg.compaction_strategy))
            , _distribution('@', '~')
            , _mt(make_lw_shared<replica::memtable>(s))
@@ -272,24 +275,24 @@ public:
                 cache_tracker tracker;
                 cell_locker_stats cl_stats;
                 tasks::task_manager tm;
-                auto cm = make_lw_shared<compaction_manager>(tm, compaction_manager::for_testing_tag{});
+                auto cm = make_lw_shared<compaction::compaction_manager>(tm, compaction::compaction_manager::for_testing_tag{});
                 auto cf = make_lw_shared<replica::column_family>(s, env.make_table_config(), make_lw_shared<replica::storage_options>(), *cm, env.manager(), cl_stats, tracker, nullptr);
 
                 auto start = perf_sstable_test_env::now();
 
-                auto descriptor = sstables::compaction_descriptor(std::move(ssts));
+                auto descriptor = compaction::compaction_descriptor(std::move(ssts));
                 descriptor.enable_garbage_collection(cf->get_sstable_set());
                 descriptor.creator = [sst_gen = std::move(sst_gen)] (unsigned dummy) mutable {
                     return sst_gen();
                 };
                 descriptor.replacer = sstables::replacer_fn_no_op();
-                auto cdata = compaction_manager::create_compaction_data();
-                compaction_progress_monitor progress_monitor;
-                auto ret = sstables::compact_sstables(std::move(descriptor), cdata, cf->try_get_table_state_with_static_sharding(), progress_monitor).get();
+                auto cdata = compaction::compaction_manager::create_compaction_data();
+                compaction::compaction_progress_monitor progress_monitor;
+                auto ret = compaction::compact_sstables(std::move(descriptor), cdata, cf->try_get_compaction_group_view_with_static_sharding(), progress_monitor).get();
                 auto end = perf_sstable_test_env::now();
 
                 auto partitions_per_sstable = _cfg.partitions / _cfg.sstables;
-                if (_cfg.compaction_strategy != sstables::compaction_strategy_type::time_window) {
+                if (_cfg.compaction_strategy != compaction::compaction_strategy_type::time_window) {
                     SCYLLA_ASSERT(ret.new_sstables.size() == 1);
                 }
                 auto total_keys_written = std::accumulate(ret.new_sstables.begin(), ret.new_sstables.end(), uint64_t(0), [] (uint64_t n, const sstables::shared_sstable& sst) {
@@ -353,7 +356,7 @@ public:
 // The function func should carry on with the test, and return the number of partitions processed.
 // time_runs will then map reduce it, and return the aggregate partitions / sec for the whole system.
 template <typename Func>
-future<> time_runs(unsigned iterations, unsigned parallelism, distributed<perf_sstable_test_env>& dt, Func func) {
+future<> time_runs(unsigned iterations, unsigned parallelism, sharded<perf_sstable_test_env>& dt, Func func) {
     using namespace boost::accumulators;
     auto acc = make_lw_shared<accumulator_set<double, features<tag::mean, tag::error_of<tag::mean>>>>();
     auto idx = std::views::iota(0, int(iterations));

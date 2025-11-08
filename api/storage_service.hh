@@ -52,17 +52,19 @@ table_id validate_table(const replica::database& db, sstring ks_name, sstring ta
 // containing the description of the respective no_such_column_family error.
 // Returns a vector of all table infos given by the parameter, or
 // if the parameter is not found or is empty, returns a list of all table infos in the keyspace.
-std::vector<table_info> parse_table_infos(const sstring& ks_name, const http_context& ctx, const std::unordered_map<sstring, sstring>& query_params, sstring param_name);
 
 std::vector<table_info> parse_table_infos(const sstring& ks_name, const http_context& ctx, sstring value);
 
+std::pair<sstring, std::vector<table_info>> parse_table_infos(const http_context& ctx, const http::request& req, sstring cf_param_name = "cf");
+
 struct scrub_info {
-    sstables::compaction_type_options::scrub opts;
+    compaction::compaction_type_options::scrub opts;
     sstring keyspace;
     std::vector<sstring> column_families;
+    sstring snapshot_tag;
 };
 
-future<scrub_info> parse_scrub_options(const http_context& ctx, sharded<db::snapshot_ctl>& snap_ctl, std::unique_ptr<http::request> req);
+scrub_info parse_scrub_options(const http_context& ctx, std::unique_ptr<http::request> req);
 
 void set_storage_service(http_context& ctx, httpd::routes& r, sharded<service::storage_service>& ss, service::raft_group0_client&);
 void unset_storage_service(http_context& ctx, httpd::routes& r);
@@ -80,6 +82,13 @@ void set_snapshot(http_context& ctx, httpd::routes& r, sharded<db::snapshot_ctl>
 void unset_snapshot(http_context& ctx, httpd::routes& r);
 void set_load_meter(http_context& ctx, httpd::routes& r, service::load_meter& lm);
 void unset_load_meter(http_context& ctx, httpd::routes& r);
-seastar::future<json::json_return_type> run_toppartitions_query(db::toppartitions_query& q, http_context &ctx, bool legacy_request = false);
+seastar::future<json::json_return_type> run_toppartitions_query(db::toppartitions_query& q, bool legacy_request = false);
+
+// converts string value of boolean parameter into bool
+// maps (case insensitively)
+//     "true", "yes" and "1" into true
+//     "false", "no" and "0" into false
+// otherwise throws runtime_error
+bool validate_bool_x(const sstring& param, bool default_value);
 
 } // namespace api

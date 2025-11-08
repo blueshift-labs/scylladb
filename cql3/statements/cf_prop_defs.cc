@@ -9,6 +9,7 @@
  */
 
 #include "cql3/statements/cf_prop_defs.hh"
+#include "cql3/statements/property_definitions.hh"
 #include "cql3/statements/request_validations.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "db/extensions.hh"
@@ -23,6 +24,8 @@
 #include "db/per_partition_rate_limit_options.hh"
 #include "db/tablet_options.hh"
 #include "utils/bloom_calculations.hh"
+#include "utils/overloaded_functor.hh"
+#include "db/config.hh"
 
 #include <boost/algorithm/string/predicate.hpp>
 
@@ -61,12 +64,19 @@ schema::extensions_map cf_prop_defs::make_schema_extensions(const db::extensions
     for (auto& p : exts.schema_extensions()) {
         auto i = _properties.find(p.first);
         if (i != _properties.end()) {
-            std::visit([&](auto& v) {
+            std::visit(overloaded_functor{
+            [&](const sstring& v) {
                 auto ep = p.second(v);
                 if (ep) {
                     er.emplace(p.first, std::move(ep));
                 }
-            }, i->second);
+            },
+            [&](const property_definitions::extended_map_type& xmap) {
+                auto ep = p.second(property_definitions::to_simple_map(std::move(xmap)));
+                if (ep) {
+                    er.emplace(p.first, std::move(ep));
+                }
+            }}, i->second);
         }
     }
     return er;
@@ -120,7 +130,7 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
         if (strategy == compaction_type_options.end()) {
             throw exceptions::configuration_exception(sstring("Missing sub-option '") + COMPACTION_STRATEGY_CLASS_KEY + "' for the '" + KW_COMPACTION + "' option.");
         }
-        _compaction_strategy_class = sstables::compaction_strategy::type(strategy->second);
+        _compaction_strategy_class = compaction::compaction_strategy::type(strategy->second);
         remove_from_map_if_exists(KW_COMPACTION, COMPACTION_STRATEGY_CLASS_KEY);
 
 #if 0
@@ -135,7 +145,7 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
             throw exceptions::configuration_exception(sstring("Missing sub-option '") + compression_parameters::SSTABLE_COMPRESSION + "' for the '" + KW_COMPRESSION + "' option.");
         }
         compression_parameters cp(*compression_options);
-        cp.validate();
+        cp.validate(compression_parameters::dicts_feature_enabled(bool(db.features().sstable_compression_dicts)));
     }
 
     auto per_partition_rate_limit_options = get_per_partition_rate_limit_options(schema_extensions);
@@ -237,8 +247,8 @@ std::optional<caching_options> cf_prop_defs::get_caching_options() const {
         return {};
     }
     return std::visit(make_visitor(
-        [] (const property_definitions::map_type& map) {
-            return map.empty() ? std::nullopt : std::optional<caching_options>(caching_options::from_map(map));
+        [] (const property_definitions::extended_map_type& map) {
+            return map.empty() ? std::nullopt : std::optional<caching_options>(caching_options::from_map(to_simple_map(map)));
         },
         [] (const sstring& str) {
             return std::optional<caching_options>(caching_options::from_sstring(str));
@@ -369,7 +379,7 @@ void cf_prop_defs::apply_to_builder(schema_builder& builder, schema::extensions_
     }
     // Set default tombstone_gc mode.
     if (!schema_extensions.contains(tombstone_gc_extension::NAME)) {
-        auto ext = seastar::make_shared<tombstone_gc_extension>(get_default_tombstonesonte_gc_mode(db, ks_name));
+        auto ext = seastar::make_shared<tombstone_gc_extension>(get_default_tombstone_gc_mode(db, ks_name));
         schema_extensions.emplace(tombstone_gc_extension::NAME, std::move(ext));
     }
     builder.set_extensions(std::move(schema_extensions));
@@ -397,7 +407,7 @@ void cf_prop_defs::validate_minimum_int(const sstring& field, int32_t minimum_va
     }
 }
 
-std::optional<sstables::compaction_strategy_type> cf_prop_defs::get_compaction_strategy_class() const {
+std::optional<compaction::compaction_strategy_type> cf_prop_defs::get_compaction_strategy_class() const {
     // Unfortunately, in our implementation, the compaction strategy begins
     // stored in the compaction strategy options, and then the validate()
     // functions moves it into _compaction_strategy_class... If we want a
@@ -409,7 +419,7 @@ std::optional<sstables::compaction_strategy_type> cf_prop_defs::get_compaction_s
     auto compaction_type_options = get_compaction_type_options();
     auto strategy = compaction_type_options.find(COMPACTION_STRATEGY_CLASS_KEY);
     if (strategy != compaction_type_options.end()) {
-        return sstables::compaction_strategy::type(strategy->second);
+        return compaction::compaction_strategy::type(strategy->second);
     }
     return std::nullopt;
 }

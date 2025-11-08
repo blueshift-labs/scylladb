@@ -11,8 +11,9 @@
 #include "compaction/compaction_garbage_collector.hh"
 #include "mutation_fragment.hh"
 #include "mutation_fragment_stream_validator.hh"
+#include "mutation_tombstone_stats.hh"
 #include "tombstone_gc.hh"
-#include "full_position.hh"
+#include "keys/full_position.hh"
 #include <type_traits>
 #include "utils/log.hh"
 
@@ -31,7 +32,7 @@ enum class compact_for_sstables {
 };
 
 template<typename T>
-concept CompactedFragmentsConsumerV2 = requires(T obj, tombstone t, const dht::decorated_key& dk, static_row sr,
+concept CompactedFragmentsConsumer = requires(T obj, tombstone t, const dht::decorated_key& dk, static_row sr,
         clustering_row cr, range_tombstone_change rtc, tombstone current_tombstone, row_tombstone current_row_tombstone, bool is_alive) {
     obj.consume_new_partition(dk);
     obj.consume(t);
@@ -127,6 +128,13 @@ struct compaction_stats {
         uint64_t total() const {
             return live + dead;
         }
+
+        row_stats& operator+=(const row_stats& other) {
+            live += other.live;
+            dead += other.dead;
+            cell_stats += other.cell_stats;
+            return *this;
+        }
     };
 
     uint64_t live_cells() const {
@@ -136,11 +144,24 @@ struct compaction_stats {
         return static_rows.cell_stats.dead_cells + clustering_rows.cell_stats.dead_cells +
             static_rows.cell_stats.collection_tombstones + clustering_rows.cell_stats.collection_tombstones;
     }
+    uint64_t dead_partitions() const {
+        return total_partitions - live_partitions;
+    }
 
-    uint64_t partitions = 0;
+    uint64_t total_partitions = 0;
+    uint64_t live_partitions = 0;
     row_stats static_rows;
     row_stats clustering_rows;
     uint64_t range_tombstones = 0;
+
+    compaction_stats& operator+=(const compaction_stats& other) {
+        total_partitions += other.total_partitions;
+        live_partitions += other.live_partitions;
+        static_rows += other.static_rows;
+        clustering_rows += other.clustering_rows;
+        range_tombstones += other.range_tombstones;
+        return *this;
+    }
 };
 
 template<compact_for_sstables SSTableCompaction>
@@ -148,8 +169,8 @@ class compact_mutation_state {
     const schema& _schema;
     gc_clock::time_point _query_time;
     max_purgeable_fn _get_max_purgeable;
-    can_gc_fn _can_gc;
-    api::timestamp_type _max_purgeable = api::missing_timestamp;
+    max_purgeable _max_purgeable_regular;
+    max_purgeable _max_purgeable_shadowable;
     std::optional<gc_clock::time_point> _gc_before;
     const query::partition_slice& _slice;
     uint64_t _row_limit{};
@@ -164,8 +185,7 @@ class compact_mutation_state {
     uint32_t _current_partition_limit;
     bool _empty_partition{};
     bool _empty_partition_in_gc_consumer{};
-    const dht::decorated_key* _dk{};
-    dht::decorated_key _last_dk;
+    std::optional<dht::decorated_key> _dk;
     bool _return_static_content_on_partition_with_no_rows{};
 
     std::optional<static_row> _last_static_row;
@@ -181,7 +201,8 @@ class compact_mutation_state {
 
     std::unique_ptr<mutation_compactor_garbage_collector> _collector;
 
-    compaction_stats _stats;
+    ::compaction_stats _stats;
+    tombstone_purge_stats* _tombstone_stats = nullptr;
 
     mutation_fragment_stream_validating_filter _validator;
 
@@ -189,7 +210,7 @@ class compact_mutation_state {
     stop_iteration _stop = stop_iteration::no;
 private:
     template <typename Consumer, typename GCConsumer>
-    requires CompactedFragmentsConsumerV2<Consumer> && CompactedFragmentsConsumerV2<GCConsumer>
+    requires CompactedFragmentsConsumer<Consumer> && CompactedFragmentsConsumer<GCConsumer>
     stop_iteration do_consume(range_tombstone_change&& rtc, Consumer& consumer, GCConsumer& gc_consumer) {
         _validator(mutation_fragment_v2::kind::range_tombstone_change, rtc.position(), rtc.tombstone());
         stop_iteration gc_consumer_stop = stop_iteration::no;
@@ -236,7 +257,7 @@ private:
     void partition_is_not_empty(Consumer& consumer) {
         if (_empty_partition) {
             _empty_partition = false;
-            ++_stats.partitions;
+            ++_stats.live_partitions;
             consumer.consume_new_partition(*_dk);
             auto pt = _partition_tombstone;
             if (pt && !can_purge_tombstone(pt)) {
@@ -250,14 +271,41 @@ private:
     }
 
     bool can_purge_tombstone(const tombstone& t, is_shadowable is_shadowable, const gc_clock::time_point deletion_time) {
+        max_purgeable::can_purge_result purge_res { };
+
         if (_tombstone_gc_state.cheap_to_get_gc_before(_schema)) {
             // if retrieval of grace period is cheap, can_gc() will only be
             // called for tombstones that are older than grace period, in
             // order to avoid unnecessary bloom filter checks when calculating
             // max purgeable timestamp.
-            return satisfy_grace_period(deletion_time) && can_gc(t, is_shadowable);
+            purge_res.can_purge = satisfy_grace_period(deletion_time);
+            if (purge_res.can_purge) {
+                purge_res = can_gc(t, is_shadowable);
+            }
+        } else {
+            purge_res = can_gc(t, is_shadowable);
+            if (purge_res.can_purge) {
+                purge_res.can_purge = satisfy_grace_period(deletion_time);
+            }
         }
-        return can_gc(t, is_shadowable) && satisfy_grace_period(deletion_time);
+
+        if constexpr (sstable_compaction()) {
+            if (!_tombstone_stats || !t) {
+                return purge_res.can_purge;
+            }
+
+            ++_tombstone_stats->attempts;
+            if (!purge_res.can_purge) {
+                static int64_t tombstone_purge_stats::*stats_table[] = {
+                    &tombstone_purge_stats::failures_other,
+                    &tombstone_purge_stats::failures_due_to_overlapping_with_memtable,
+                    &tombstone_purge_stats::failures_due_to_overlapping_with_uncompacting_sstable
+                };
+                ++(_tombstone_stats->*stats_table[static_cast<int>(purge_res.timestamp_source)]);
+            }
+        }
+
+        return purge_res.can_purge;
     }
 
     bool can_purge_tombstone(const tombstone& t) {
@@ -282,35 +330,44 @@ private:
         }
     }
 
-    bool can_gc(tombstone t, is_shadowable is_shadowable) {
+    max_purgeable::can_purge_result can_gc(tombstone t, is_shadowable is_shadowable) {
         if (!sstable_compaction()) {
-            return true;
+            return { .can_purge = _tombstone_gc_state.is_gc_enabled(), .timestamp_source = max_purgeable::timestamp_source::none };
         }
         if (!t) {
-            return false;
+            return { .can_purge = false };
         }
-        if (_max_purgeable == api::missing_timestamp) {
-            _max_purgeable = _get_max_purgeable(*_dk, is_shadowable);
+        auto& max_purgeable = is_shadowable ? _max_purgeable_shadowable : _max_purgeable_regular;
+        if (!max_purgeable) {
+            max_purgeable = _get_max_purgeable(*_dk, is_shadowable);
         }
-        auto ret = t.timestamp < _max_purgeable;
-        mclog.debug("can_gc: t={} is_shadowable={} max_purgeable={}: ret={}", t, is_shadowable, _max_purgeable, ret);
+        auto ret = max_purgeable.can_purge(t);
+        mclog.debug("can_gc: t={} is_shadowable={} max_purgeable={}: can_purge={}, timestamp_source={}", t, is_shadowable, max_purgeable, ret.can_purge, ret.timestamp_source);
         return ret;
     };
+
+    can_gc_fn make_can_gc_fn() {
+        return [this] (tombstone t, is_shadowable is_shadowable) { return can_gc(t, is_shadowable).can_purge; };
+    }
 
 public:
     compact_mutation_state(compact_mutation_state&&) = delete; // Because 'this' is captured
 
-    compact_mutation_state(const schema& s, gc_clock::time_point query_time, const query::partition_slice& slice, uint64_t limit,
-              uint32_t partition_limit, mutation_fragment_stream_validation_level validation_level = mutation_fragment_stream_validation_level::token)
+    compact_mutation_state(
+            const schema& s,
+            gc_clock::time_point query_time,
+            const query::partition_slice& slice,
+            uint64_t limit,
+            uint32_t partition_limit,
+            const tombstone_gc_state& gc_state,
+            mutation_fragment_stream_validation_level validation_level = mutation_fragment_stream_validation_level::token)
         : _schema(s)
         , _query_time(query_time)
-        , _can_gc(always_gc)
         , _slice(slice)
         , _row_limit(limit)
         , _partition_limit(partition_limit)
         , _partition_row_limit(_slice.options.contains(query::partition_slice::option::distinct) ? 1 : slice.partition_row_limit())
-        , _tombstone_gc_state(nullptr)
-        , _last_dk({dht::token(), partition_key::make_empty()})
+        , _tombstone_gc_state(gc_state)
         , _last_pos(position_in_partition::for_partition_end())
         , _validator("mutation_compactor for read", _schema, validation_level)
     {
@@ -319,16 +376,16 @@ public:
 
     compact_mutation_state(const schema& s, gc_clock::time_point compaction_time,
             max_purgeable_fn get_max_purgeable,
-            const tombstone_gc_state& gc_state)
+            const tombstone_gc_state& gc_state,
+            tombstone_purge_stats* tombstone_stats = nullptr)
         : _schema(s)
         , _query_time(compaction_time)
         , _get_max_purgeable(std::move(get_max_purgeable))
-        , _can_gc([this] (tombstone t, is_shadowable is_shadowable) { return can_gc(t, is_shadowable); })
         , _slice(s.full_slice())
         , _tombstone_gc_state(gc_state)
-        , _last_dk({dht::token(), partition_key::make_empty()})
         , _last_pos(position_in_partition::for_partition_end())
         , _collector(std::make_unique<mutation_compactor_garbage_collector>(_schema))
+        , _tombstone_stats(tombstone_stats)
         // We already have a validator for compaction in the sstable writer, no need to validate twice
         , _validator("mutation_compactor for compaction", _schema, mutation_fragment_stream_validation_level::none)
     {
@@ -337,10 +394,10 @@ public:
 
     void consume_new_partition(const dht::decorated_key& dk) {
         _validator(mutation_fragment_v2::kind::partition_start, position_in_partition_view::for_partition_start(), {});
-        _validator(dk);
         _stop = stop_iteration::no;
-        auto& pk = dk.key();
-        _dk = &dk;
+        _dk = dk;
+        auto& pk = _dk->key();
+        _validator(*_dk);
         _return_static_content_on_partition_with_no_rows =
             _slice.options.contains(query::partition_slice::option::always_return_static_content) ||
             !has_ck_selector(_slice.row_ranges(_schema, pk));
@@ -350,17 +407,20 @@ public:
         _static_row_live = false;
         _partition_tombstone = {};
         _current_partition_limit = std::min(_row_limit, _partition_row_limit);
-        _max_purgeable = api::missing_timestamp;
+        _max_purgeable_regular = {};
+        _max_purgeable_shadowable = {};
         _gc_before = std::nullopt;
         _last_static_row.reset();
         _last_pos = position_in_partition::for_partition_start();
         _effective_tombstone = {};
         _current_emitted_tombstone = {};
         _current_emitted_gc_tombstone = {};
+
+        ++_stats.total_partitions;
     }
 
     template <typename Consumer, typename GCConsumer>
-    requires CompactedFragmentsConsumerV2<Consumer> && CompactedFragmentsConsumerV2<GCConsumer>
+    requires CompactedFragmentsConsumer<Consumer> && CompactedFragmentsConsumer<GCConsumer>
     void consume(tombstone t, Consumer& consumer, GCConsumer& gc_consumer) {
         _partition_tombstone = t;
         if (can_purge_tombstone(t)) {
@@ -371,13 +431,13 @@ public:
     }
 
     template <typename Consumer>
-    requires CompactedFragmentsConsumerV2<Consumer>
+    requires CompactedFragmentsConsumer<Consumer>
     void force_partition_not_empty(Consumer& consumer) {
         partition_is_not_empty(consumer);
     }
 
     template <typename Consumer, typename GCConsumer>
-    requires CompactedFragmentsConsumerV2<Consumer> && CompactedFragmentsConsumerV2<GCConsumer>
+    requires CompactedFragmentsConsumer<Consumer> && CompactedFragmentsConsumer<GCConsumer>
     stop_iteration consume(static_row&& sr, Consumer& consumer, GCConsumer& gc_consumer) {
         _validator(mutation_fragment_v2::kind::static_row, sr.position(), {});
         _last_static_row = static_row(_schema, sr);
@@ -386,9 +446,10 @@ public:
         if constexpr (sstable_compaction()) {
             _collector->start_collecting_static_row();
         }
+        auto can_gc = make_can_gc_fn();
         auto gc_before = get_gc_before();
         auto res = sr.cells().compact_and_expire(_schema, column_kind::static_column, row_tombstone(current_tombstone),
-                _query_time, _can_gc, gc_before, _collector.get());
+                _query_time, can_gc, gc_before, _collector.get());
         _stats.static_rows.add_row(res);
         const auto is_live = res.is_live();
         if constexpr (sstable_compaction()) {
@@ -411,7 +472,7 @@ public:
     }
 
     template <typename Consumer, typename GCConsumer>
-    requires CompactedFragmentsConsumerV2<Consumer> && CompactedFragmentsConsumerV2<GCConsumer>
+    requires CompactedFragmentsConsumer<Consumer> && CompactedFragmentsConsumer<GCConsumer>
     stop_iteration consume(clustering_row&& cr, Consumer& consumer, GCConsumer& gc_consumer) {
         _validator(mutation_fragment_v2::kind::clustering_row, cr.position(), {});
         if (!sstable_compaction()) {
@@ -436,9 +497,10 @@ public:
                 cr.remove_tombstone();
             }
         }
+        auto can_gc = make_can_gc_fn();
         auto gc_before = get_gc_before();
-        const bool marker_is_live = cr.marker().compact_and_expire(t.tomb(), _query_time, _can_gc, gc_before, _collector.get());
-        const auto res = cr.cells().compact_and_expire(_schema, column_kind::regular_column, t, _query_time, _can_gc, gc_before, cr.marker(),
+        const bool marker_is_live = cr.marker().compact_and_expire(t.tomb(), _query_time, can_gc, gc_before, _collector.get());
+        const auto res = cr.cells().compact_and_expire(_schema, column_kind::regular_column, t, _query_time, can_gc, gc_before, cr.marker(),
                 _collector.get());
         _stats.clustering_rows.add_row(res, marker_is_live);
         const auto is_live = res.is_live() || marker_is_live;
@@ -466,7 +528,7 @@ public:
     }
 
     template <typename Consumer, typename GCConsumer>
-    requires CompactedFragmentsConsumerV2<Consumer> && CompactedFragmentsConsumerV2<GCConsumer>
+    requires CompactedFragmentsConsumer<Consumer> && CompactedFragmentsConsumer<GCConsumer>
     stop_iteration consume(range_tombstone_change&& rtc, Consumer& consumer, GCConsumer& gc_consumer) {
         if (!sstable_compaction()) {
             _last_pos = rtc.position();
@@ -477,7 +539,7 @@ public:
     }
 
     template <typename Consumer, typename GCConsumer>
-    requires CompactedFragmentsConsumerV2<Consumer> && CompactedFragmentsConsumerV2<GCConsumer>
+    requires CompactedFragmentsConsumer<Consumer> && CompactedFragmentsConsumer<GCConsumer>
     stop_iteration consume_end_of_partition(Consumer& consumer, GCConsumer& gc_consumer) {
         // Only check if the active tombstone has to be closed, if the partition
         // was cut by the consumer. Otherwise, leave the stream as-is.
@@ -528,13 +590,9 @@ public:
     }
 
     template <typename Consumer, typename GCConsumer>
-    requires CompactedFragmentsConsumerV2<Consumer> && CompactedFragmentsConsumerV2<GCConsumer>
+    requires CompactedFragmentsConsumer<Consumer> && CompactedFragmentsConsumer<GCConsumer>
     auto consume_end_of_stream(Consumer& consumer, GCConsumer& gc_consumer) {
         _validator.on_end_of_stream();
-        if (_dk) {
-            _last_dk = *_dk;
-            _dk = &_last_dk;
-        }
         if constexpr (std::is_void_v<std::invoke_result_t<decltype(&GCConsumer::consume_end_of_stream), GCConsumer&>>) {
             gc_consumer.consume_end_of_stream();
             return consumer.consume_end_of_stream();
@@ -546,7 +604,7 @@ public:
     /// The decorated key of the partition the compaction is positioned in.
     /// Can be null if the compaction wasn't started yet.
     const dht::decorated_key* current_partition() const {
-        return _dk;
+        return _dk ? &*_dk : nullptr;
     }
 
     // Only updated when SSTableCompaction == compact_for_sstables::no.
@@ -566,7 +624,7 @@ public:
     /// partition-header and static row if there are clustering rows or range
     /// tombstones left in the partition.
     template <typename Consumer>
-    requires CompactedFragmentsConsumerV2<Consumer>
+    requires CompactedFragmentsConsumer<Consumer>
     void start_new_page(uint64_t row_limit,
             uint32_t partition_limit,
             gc_clock::time_point query_time,
@@ -629,7 +687,7 @@ public:
         if (!_stop) {
             return {};
         }
-        partition_start ps(std::move(_last_dk), _partition_tombstone);
+        partition_start ps(*std::exchange(_dk, std::nullopt), _partition_tombstone);
         if (_effective_tombstone) {
             return detached_compaction_state{std::move(ps), std::move(_last_static_row),
                     range_tombstone_change(position_in_partition::after_key(_schema, _last_pos), _effective_tombstone)};
@@ -638,12 +696,12 @@ public:
         }
     }
 
-    const compaction_stats& stats() const { return _stats; }
+    const ::compaction_stats& stats() const { return _stats; }
 };
 
 template<compact_for_sstables SSTableCompaction, typename Consumer, typename GCConsumer>
-requires CompactedFragmentsConsumerV2<Consumer> && CompactedFragmentsConsumerV2<GCConsumer>
-class compact_mutation_v2 {
+requires CompactedFragmentsConsumer<Consumer> && CompactedFragmentsConsumer<GCConsumer>
+class compact_mutation {
     lw_shared_ptr<compact_mutation_state<SSTableCompaction>> _state;
     Consumer _consumer;
     // Garbage Collected Consumer
@@ -651,25 +709,26 @@ class compact_mutation_v2 {
 
 public:
     // Can only be used for compact_for_sstables::no
-    compact_mutation_v2(const schema& s, gc_clock::time_point query_time, const query::partition_slice& slice, uint64_t limit,
-              uint32_t partition_limit,
+    compact_mutation(const schema& s, gc_clock::time_point query_time, const query::partition_slice& slice, uint64_t limit,
+              uint32_t partition_limit, const tombstone_gc_state& gc_state,
               Consumer consumer, GCConsumer gc_consumer = GCConsumer())
-        : _state(make_lw_shared<compact_mutation_state<SSTableCompaction>>(s, query_time, slice, limit, partition_limit))
+        : _state(make_lw_shared<compact_mutation_state<SSTableCompaction>>(s, query_time, slice, limit, partition_limit, gc_state))
         , _consumer(std::move(consumer))
         , _gc_consumer(std::move(gc_consumer)) {
     }
 
     // Can only be used for compact_for_sstables::yes
-    compact_mutation_v2(const schema& s, gc_clock::time_point compaction_time,
+    compact_mutation(const schema& s, gc_clock::time_point compaction_time,
             max_purgeable_fn get_max_purgeable,
+
             const tombstone_gc_state& gc_state,
-            Consumer consumer, GCConsumer gc_consumer = GCConsumer())
-        : _state(make_lw_shared<compact_mutation_state<SSTableCompaction>>(s, compaction_time, get_max_purgeable, gc_state))
+            Consumer consumer, GCConsumer gc_consumer = GCConsumer(), tombstone_purge_stats* tombstone_stats = nullptr)
+        : _state(make_lw_shared<compact_mutation_state<SSTableCompaction>>(s, compaction_time, get_max_purgeable, gc_state, tombstone_stats))
         , _consumer(std::move(consumer))
         , _gc_consumer(std::move(gc_consumer)) {
     }
 
-    compact_mutation_v2(lw_shared_ptr<compact_mutation_state<SSTableCompaction>> state, Consumer consumer,
+    compact_mutation(lw_shared_ptr<compact_mutation_state<SSTableCompaction>> state, Consumer consumer,
                      GCConsumer gc_consumer = GCConsumer())
         : _state(std::move(state))
         , _consumer(std::move(consumer))
@@ -710,15 +769,15 @@ public:
 };
 
 template<typename Consumer>
-requires CompactedFragmentsConsumerV2<Consumer>
-struct compact_for_query_v2 : compact_mutation_v2<compact_for_sstables::no, Consumer, noop_compacted_fragments_consumer> {
-    using compact_mutation_v2<compact_for_sstables::no, Consumer, noop_compacted_fragments_consumer>::compact_mutation_v2;
+requires CompactedFragmentsConsumer<Consumer>
+struct compact_for_query : compact_mutation<compact_for_sstables::no, Consumer, noop_compacted_fragments_consumer> {
+    using compact_mutation<compact_for_sstables::no, Consumer, noop_compacted_fragments_consumer>::compact_mutation;
 };
 
-using compact_for_query_state_v2 = compact_mutation_state<compact_for_sstables::no>;
+using compact_for_query_state = compact_mutation_state<compact_for_sstables::no>;
 
 template<typename Consumer, typename GCConsumer = noop_compacted_fragments_consumer>
-requires CompactedFragmentsConsumerV2<Consumer> && CompactedFragmentsConsumerV2<GCConsumer>
-struct compact_for_compaction_v2 : compact_mutation_v2<compact_for_sstables::yes, Consumer, GCConsumer> {
-    using compact_mutation_v2<compact_for_sstables::yes, Consumer, GCConsumer>::compact_mutation_v2;
+requires CompactedFragmentsConsumer<Consumer> && CompactedFragmentsConsumer<GCConsumer>
+struct compact_for_compaction : compact_mutation<compact_for_sstables::yes, Consumer, GCConsumer> {
+    using compact_mutation<compact_for_sstables::yes, Consumer, GCConsumer>::compact_mutation;
 };

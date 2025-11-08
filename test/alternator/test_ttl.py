@@ -13,15 +13,22 @@ from decimal import Decimal
 import pytest
 from botocore.exceptions import ClientError
 
-from test.alternator.util import new_test_table, random_string, full_query, unique_table_name, is_aws, \
-    client_no_transform
+from .util import new_test_table, random_string, full_query, unique_table_name, is_aws, client_no_transform, multiset, scylla_config_read
 
-# All tests in this file are expected to fail with tablets due to #16567.
-# To ensure that Alternator TTL is still being tested, instead of
-# xfailing these tests, we temporarily coerce the tests below to avoid
-# using default tablets setting, even if it's available. We do this by
-# using the following tags when creating each table below:
-TAGS = [{'Key': 'experimental:initial_tablets', 'Value': 'none'}]
+# The following fixture is to ensure that Alternator TTL is being tested with both vnodes and tablets.
+# This fixture will run automatically for every test in the module.
+# It sets the TAGS variable in the module’s global namespace to the current parameter value before each test.
+# All tests that use the global TAGS variable will see the correct value, and each test will be run for
+# both values. Thanks to this, the tests will run for both vnodes and tables without the need to change
+# their argument list.
+@pytest.fixture(params=[
+    [{'Key': 'experimental:initial_tablets', 'Value': 'none'}],
+    [{'Key': 'experimental:initial_tablets', 'Value': '0'}],
+], ids=["using vnodes", "using tablets"], autouse=True)
+def tags_param(request):
+    # Set TAGS in the global namespace of this module
+    global TAGS
+    TAGS = request.param
 
 # passes_or_raises() is similar to pytest.raises(), except that while raises()
 # expects a certain exception must happen, the new passes_or_raises()
@@ -57,19 +64,16 @@ def passes_or_raises(expected_exception, match=None):
 # very slow on Scylla or reasonably fast depends on the
 # alternator_ttl_period_in_seconds configuration - test/alternator/run sets
 # it very low, but Scylla may have been run manually.
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def waits_for_expiration(dynamodb, request):
     if is_aws(dynamodb):
         if request.config.getoption('runveryslow'):
             return
         else:
             pytest.skip('need --runveryslow option to run')
-    config_table = dynamodb.Table('.scylla.alternator.system.config')
-    resp = config_table.query(
-            KeyConditionExpression='#key=:val',
-            ExpressionAttributeNames={'#key': 'name'},
-            ExpressionAttributeValues={':val': 'alternator_ttl_period_in_seconds'})
-    period = float(resp['Items'][0]['value'])
+    period = scylla_config_read(dynamodb, 'alternator_ttl_period_in_seconds')
+    assert period is not None
+    period = float(period)
     if period > 1 and not request.config.getoption('runveryslow'):
         pytest.skip('need --runveryslow option to run')
 
@@ -77,7 +81,7 @@ def waits_for_expiration(dynamodb, request):
 # always reasonably fast on Scylla. If fastness on Scylla requires a
 # specific setting of alternator_ttl_period_in_seconds, don't use this
 # fixture - use the above waits_for_expiration instead.
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def veryslow_on_aws(dynamodb, request):
     if is_aws(dynamodb) and not request.config.getoption('runveryslow'):
         pytest.skip('need --runveryslow option to run')
@@ -593,16 +597,14 @@ def test_ttl_expiration_gsi_lsi(dynamodb, waits_for_expiration):
 # checked the case where TTL's expiration-time attribute is not a regular
 # attribute but one of the two key attributes. Alternator encodes these
 # attributes differently (as a real column in the schema - not a serialized
-# JSON inside a map column), so needed to check that such an attribute is
-# usable as well. LSI (and, currently, also GSI) *also* implement their keys
-# differently (like the base key), so let's check that having the TTL column
-# a GSI or LSI key still works. Even though it is unlikely that any user
-# would want to have such a use case.
-# The following test only tries LSI, which we're sure will always have this
-# special case (for GSI, we are considering changing the implementation
-# and make their keys regular attributes - to support adding GSIs after a
-# table already exists - so after such a change GSIs will no longer be a
-# special case.
+# JSON inside a map column), so we needed to check that such an attribute is
+# usable as well. LSI *also* currently implements their keys differently
+# (like the base key), so let's check that having the TTL column an LSI key
+# still works. Even though it is unlikely that any user would want to have
+# such a use case.
+# For GSIs, to support the ability to add a GSI to an existing table, a
+# GSI key can be any regular attribute in the base table, so we don't need
+# a special test for GSIs.
 def test_ttl_expiration_lsi_key(dynamodb, waits_for_expiration):
     # In my experiments, a 30-minute (1800 seconds) is the typical delay
     # for expiration in this test for DynamoDB
@@ -643,23 +645,24 @@ def test_ttl_expiration_lsi_key(dynamodb, waits_for_expiration):
         start_time = time.time()
         gsi_was_alive = False
         while time.time() < start_time + max_duration:
-            print(f"--- {int(time.time()-start_time)} seconds")
-            if 'Item' in table.get_item(Key={'p': p, 'c': c}):
-                print("base alive")
-            else:
+            if 'Item' not in table.get_item(Key={'p': p, 'c': c}):
                 # test is done - and successful:
                 return
-            time.sleep(max_duration/200)
+            time.sleep(sleep)
         pytest.fail('base not expired')
 
 # Check that in the DynamoDB Streams API, an event appears about an item
 # becoming expired. This event should contain be a REMOVE event, contain
 # the appropriate information about the expired item (its key and/or its
 # content), and a special userIdentity flag saying that this is not a regular
-# REMOVE but an expiration.
-@pytest.mark.veryslow
-@pytest.mark.xfail(reason="TTL expiration event in streams not yet marked")
-def test_ttl_expiration_streams(dynamodb, dynamodbstreams):
+# REMOVE but an expiration. Reproduces issue #11523.
+def test_ttl_expiration_streams(dynamodb, dynamodbstreams, waits_for_expiration):
+    # Alternator Streams currently doesn't work with tablets, so until
+    # #23838 is solved, skip this test on tablets.
+    for tag in TAGS:
+        if tag['Key'] == 'experimental:initial_tablets' and tag['Value'].isdigit():
+            pytest.skip("Streams test skipped on tablets due to #23838")
+
     # In my experiments, a 30-minute (1800 seconds) is the typical
     # expiration delay in this test. If the test doesn't finish within
     # max_duration, we report a failure.
@@ -809,3 +812,42 @@ def test_ttl_expiration_long(dynamodb, waits_for_expiration):
                 break
             time.sleep(max_duration/100.0)
         assert count == 99*N
+
+# Alternator uses a tag "system:ttl_attribute" to store the TTL attribute
+# chosen by UpdateTimeToLive. However, this tag is not supposed to be
+# readable or writable by the user directly - it should be read or written
+# only with the usual UpdateTimeToLive and DescribeTimeToLive operations.
+# The following two test confirms that this is the case. The first test
+# checks that the internal tag is invisible, i.e., not returned by
+# ListTagsOfResource. Basically we check that enabling TTL does not add
+# any tags to the list of tags.
+# Reproduces issue #24098.
+def test_ttl_tag_is_invisible(dynamodb):
+    with new_test_table(dynamodb,
+        Tags=TAGS,
+        KeySchema=[{ 'AttributeName': 'p', 'KeyType': 'HASH' }],
+        AttributeDefinitions=[{ 'AttributeName': 'p', 'AttributeType': 'S' }]
+        ) as table:
+            client = table.meta.client
+            client.update_time_to_live(TableName=table.name,
+                TimeToLiveSpecification={'AttributeName': 'x', 'Enabled': True})
+            # Verify that TTL is set for this table, but no extra tags
+            # like "system:ttl_attribute" (or anything else) are visible
+            # in ListTagsOfResource:
+            assert client.describe_time_to_live(TableName=table.name)['TimeToLiveDescription'] == {'TimeToLiveStatus': 'ENABLED', 'AttributeName': 'x'}
+            arn = client.describe_table(TableName=table.name)['Table']['TableArn']
+            assert multiset(TAGS) == multiset(client.list_tags_of_resource(ResourceArn=arn)['Tags'])
+
+# Now check that the internal tag system:ttl_attribute cannot be written with
+# TagResource or UntagResource (it can only be modified by UpdateTimeToLive).
+# This is an Scylla-only test because in DynamoDB, there is nothing
+# special about the tag name "system:ttl_attribute", and it can be written.
+# Reproduces issue #24098.
+def test_ttl_tag_is_unwritable(test_table, scylla_only):
+    tag_name = 'system:ttl_attribute'
+    client = test_table.meta.client
+    arn = client.describe_table(TableName=test_table.name)['Table']['TableArn']
+    with pytest.raises(ClientError, match='ValidationException.*internal'):
+        client.tag_resource(ResourceArn=arn, Tags=[{'Key': tag_name, 'Value': 'x'}])
+    with pytest.raises(ClientError, match='ValidationException.*internal'):
+        client.untag_resource(ResourceArn=arn, TagKeys=[tag_name])

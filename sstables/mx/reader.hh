@@ -12,6 +12,7 @@
 #include "readers/mutation_reader.hh"
 #include "sstables/progress_monitor.hh"
 #include "sstables/types_fwd.hh"
+#include "sstables/index_reader.hh"
 
 namespace sstables {
 namespace mx {
@@ -29,7 +30,10 @@ mutation_reader make_reader(
         streamed_mutation::forwarding fwd,
         mutation_reader::forwarding fwd_mr,
         read_monitor& monitor,
-        integrity_check integrity);
+        integrity_check integrity,
+        std::unique_ptr<abstract_index_reader>,
+        const utils::hashed_key* single_partition_read_murmur_hash
+);
 
 // Same as above but the slice is moved and stored inside the reader.
 mutation_reader make_reader(
@@ -42,7 +46,10 @@ mutation_reader make_reader(
         streamed_mutation::forwarding fwd,
         mutation_reader::forwarding fwd_mr,
         read_monitor& monitor,
-        integrity_check integrity);
+        integrity_check integrity,
+        std::unique_ptr<abstract_index_reader>,
+        const utils::hashed_key* single_partition_read_murmur_hash
+);
 
 // A reader which doesn't use the index at all. It reads everything from the
 // sstable and it doesn't support skipping.

@@ -32,6 +32,7 @@ here="$(realpath $(dirname "$0"))"
 toplevel="$(realpath "$here/../..")"
 group_args=()
 docker_args=()
+tmpfiles=()
 image="$(<"$here/image")"
 
 for gid in $(id -G); do
@@ -142,6 +143,9 @@ if [[ -z "$CARGO_HOME" ]]; then
     mkdir -p "$CARGO_HOME"
 fi
 
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+mkdir -p "$XDG_CACHE_HOME/scylladb"
+
 is_podman="$($tool --help | grep -o podman)"
 
 docker_common_args=()
@@ -158,13 +162,39 @@ if [ -z "$is_podman" ]; then
        --pids-limit -1
        )
 else
-    docker_common_args+=(
-        --userns keep-id)
     # --pids-limit is not supported on podman with cgroupsv1
     # detection code from
     #   https://unix.stackexchange.com/questions/617764/how-do-i-check-if-system-is-using-cgroupv1
+    containers_conf="$(mktemp)"
+    tmpfiles+=("$containers_conf")
+    cat > "$containers_conf" <<EOF
+[engine]
+static_dir = "$HOME/.local/share/containers/storage/libpod"
+volume_path = "$HOME/.local/share/containers/storage/libpod"
+
+[containers]
+# netns = private, the default, doesn't work in nested containers,
+# and we don't mind using the host network anyway.
+netns = "host"
+
+EOF
+
+    storage_conf="$(mktemp)"
+    tmpfiles+=("$storage_conf")
+    cat > "$storage_conf" <<EOF
+
+[storage]
+driver = "overlay"
+runroot = "/run/containers/storage"
+graphroot = "$HOME/.local/share/containers/storage"
+
+EOF
+
     if grep -q 'cgroup2.*/sys/fs/cgroup ' /proc/mounts; then
         docker_common_args+=(
+            -v "$HOME/.local/share/containers:$HOME/.local/share/containers"
+            -v "$containers_conf:/etc/containers/containers.conf.d/nested.conf"
+            -v "$storage_conf:/etc/containers/storage.conf"
             --pids-limit -1
             --annotation run.oci.keep_original_groups=1
         )
@@ -175,6 +205,14 @@ else
     #
     # to /etc/containers/containers.conf
 fi
+
+# Forward authentication, to avoid docker hub unauthenticated rate limits.
+for auth_json in "${XDG_RUNTIME_DIR}/containers/auth.json" "${HOME}/.config/containers/auth.json"; do
+    if [[ -f "$auth_json" ]]; then
+        docker_common_args+=(-v "${auth_json}:${HOME}/.config/containers/auth.json")
+        break
+    fi
+done
 
 if [ "$PWD" != "$toplevel" ]; then
      docker_common_args+=(-v "$toplevel:$toplevel")
@@ -213,6 +251,8 @@ docker_common_args+=(
        -v /etc/localtime:/etc/localtime:ro \
        --env CARGO_HOME \
        -v "${CARGO_HOME}:${CARGO_HOME}" \
+       --env XDG_CACHE_HOME \
+       -v "${XDG_CACHE_HOME}/scylladb:${XDG_CACHE_HOME}/scylladb" \
        -w "$PWD" \
        -e HOME="$HOME" \
        "${docker_args[@]}" \
@@ -224,6 +264,7 @@ cleanup() {
     if [ -v TMP_PASSWD ]; then
         rm -f "$TMP_PASSWD"
     fi
+    rm -f "${tmpfiles[@]}"
 }
 
 if [[ -n "$interactive" || -n "$is_podman" ]]; then

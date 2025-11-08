@@ -12,7 +12,7 @@ from cassandra import ConsistencyLevel  # type: ignore
 from cassandra.query import SimpleStatement  # type: ignore
 from test.pylib.manager_client import ManagerClient
 from test.pylib.util import wait_for_cql_and_get_hosts
-from test.cluster.util import check_token_ring_and_group0_consistency, new_test_keyspace
+from test.cluster.util import new_test_keyspace, wait_for_token_ring_and_group0_consistency
 from test.pylib.util import wait_for
 
 logger = logging.getLogger(__name__)
@@ -22,12 +22,12 @@ logger = logging.getLogger(__name__)
     "use_tablets",
     [
         pytest.param(False, id="vnodes"),
-        pytest.param(True, id="tablets", marks=pytest.mark.xfail(reason="issue #20282")),
+        pytest.param(True, id="tablets", marks=[pytest.mark.skip(reason="issue #20282"), pytest.mark.nightly]),
     ],
 )
 @pytest.mark.asyncio
 async def test_change_replication_factor_1_to_0(request: pytest.FixtureRequest, manager: ManagerClient, use_tablets: bool) -> None:
-    CONFIG = {"endpoint_snitch": "GossipingPropertyFileSnitch", "enable_tablets": str(use_tablets)}
+    CONFIG = {"endpoint_snitch": "GossipingPropertyFileSnitch", "tablets_mode_for_new_keyspaces": "enabled" if use_tablets else "disabled"}
     logger.info("Creating a new cluster")
     for i in range(2):
         await manager.server_add(
@@ -79,7 +79,7 @@ async def test_change_replication_factor_1_to_0(request: pytest.FixtureRequest, 
 )
 @pytest.mark.asyncio
 async def test_change_replication_factor_1_to_0_and_decommission(request: pytest.FixtureRequest, manager: ManagerClient, use_tablets: bool) -> None:
-    CONFIG = {"endpoint_snitch": "GossipingPropertyFileSnitch", "enable_tablets": str(use_tablets)}
+    CONFIG = {"endpoint_snitch": "GossipingPropertyFileSnitch", "tablets_mode_for_new_keyspaces": "enabled" if use_tablets else "disabled"}
     logger.info("Creating a new cluster")
     for i in range(2):
         await manager.server_add(
@@ -106,7 +106,7 @@ async def test_change_replication_factor_1_to_0_and_decommission(request: pytest
 
         # decommission dc1
         await manager.decommission_node(srvs[1].server_id)
-        await check_token_ring_and_group0_consistency(manager)
+        await wait_for_token_ring_and_group0_consistency(manager, time.time() + 30)
 
         # ensure this no-op alter still works
         async with asyncio.timeout(30):

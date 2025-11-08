@@ -17,6 +17,7 @@
 #include <unordered_set>
 #include <exception>
 #include <filesystem>
+#include <concepts>
 
 #include <fmt/ranges.h>
 
@@ -519,7 +520,7 @@ private:
     future<> replenish_reserve();
     future<> _reserve_replenisher;
     future<> _background_sync;
-    seastar::gate _gate;
+    seastar::named_gate _gate;
     uint64_t _new_counter = 0;
     uint32_t _frag_id_counter = 0;
     std::optional<size_t> _disk_write_alignment;
@@ -632,9 +633,9 @@ static void write(fragmented_temporary_buffer::ostream& out, T value) {
     out.write(reinterpret_cast<const char*>(&v), sizeof(v));
 }
 
-template<typename T, typename Input>
-std::enable_if_t<std::is_fundamental<T>::value, T> read(Input& in) {
-    return net::ntoh(in.template read<T>());
+template<std::integral T, typename Input>
+T read(Input& in) {
+    return net::ntoh(in.template read<T>().value());
 }
 
 detail::sector_split_iterator::sector_split_iterator(const sector_split_iterator&) noexcept = default;
@@ -800,6 +801,8 @@ class db::commitlog::segment : public enable_shared_from_this<segment>, public c
     void end_flush() {
         _segment_manager->end_flush();
         if (can_delete()) {
+            // #25709 - do this early if possible
+            _extended_segments.clear();
             _segment_manager->discard_unused_segments();
         }
     }
@@ -875,6 +878,8 @@ public:
     void release_cf_count(const cf_id_type& cf) {
         mark_clean(cf, 1);
         if (can_delete()) {
+            // #25709 - do this early if possible
+            _extended_segments.clear();
             _segment_manager->discard_unused_segments();
         }
     }
@@ -1792,7 +1797,7 @@ future<> db::commitlog::segment_manager::oversized_allocation(entry_writer& writ
                 auto max_write = data_size - off;
                 auto to_write = std::min(avail, max_write);
                 auto rem = max_write - to_write;
-                partial_writer pw(writer, i, to_write, strm.read_view(to_write), rem, off, id);
+                partial_writer pw(writer, i, to_write, strm.read_view(to_write).value(), rem, off, id);
 
                 switch (s->allocate(pw, fake_permit, timeout)) {
                     case write_result::ok_need_batch_sync:
@@ -1915,6 +1920,7 @@ db::commitlog::segment_manager::segment_manager(config c)
     , _recycled_segments(std::numeric_limits<size_t>::max())
     , _reserve_replenisher(make_ready_future<>())
     , _background_sync(make_ready_future<>())
+    , _gate(format("commitlog::segment_manager::{}", cfg.commit_log_location))
 {
     SCYLLA_ASSERT(max_size > 0);
     SCYLLA_ASSERT(max_mutation_size < segment::multi_entry_size_magic);
@@ -2575,20 +2581,24 @@ struct fmt::formatter<db::commitlog::segment::cf_mark> {
 void db::commitlog::segment_manager::discard_unused_segments() noexcept {
     clogger.trace("Checking for unused segments ({} active)", _segments.size());
 
-    std::erase_if(_segments, [=](sseg_ptr s) {
-        if (s->can_delete()) {
-            clogger.debug("Segment {} is unused", *s);
-            return true;
-        }
-        if (s->is_still_allocating()) {
-            clogger.debug("Not safe to delete segment {}; still allocating.", *s);
-        } else if (!s->is_clean()) {
-            clogger.debug("Not safe to delete segment {}; dirty is {}", *s, segment::cf_mark {*s});
-        } else {
-            clogger.debug("Not safe to delete segment {}; disk ops pending", *s);
-        }
-        return false;
-    });
+    // #25709 ensure we don't free any segment until after prune.
+    {
+        auto tmp = _segments; 
+        std::erase_if(_segments, [=](sseg_ptr s) {
+            if (s->can_delete()) {
+                clogger.debug("Segment {} is unused", *s);
+                return true;
+            }
+            if (s->is_still_allocating()) {
+                clogger.debug("Not safe to delete segment {}; still allocating.", *s);
+            } else if (!s->is_clean()) {
+                clogger.debug("Not safe to delete segment {}; dirty is {}", *s, segment::cf_mark {*s});
+            } else {
+                clogger.debug("Not safe to delete segment {}; disk ops pending", *s);
+            }
+            return false;
+        });
+    }
 
     // launch in background, but guard with gate so this deletion is
     // sure to finish in shutdown, because at least through this path,
@@ -2877,7 +2887,10 @@ future<> db::commitlog::segment_manager::do_pending_deletes() {
 }
 
 future<> db::commitlog::segment_manager::orphan_all() {
-    _segments.clear();
+    // #25709. the actual process of destroying the elements here
+    // might cause a call into discard_unused_segments.
+    // ensure the target vector is empty when we get to destructors
+    auto tmp = std::exchange(_segments, {});
     return clear_reserve_segments();
 }
 
@@ -3086,16 +3099,16 @@ future<db::rp_handle> db::commitlog::add_entry(const cf_id_type& id, const commi
     return _segment_manager->allocate_when_possible(cl_entry_writer(cew), timeout);
 }
 
-future<std::vector<db::rp_handle>> 
-db::commitlog::add_entries(std::vector<commitlog_entry_writer> entry_writers, db::timeout_clock::time_point timeout) {
+future<utils::chunked_vector<db::rp_handle>>
+db::commitlog::add_entries(utils::chunked_vector<commitlog_entry_writer> entry_writers, db::timeout_clock::time_point timeout) {
     class cl_entries_writer final : public entry_writer {
-        std::vector<commitlog_entry_writer> _writers;
+        utils::chunked_vector<commitlog_entry_writer> _writers;
         std::unordered_set<table_schema_version> _known;
         const segment* _sizes_computed = nullptr;
     public:
-        std::vector<rp_handle> res;
+        utils::chunked_vector<rp_handle> res;
 
-        cl_entries_writer(force_sync sync, std::vector<commitlog_entry_writer> entry_writers)
+        cl_entries_writer(force_sync sync, utils::chunked_vector<commitlog_entry_writer> entry_writers)
             : entry_writer(sync, entry_writers.size()), _writers(std::move(entry_writers))
         {
             res.reserve(_writers.size());
@@ -3143,7 +3156,7 @@ db::commitlog::add_entries(std::vector<commitlog_entry_writer> entry_writers, db
             res.emplace_back(std::move(h));
         }
 
-        using result_type = std::vector<db::rp_handle>;
+        using result_type = utils::chunked_vector<db::rp_handle>;
 
         result_type result() {
             return std::move(res);
@@ -3254,9 +3267,13 @@ const db::commitlog::config& db::commitlog::active_config() const {
     return _segment_manager->cfg;
 }
 
+db::commitlog::segment_data_corruption_error::segment_data_corruption_error(std::string_view msg, uint64_t s)
+    : _msg(fmt::format("Segment data corruption: {}", msg))
+    , _bytes(s)
+{}
 
-db::commitlog::segment_truncation::segment_truncation(uint64_t pos) 
-    : _msg(fmt::format("Segment truncation at {}", pos))
+db::commitlog::segment_truncation::segment_truncation(std::string_view reason, uint64_t pos)
+    : _msg(fmt::format("Segment truncation at {}. Reason: {}", pos, reason))
     , _pos(pos)
 {}
 
@@ -3312,7 +3329,6 @@ db::commitlog::read_log_file(const replay_state& state, sstring filename, sstrin
         commit_load_reader_func func;
         input_stream<char> fin;
         replay_state::impl& state;
-        input_stream<char> r;
         uint64_t id = 0;
         size_t pos = 0;
         size_t next = 0;
@@ -3446,7 +3462,8 @@ db::commitlog::read_log_file(const replay_state& state, sstring filename, sstrin
 
             while (rem < size) {
                 if (eof) {
-                    throw segment_truncation(block_boundry);
+                    auto reason = fmt::format("unexpected EOF, rem={}, size={}", rem, size);
+                    throw segment_truncation(std::move(reason), block_boundry);
                 }
 
                 auto block_size = alignment - initial.size_bytes();
@@ -3457,7 +3474,9 @@ db::commitlog::read_log_file(const replay_state& state, sstring filename, sstrin
 
                 if (tmp.size_bytes() == 0) {
                     eof = true;
-                    throw segment_truncation(block_boundry);
+                    auto reason = fmt::format("read 0 bytes, while tried to read {} bytes. rem={}, size={}",
+                            block_size, rem, size);
+                    throw segment_truncation(std::move(reason), block_boundry);
                 }
 
                 crc32_nbo crc;
@@ -3492,10 +3511,14 @@ db::commitlog::read_log_file(const replay_state& state, sstring filename, sstrin
                     auto checksum = crc.checksum();
 
                     if (check != checksum) {
-                        throw segment_data_corruption_error("Data corruption", alignment);
+                        auto reason = fmt::format("checksums do not match: {:x} vs. {:x}. rem={}, size={}",
+                                check, checksum, rem, size);
+                        throw segment_data_corruption_error(std::move(reason), alignment);
                     }
                     if (id != this->id) {
-                        throw segment_truncation(pos + rem);
+                        auto reason = fmt::format("IDs do not match: {} vs. {}. rem={}, size={}",
+                                id, this->id, rem, size);
+                        throw segment_truncation(std::move(reason), pos + rem);
                     }
                 }
                 tmp.remove_suffix(detail::sector_overhead_size);
@@ -3770,7 +3793,8 @@ db::commitlog::read_log_file(const replay_state& state, sstring filename, sstrin
                     co_await read_chunk();
                 }
                 if (corrupt_size > 0) {
-                    throw segment_data_corruption_error("Data corruption", corrupt_size);
+                    auto reason = fmt::format("corrupted size while reading file: {}", corrupt_size);
+                    throw segment_data_corruption_error(std::move(reason), corrupt_size);
                 }
             } catch (...) {
                 p = std::current_exception();

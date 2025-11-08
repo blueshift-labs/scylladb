@@ -19,7 +19,7 @@
 #include "test/lib/test_services.hh"
 #include "test/lib/sstable_test_env.hh"
 #include "test/lib/reader_concurrency_semaphore.hh"
-#include "gc_clock.hh"
+#include "db_clock.hh"
 #include <seastar/core/coroutine.hh>
 
 using namespace sstables;
@@ -29,14 +29,15 @@ using validate = bool_class<struct validate_tag>;
 // Must be called in a seastar thread.
 sstables::shared_sstable make_sstable_containing(std::function<sstables::shared_sstable()> sst_factory, lw_shared_ptr<replica::memtable> mt);
 sstables::shared_sstable make_sstable_containing(sstables::shared_sstable sst, lw_shared_ptr<replica::memtable> mt);
-sstables::shared_sstable make_sstable_containing(std::function<sstables::shared_sstable()> sst_factory, std::vector<mutation> muts, validate do_validate = validate::yes);
-sstables::shared_sstable make_sstable_containing(sstables::shared_sstable sst, std::vector<mutation> muts, validate do_validate = validate::yes);
+sstables::shared_sstable make_sstable_containing(std::function<sstables::shared_sstable()> sst_factory, utils::chunked_vector<mutation> muts, validate do_validate = validate::yes);
+sstables::shared_sstable make_sstable_containing(sstables::shared_sstable sst, utils::chunked_vector<mutation> muts, validate do_validate = validate::yes);
 
 namespace sstables {
 
 using sstable_ptr = shared_sstable;
 
 class test {
+protected:
     sstable_ptr _sst;
 public:
 
@@ -68,7 +69,9 @@ public:
         try {
             while (!ir->eof()) {
                 co_await ir->read_partition_data();
-                auto pk = ir->get_partition_key();
+                // In general the index might not be able to return the key,
+                // but this helper is only used for tests of indexes which are able to do that.
+                auto pk = ir->get_partition_key().value();
                 entries.emplace_back(index_entry{sstables::key::from_partition_key(*s, pk),
                                         pk, ir->get_promoted_index_size()});
                 co_await ir->advance_to_next_partition();
@@ -91,6 +94,14 @@ public:
         return _sst->read_summary();
     }
 
+    future<> read_toc() {
+        return _sst->read_toc();
+    }
+
+    future<> read_filter() {
+        return _sst->read_filter();
+    }
+
     future<summary_entry&> read_summary_entry(size_t i) {
         return _sst->read_summary_entry(i);
     }
@@ -111,7 +122,7 @@ public:
         _sst->_run_identifier = identifier;
     }
 
-    future<> store(sstring dir, sstables::generation_type generation) {
+    future<sstable_ptr> store(sstring dir, sstables::generation_type generation) {
         _sst->_generation = generation;
         co_await _sst->_storage->change_dir_for_test(dir);
         _sst->_recognized_components.erase(component_type::Index);
@@ -124,6 +135,7 @@ public:
             sst->write_summary();
             sst->seal_sstable(false).get();
         });
+        co_return _sst;
     }
 
     // Used to create synthetic sstables for testing leveled compaction strategy.
@@ -144,9 +156,8 @@ public:
         // scylla component must be present for a sstable to be considered fully expired.
         _sst->_recognized_components.insert(component_type::Scylla);
         _sst->_components->statistics.contents[metadata_type::Stats] = std::make_unique<stats_metadata>(std::move(stats));
-        _sst->_components->summary.first_key.value = sstables::key::from_partition_key(*_sst->_schema, first_key).get_bytes();
-        _sst->_components->summary.last_key.value = sstables::key::from_partition_key(*_sst->_schema, last_key).get_bytes();
-        _sst->set_first_and_last_keys();
+        _sst->_first = dht::decorate_key(*_sst->_schema, first_key);
+        _sst->_last = dht::decorate_key(*_sst->_schema, last_key);
         _sst->_components->statistics.contents[metadata_type::Compaction] = std::make_unique<compaction_metadata>();
         _sst->_run_identifier = run_id::create_random_id();
         _sst->_shards.push_back(this_shard_id());
@@ -213,7 +224,7 @@ public:
 };
 
 inline auto replacer_fn_no_op() {
-    return [](sstables::compaction_completion_desc desc) -> void {};
+    return [](compaction::compaction_completion_desc desc) -> void {};
 }
 
 template<typename AsyncAction>
@@ -225,16 +236,16 @@ future<> for_each_sstable_version(AsyncAction action) {
 
 } // namespace sstables
 
-using can_purge_tombstones = compaction_manager::can_purge_tombstones;
-future<> run_compaction_task(test_env&, sstables::run_id output_run_id, table_state& table_s, noncopyable_function<future<> (sstables::compaction_data&)> job);
-future<compaction_result> compact_sstables(test_env& env, sstables::compaction_descriptor descriptor, table_for_tests t,
-                 std::function<shared_sstable()> creator, sstables::compaction_sstable_replacer_fn replacer = sstables::replacer_fn_no_op(),
+using can_purge_tombstones = compaction::compaction_manager::can_purge_tombstones;
+future<> run_compaction_task(test_env&, sstables::run_id output_run_id, compaction::compaction_group_view& table_s, noncopyable_function<future<> (compaction::compaction_data&)> job);
+future<compaction::compaction_result> compact_sstables(test_env& env, compaction::compaction_descriptor descriptor, table_for_tests t,
+                 std::function<shared_sstable()> creator, compaction::compaction_sstable_replacer_fn replacer = sstables::replacer_fn_no_op(),
                  can_purge_tombstones can_purge = can_purge_tombstones::yes);
 
 shared_sstable make_sstable_easy(test_env& env, mutation_reader rd, sstable_writer_config cfg,
-        sstables::generation_type gen, const sstable::version_types version = sstables::get_highest_sstable_version(), int expected_partition = 1, gc_clock::time_point = gc_clock::now());
+        sstables::generation_type gen, const sstable::version_types version = sstables::get_highest_sstable_version(), int expected_partition = 1, db_clock::time_point = db_clock::now());
 shared_sstable make_sstable_easy(test_env& env, lw_shared_ptr<replica::memtable> mt, sstable_writer_config cfg,
-        sstables::generation_type gen, const sstable::version_types v = sstables::get_highest_sstable_version(), int estimated_partitions = 1, gc_clock::time_point = gc_clock::now());
+        sstables::generation_type gen, const sstable::version_types v = sstables::get_highest_sstable_version(), int estimated_partitions = 1, db_clock::time_point = db_clock::now());
 
 
 inline shared_sstable make_sstable_easy(test_env& env, mutation_reader rd, sstable_writer_config cfg,
@@ -242,9 +253,9 @@ inline shared_sstable make_sstable_easy(test_env& env, mutation_reader rd, sstab
     return make_sstable_easy(env, std::move(rd), std::move(cfg), env.new_generation(), version, expected_partition);
 }
 inline shared_sstable make_sstable_easy(test_env& env, lw_shared_ptr<replica::memtable> mt, sstable_writer_config cfg,
-        const sstable::version_types version = sstables::get_highest_sstable_version(), int estimated_partitions = 1, gc_clock::time_point query_time = gc_clock::now()) {
+        const sstable::version_types version = sstables::get_highest_sstable_version(), int estimated_partitions = 1, db_clock::time_point query_time = db_clock::now()) {
     return make_sstable_easy(env, std::move(mt), std::move(cfg), env.new_generation(), version, estimated_partitions, query_time);
 }
 
-lw_shared_ptr<replica::memtable> make_memtable(schema_ptr s, const std::vector<mutation>& muts);
+lw_shared_ptr<replica::memtable> make_memtable(schema_ptr s, const utils::chunked_vector<mutation>& muts);
 std::vector<replica::memtable*> active_memtables(replica::table& t);

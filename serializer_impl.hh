@@ -384,7 +384,7 @@ struct serializer<std::map<K, V>> {
         while (sz--) {
             K k = deserialize(in, std::type_identity<K>());
             V v = deserialize(in, std::type_identity<V>());
-            m[k] = v;
+            m.emplace(k, v);
         }
         return m;
     }
@@ -767,6 +767,12 @@ utils::input_stream as_input_stream(const bytes_ostream& b) {
         return as_input_stream(b.view());
     }
     return utils::input_stream::fragmented(b.fragments().begin(), b.size());
+}
+
+template<FragmentedView View>
+inline
+auto as_input_stream(View v) {
+    return fragmented_memory_input_stream(fragment_range(v).begin(), v.size_bytes());
 }
 
 template<typename Output, typename ...T>

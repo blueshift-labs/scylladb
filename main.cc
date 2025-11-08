@@ -12,6 +12,7 @@
 
 #include <seastar/util/closeable.hh>
 #include <seastar/core/abort_source.hh>
+#include "db/view/view_building_worker.hh"
 #include "exceptions/exceptions.hh"
 #include "gms/inet_address.hh"
 #include "auth/allow_all_authenticator.hh"
@@ -21,6 +22,7 @@
 #include <seastar/core/signal.hh>
 #include <seastar/core/timer.hh>
 #include "service/qos/raft_service_level_distributed_data_accessor.hh"
+#include "db/view/view_building_state.hh"
 #include "tasks/task_manager.hh"
 #include "utils/assert.hh"
 #include "utils/build_id.hh"
@@ -29,7 +31,7 @@
 #include "replica/database.hh"
 #include <seastar/core/reactor.hh>
 #include <seastar/core/app-template.hh>
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include "transport/server.hh"
 #include <seastar/http/httpd.hh>
 #include "api/api_init.hh"
@@ -61,6 +63,7 @@
 #include "release.hh"
 #include "repair/repair.hh"
 #include "repair/row_level.hh"
+#include "vector_search/vector_store_client.hh"
 #include <cstdio>
 #include <seastar/core/file.hh>
 #include <unistd.h>
@@ -71,7 +74,6 @@
 #include "audit/audit.hh"
 #include <seastar/core/prometheus.hh>
 #include "message/messaging_service.hh"
-#include "db/sstables-format-selector.hh"
 #include "db/snapshot-ctl.hh"
 #include "cql3/query_processor.hh"
 #include <seastar/net/dns.hh>
@@ -92,7 +94,6 @@
 #include "service/endpoint_lifecycle_subscriber.hh"
 #include "db/schema_tables.hh"
 
-#include "redis/controller.hh"
 #include "cdc/log.hh"
 #include "cdc/generation_service.hh"
 #include "service/qos/standard_service_level_distributed_data_accessor.hh"
@@ -109,11 +110,13 @@
 #include "service/raft/raft_group_registry.hh"
 #include "service/raft/raft_group0_client.hh"
 #include "service/raft/raft_group0.hh"
+#include "service/paxos/paxos_state.hh"
 #include "gms/gossip_address_map.hh"
 #include "utils/alien_worker.hh"
-#include "utils/advanced_rpc_compressor.hh"
-#include "utils/shared_dict.hh"
+#include "message/advanced_rpc_compressor.hh"
+#include "message/shared_dict.hh"
 #include "message/dictionary_service.hh"
+#include "sstable_dict_autotrainer.hh"
 #include "utils/disk_space_monitor.hh"
 #include "utils/labels.hh"
 #include "tools/utils.hh"
@@ -135,6 +138,7 @@ using namespace std::chrono_literals;
 namespace bpo = boost::program_options;
 
 logging::logger diaglog("diagnostics");
+extern seastar::logger dsmlog;
 
 // Must live in a seastar::thread
 class stop_signal {
@@ -211,7 +215,6 @@ read_config(bpo::variables_map& opts, db::config& cfg) {
             }
             startlog.log(level, "{} : {}", msg, opt);
         });
-        co_await read_object_storage_config(cfg);
     } catch (...) {
         auto ep = std::current_exception();
         startlog.error("Could not read configuration file {}: {}", file, ep);
@@ -458,9 +461,13 @@ verify_adequate_memory_per_shard(bool developer_mode) {
 }
 
 class memory_threshold_guard {
-    seastar::memory::scoped_large_allocation_warning_threshold _slawt;
+    std::optional<seastar::memory::scoped_large_allocation_warning_threshold> _slawt;
 public:
-    explicit memory_threshold_guard(size_t threshold) : _slawt(threshold)  {}
+    explicit memory_threshold_guard(size_t threshold) {
+        if (threshold != 0) {
+            _slawt.emplace(threshold);
+        }
+    }
     future<> stop() { return make_ready_future<>(); }
 };
 
@@ -578,6 +585,17 @@ static locator::host_id initialize_local_info_thread(sharded<db::system_keyspace
     } else if (linfo.cluster_name != cfg.cluster_name()) {
         throw exceptions::configuration_exception("Saved cluster name " + linfo.cluster_name + " != configured name " + cfg.cluster_name());
     }
+    const auto location = snitch.local()->get_location();
+    if (linfo.dc.empty()) {
+        linfo.dc = location.dc;
+    } else if (linfo.dc != location.dc) {
+        throw std::runtime_error(format("Saved DC name \"{}\" is not equal to the DC name \"{}\" specified by the snitch", linfo.dc, location.dc));
+    }
+    if (linfo.rack.empty()) {
+        linfo.rack = location.rack;
+    } else if (linfo.rack != location.rack) {
+        throw std::runtime_error(format("Saved rack name \"{}\" is not equal to the rack name \"{}\" specified by the snitch", linfo.rack, location.rack));
+    }
     if (!linfo.host_id) {
         linfo.host_id = locator::host_id::create_random_id();
         startlog.info("Setting local host id to {}", linfo.host_id);
@@ -585,7 +603,7 @@ static locator::host_id initialize_local_info_thread(sharded<db::system_keyspace
 
     linfo.listen_address = listen_address;
     const auto host_id = linfo.host_id;
-    sys_ks.local().save_local_info(std::move(linfo), snitch.local()->get_location(), broadcast_address, broadcast_rpc_address).get();
+    sys_ks.local().save_local_info(std::move(linfo), broadcast_address, broadcast_rpc_address).get();
     return host_id;
 }
 
@@ -685,7 +703,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
 
     // If --version is requested, print it out and exit immediately to avoid
     // Seastar-specific warnings that may occur when running the app
-    if (!isatty(fileno(stdin))) {
+    if (!isatty(fileno(stdin)) || tcgetpgrp(fileno(stdin)) != getpgrp()) {
         auto parsed_opts = bpo::command_line_parser(ac, av).options(app.get_options_description()).allow_unregistered().run();
         print_starting_message(ac, av, parsed_opts);
     }
@@ -698,14 +716,14 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
     auto p11_modules_str = p11_modules.string<char>();
     ::p11_kit_override_system_files(NULL, NULL, p11_modules_str.c_str(), NULL, NULL);
 
-sharded<locator::shared_token_metadata> token_metadata;
+    sharded<locator::shared_token_metadata> token_metadata;
     sharded<locator::effective_replication_map_factory> erm_factory;
     sharded<service::migration_notifier> mm_notifier;
     sharded<service::endpoint_lifecycle_notifier> lifecycle_notifier;
     std::optional<utils::disk_space_monitor> disk_space_monitor_shard0;
-    sharded<compaction_manager> cm;
+    sharded<compaction::compaction_manager> cm;
     sharded<sstables::storage_manager> sstm;
-    distributed<replica::database> db;
+    sharded<replica::database> db;
     seastar::sharded<service::cache_hitrate_calculator> cf_cache_hitrate_calculator;
     service::load_meter load_meter;
     sharded<service::storage_proxy> proxy;
@@ -729,6 +747,7 @@ sharded<locator::shared_token_metadata> token_metadata;
     sharded<service::mapreduce_service> mapreduce_service;
     sharded<gms::gossiper> gossiper;
     sharded<locator::snitch_ptr> snitch;
+    sharded<vector_search::vector_store_client> vector_store_client;
 
     // This worker wasn't designed to be used from multiple threads.
     // If you are attempting to do that, make sure you know what you are doing.
@@ -738,7 +757,9 @@ sharded<locator::shared_token_metadata> token_metadata;
     // Note: we are creating this thread before app.run so that it doesn't
     // inherit Seastar's CPU affinity masks. We want this thread to be free
     // to migrate between CPUs; we think that's what makes the most sense.
-    auto rpc_dict_training_worker = utils::alien_worker(startlog, 19);
+    auto rpc_dict_training_worker = utils::alien_worker(startlog, 19, "rpc-dict");
+    // niceness=10 is ~10% of normal process time
+    auto hashing_worker = utils::alien_worker(startlog, 10, "pwd-hash");
 
     return app.run(ac, av, [&] () -> future<int> {
 
@@ -768,7 +789,8 @@ sharded<locator::shared_token_metadata> token_metadata;
         return seastar::async([&app, cfg, ext, &disk_space_monitor_shard0, &cm, &sstm, &db, &qp, &bm, &proxy, &mapreduce_service, &mm, &mm_notifier, &ctx, &opts, &dirs,
                 &prometheus_server, &cf_cache_hitrate_calculator, &load_meter, &feature_service, &gossiper, &snitch,
                 &token_metadata, &erm_factory, &snapshot_ctl, &messaging, &sst_dir_semaphore, &raft_gr, &service_memory_limiter,
-                &repair, &sst_loader, &ss, &lifecycle_notifier, &stream_manager, &task_manager, &rpc_dict_training_worker] {
+                &repair, &sst_loader, &ss, &lifecycle_notifier, &stream_manager, &task_manager, &rpc_dict_training_worker,
+                &hashing_worker, &vector_store_client] {
           try {
               if (opts.contains("relabel-config-file") && !opts["relabel-config-file"].as<sstring>().empty()) {
                   // calling update_relabel_config_from_file can cause an exception that would stop startup
@@ -859,7 +881,8 @@ sharded<locator::shared_token_metadata> token_metadata;
                 startlog.warn("Ignoring unused features found in config: {}", unused_features);
             }
 
-            gms::feature_config fcfg = gms::feature_config_from_db_config(*cfg);
+            gms::feature_config fcfg;
+            fcfg.disabled_features = get_disabled_features_from_db_config(*cfg);
 
             checkpoint(stop_signal, "starting feature service");
             debug::the_feature_service = &feature_service;
@@ -873,15 +896,9 @@ sharded<locator::shared_token_metadata> token_metadata;
             //});
 
             schema::set_default_partitioner(cfg->partitioner(), cfg->murmur3_partitioner_ignore_msb_bits());
-            auto make_sched_group = [&] (sstring name, sstring short_name, unsigned shares) {
-                if (cfg->cpu_scheduler()) {
-                    return seastar::create_scheduling_group(name, short_name, shares).get();
-                } else {
-                    return seastar::scheduling_group();
-                }
-            };
-            auto background_reclaim_scheduling_group = make_sched_group("background_reclaim", "bgre", 50);
-            auto maintenance_scheduling_group = make_sched_group("streaming", "strm", 200);
+
+            auto background_reclaim_scheduling_group = create_scheduling_group("background_reclaim", "bgre", 50).get();
+            auto maintenance_scheduling_group = create_scheduling_group("streaming", "strm", 200).get();
 
             smp::invoke_on_all([&cfg, background_reclaim_scheduling_group] {
                 logalloc::tracker::config st_cfg;
@@ -1117,15 +1134,15 @@ sharded<locator::shared_token_metadata> token_metadata;
 
             // Note: changed from using a move here, because we want the config object intact.
             replica::database_config dbcfg;
-            dbcfg.compaction_scheduling_group = make_sched_group("compaction", "comp", 1000);
-            dbcfg.memory_compaction_scheduling_group = make_sched_group("mem_compaction", "mcmp", 1000);
+            dbcfg.compaction_scheduling_group = create_scheduling_group("compaction", "comp", 1000).get();
+            dbcfg.memory_compaction_scheduling_group = create_scheduling_group("mem_compaction", "mcmp", 1000).get();
             dbcfg.streaming_scheduling_group = maintenance_scheduling_group;
-            dbcfg.statement_scheduling_group = make_sched_group("statement", "stmt", 1000);
-            dbcfg.memtable_scheduling_group = make_sched_group("memtable", "mt", 1000);
-            dbcfg.memtable_to_cache_scheduling_group = make_sched_group("memtable_to_cache", "mt2c", 200);
-            dbcfg.gossip_scheduling_group = make_sched_group("gossip", "gms", 1000);
-            dbcfg.commitlog_scheduling_group = make_sched_group("commitlog", "clog", 1000);
-            dbcfg.schema_commitlog_scheduling_group = make_sched_group("schema_commitlog", "sclg", 1000);
+            dbcfg.statement_scheduling_group = create_scheduling_group("statement", "stmt", 1000).get();
+            dbcfg.memtable_scheduling_group = create_scheduling_group("memtable", "mt", 1000).get();
+            dbcfg.memtable_to_cache_scheduling_group = create_scheduling_group("memtable_to_cache", "mt2c", 200).get();
+            dbcfg.gossip_scheduling_group = create_scheduling_group("gossip", "gms", 1000).get();
+            dbcfg.commitlog_scheduling_group = create_scheduling_group("commitlog", "clog", 1000).get();
+            dbcfg.schema_commitlog_scheduling_group = create_scheduling_group("schema_commitlog", "sclg", 1000).get();
             dbcfg.available_memory = memory::stats().total_memory();
 
             // Make sure to initialize the scheduling group keys at a point where we are sure
@@ -1161,14 +1178,23 @@ sharded<locator::shared_token_metadata> token_metadata;
             auto stop_dsm = defer_verbose_shutdown("disk space monitor", [&disk_space_monitor_shard0] {
                 disk_space_monitor_shard0->stop().get();
             });
+            auto out_of_space_subscription = disk_space_monitor_shard0->subscribe(cfg->critical_disk_utilization_level, [&threhsold = cfg->critical_disk_utilization_level, &dsm = *disk_space_monitor_shard0] (auto threshold_reached) {
+                static constexpr auto msg_template = "{} the critical disk utilization level ({:.1f}%). Current disk utilization {:.1f}%";
+                if (threshold_reached) {
+                    dsmlog.warn(msg_template, "Reached", threhsold() * 100, dsm.disk_utilization() * 100);
+                } else {
+                    dsmlog.info(msg_template, "Dropped below", threhsold() * 100, dsm.disk_utilization() * 100);
+                }
+                return make_ready_future<>();
+            });
 
             checkpoint(stop_signal, "starting compaction_manager");
             // get_cm_cfg is called on each shard when starting a sharded<compaction_manager>
             // we need the getter since updateable_value is not shard-safe (#7316)
             auto get_cm_cfg = sharded_parameter([&] {
-                return compaction_manager::config {
-                    .compaction_sched_group = compaction_manager::scheduling_group{dbcfg.compaction_scheduling_group},
-                    .maintenance_sched_group = compaction_manager::scheduling_group{dbcfg.streaming_scheduling_group},
+                return compaction::compaction_manager::config {
+                    .compaction_sched_group = compaction::compaction_manager::scheduling_group{dbcfg.compaction_scheduling_group},
+                    .maintenance_sched_group = compaction::compaction_manager::scheduling_group{dbcfg.streaming_scheduling_group},
                     .available_memory = dbcfg.available_memory,
                     .static_shares = cfg->compaction_static_shares,
                     .throughput_mb_per_sec = cfg->compaction_throughput_mb_per_sec,
@@ -1179,10 +1205,11 @@ sharded<locator::shared_token_metadata> token_metadata;
             auto stop_cm = defer_verbose_shutdown("compaction_manager", [&cm] {
                cm.stop().get();
             });
+            cm.invoke_on_all(&compaction::compaction_manager::start, std::ref(*cfg), only_on_shard0(&*disk_space_monitor_shard0)).get();
 
             checkpoint(stop_signal, "starting storage manager");
             sstables::storage_manager::config stm_cfg;
-            stm_cfg.s3_clients_memory = std::clamp<size_t>(memory::stats().total_memory() * 0.01, 10 << 20, 100 << 20);
+            stm_cfg.object_storage_clients_memory = std::clamp<size_t>(memory::stats().total_memory() * 0.01, 10 << 20, 100 << 20);
             sstm.start(std::ref(*cfg), stm_cfg).get();
             auto stop_sstm = defer_verbose_shutdown("sstables storage manager", [&sstm] {
                 sstm.stop().get();
@@ -1225,10 +1252,20 @@ sharded<locator::shared_token_metadata> token_metadata;
             auto stop_lang_man = defer_verbose_shutdown("lang manager", [] { langman.invoke_on_all(&lang::manager::stop).get(); });
             langman.invoke_on_all(&lang::manager::start).get();
 
+            sharded<default_sstable_compressor_factory> sstable_compressor_factory;
+            auto numa_groups = local_engine->smp().shard_to_numa_node_mapping();
+            sstable_compressor_factory.start(sharded_parameter(default_sstable_compressor_factory::config::from_db_config,
+                                                               std::cref(*cfg), std::cref(numa_groups))).get();
+            auto stop_compressor_factory = defer_verbose_shutdown("sstable_compressor_factory", [&sstable_compressor_factory] {
+                sstable_compressor_factory.stop().get();
+            });
+
             checkpoint(stop_signal, "starting database");
+
             debug::the_database = &db;
             db.start(std::ref(*cfg), dbcfg, std::ref(mm_notifier), std::ref(feature_service), std::ref(token_metadata),
-                    std::ref(cm), std::ref(sstm), std::ref(langman), std::ref(sst_dir_semaphore), std::ref(stop_signal.as_sharded_abort_source()), utils::cross_shard_barrier()).get();
+                    std::ref(cm), std::ref(sstm), std::ref(langman), std::ref(sst_dir_semaphore), std::ref(sstable_compressor_factory),
+                    std::ref(stop_signal.as_sharded_abort_source()), utils::cross_shard_barrier()).get();
             auto stop_database_and_sstables = defer_verbose_shutdown("database", [&db] {
                 // #293 - do not stop anything - not even db (for real)
                 //return db.stop();
@@ -1241,7 +1278,7 @@ sharded<locator::shared_token_metadata> token_metadata;
             // not include reserve segments created by active commitlogs.
             db.local().init_commitlog().get();
             checkpoint(stop_signal, "starting per-shard database core");
-            db.invoke_on_all(&replica::database::start, std::ref(sl_controller)).get();
+            db.invoke_on_all(&replica::database::start, std::ref(sl_controller), only_on_shard0(&*disk_space_monitor_shard0)).get();
 
             ::sigquit_handler sigquit_handler(db);
 
@@ -1297,6 +1334,13 @@ sharded<locator::shared_token_metadata> token_metadata;
             static sharded<cql3::cql_config> cql_config;
             cql_config.start(std::ref(*cfg)).get();
 
+            checkpoint(stop_signal, "starting a vector store service");
+            vector_store_client.start(std::ref(*cfg)).get();
+            auto stop_vector_store_client = defer_verbose_shutdown("vector store client", [&vector_store_client] {
+                vector_store_client.stop().get();
+            });
+            vector_store_client.invoke_on_all(&vector_search::vector_store_client::start_background_tasks).get();
+
             checkpoint(stop_signal, "starting query processor");
             cql3::query_processor::memory_config qp_mcfg = {memory::stats().total_memory() / 256, memory::stats().total_memory() / 2560};
             debug::the_query_processor = &qp;
@@ -1308,7 +1352,7 @@ sharded<locator::shared_token_metadata> token_metadata;
                                                      std::chrono::duration_cast<std::chrono::milliseconds>(cql3::prepared_statements_cache::entry_expiry));
             auth_prep_cache_config.refresh = std::chrono::milliseconds(cfg->permissions_update_interval_in_ms());
 
-            qp.start(std::ref(proxy), std::move(local_data_dict), std::ref(mm_notifier), qp_mcfg, std::ref(cql_config), std::move(auth_prep_cache_config), std::ref(langman)).get();
+            qp.start(std::ref(proxy), std::move(local_data_dict), std::ref(mm_notifier), std::ref(vector_store_client), qp_mcfg, std::ref(cql_config), std::move(auth_prep_cache_config), std::ref(langman)).get();
 
             checkpoint(stop_signal, "starting lifecycle notifier");
             lifecycle_notifier.start().get();
@@ -1327,6 +1371,7 @@ sharded<locator::shared_token_metadata> token_metadata;
             }).get();
 
             stop_signal.check();
+            ctx.http_server.server().invoke_on_all([] (auto& server) { server.set_content_streaming(true); }).get();
             with_scheduling_group(maintenance_scheduling_group, [&] {
                 return ctx.http_server.listen(socket_address{api_addr, cfg->api_port()});
             }).get();
@@ -1341,14 +1386,8 @@ sharded<locator::shared_token_metadata> token_metadata;
             static sharded<db::system_keyspace> sys_ks;
             static sharded<db::view::view_update_generator> view_update_generator;
             static sharded<db::view::view_builder> view_builder;
+            static sharded<db::view::view_building_worker> view_building_worker;
             static sharded<cdc::generation_service> cdc_generation_service;
-
-            db::sstables_format_selector sst_format_selector(db);
-
-            api::set_format_selector(ctx, sst_format_selector).get();
-            auto stop_format_seletor_api = defer_verbose_shutdown("sstables format selector API", [&ctx] {
-                api::unset_format_selector(ctx).get();
-            });
 
             checkpoint(stop_signal, "starting system keyspace");
             sys_ks.start(std::ref(qp), std::ref(db)).get();
@@ -1379,10 +1418,7 @@ sharded<locator::shared_token_metadata> token_metadata;
             //   * features_service: we need to re-enable previously enabled features,
             //     this should be done before commitlog starts replaying
             //     since some features affect storage.
-            //   * sstables_format_selector: we need to choose the appropriate format,
-            //     since schema commitlog replay can write to sstables.
-            when_all_succeed(feature_service.local().on_system_tables_loaded(sys_ks.local()),
-                sst_format_selector.on_system_tables_loaded(sys_ks.local())).get();
+            when_all_succeed(feature_service.local().on_system_tables_loaded(sys_ks.local())).get();
 
             db.local().init_schema_commitlog();
 
@@ -1432,9 +1468,9 @@ sharded<locator::shared_token_metadata> token_metadata;
           }).get();
 
             checkpoint(stop_signal, "starting compressor_tracker");
-            utils::dict_sampler dict_sampler;
+            netw::dict_sampler dict_sampler;
             auto arct_cfg = [&] {
-                return utils::advanced_rpc_compressor::tracker::config{
+                return netw::advanced_rpc_compressor::tracker::config{
                     .zstd_min_msg_size = cfg->internode_compression_zstd_min_message_size,
                     .zstd_max_msg_size = cfg->internode_compression_zstd_max_message_size,
                     .zstd_quota_fraction = cfg->internode_compression_zstd_max_cpu_fraction,
@@ -1446,7 +1482,7 @@ sharded<locator::shared_token_metadata> token_metadata;
                     .checksumming = cfg->internode_compression_checksumming,
                 };
             };
-            static sharded<utils::walltime_compressor_tracker> compressor_tracker;
+            static sharded<netw::walltime_compressor_tracker> compressor_tracker;
             compressor_tracker.start(arct_cfg).get();
             auto stop_compressor_tracker = defer_verbose_shutdown("compressor_tracker", [] { compressor_tracker.stop().get(); });
             compressor_tracker.local().attach_to_dict_sampler(&dict_sampler);
@@ -1632,23 +1668,41 @@ sharded<locator::shared_token_metadata> token_metadata;
                     stop_signal.as_local_abort_source(), raft_gr.local(), messaging,
                     gossiper.local(), feature_service.local(), sys_ks.local(), group0_client, dbcfg.gossip_scheduling_group};
 
-            checkpoint(stop_signal, "starting talet allocator");
+            checkpoint(stop_signal, "starting tablet allocator");
             service::tablet_allocator::config tacfg;
-            distributed<service::tablet_allocator> tablet_allocator;
+            sharded<service::tablet_allocator> tablet_allocator;
             tablet_allocator.start(tacfg, std::ref(mm_notifier), std::ref(db)).get();
             auto stop_tablet_allocator = defer_verbose_shutdown("tablet allocator", [&tablet_allocator] {
                 tablet_allocator.stop().get();
             });
 
             checkpoint(stop_signal, "starting mapreduce service");
-            mapreduce_service.start(std::ref(messaging), std::ref(proxy), std::ref(db), std::ref(token_metadata), std::ref(stop_signal.as_sharded_abort_source())).get();
+            mapreduce_service.start(std::ref(messaging), std::ref(proxy), std::ref(db), std::ref(stop_signal.as_sharded_abort_source())).get();
             auto stop_mapreduce_service_handlers = defer_verbose_shutdown("mapreduce service", [&mapreduce_service] {
                 mapreduce_service.stop().get();
             });
 
+            class sstable_dict_deleter : public service::migration_listener::empty_listener {
+                service::migration_notifier& _mn;
+                gms::feature_service& _feat;
+            public:
+                sstable_dict_deleter(service::migration_notifier& mn, gms::feature_service& feat) : _mn(mn) , _feat(feat) {
+                    _mn.register_listener(this);
+                }
+                ~sstable_dict_deleter() {
+                    _mn.unregister_listener(this).get();
+                }
+                void on_before_drop_column_family(const schema& s, utils::chunked_vector<mutation>& mutations, api::timestamp_type) override {
+                    if (_feat.sstable_compression_dicts) {
+                        mutations.push_back(db::system_keyspace::get_delete_dict_mutation(fmt::format("sstables/{}", s.id()), api::max_timestamp));
+                    }
+                }
+            };
+            auto the_sstable_dict_deleter = sstable_dict_deleter(mm_notifier.local(), feature_service.local());
+
             checkpoint(stop_signal, "starting migration manager");
             debug::the_migration_manager = &mm;
-            mm.start(std::ref(mm_notifier), std::ref(feature_service), std::ref(messaging), std::ref(proxy), std::ref(gossiper), std::ref(group0_client), std::ref(sys_ks)).get();
+            mm.start(std::ref(mm_notifier), std::ref(feature_service), std::ref(messaging), std::ref(proxy), std::ref(ss), std::ref(gossiper), std::ref(group0_client), std::ref(sys_ks)).get();
             auto stop_migration_manager = defer_verbose_shutdown("migration manager", [&mm] {
                 mm.stop().get();
             });
@@ -1675,10 +1729,22 @@ sharded<locator::shared_token_metadata> token_metadata;
             auto tablets_per_shard_goal_observer = cfg->tablets_per_shard_goal.observe(notify_topology);
             auto tablets_initial_scale_factor_observer = cfg->tablets_initial_scale_factor.observe(notify_topology);
 
-            auto compression_dict_updated_callback = [] () -> future<> {
-                auto dict = co_await sys_ks.local().query_dict();
-                co_await utils::announce_dict_to_shards(compressor_tracker, std::move(dict));
+            auto compression_dict_updated_callback = [&sstable_compressor_factory] (std::string_view name) -> future<> {
+                auto dict = co_await sys_ks.local().query_dict(name);
+                auto sstables_prefix = std::string_view("sstables/");
+                if (name.starts_with(sstables_prefix)) {
+                    auto table = table_id(utils::UUID(name.substr(sstables_prefix.size())));
+                    co_await sstable_compressor_factory.local().set_recommended_dict(table, std::move(dict.data));
+                } else if (name == dictionary_service::rpc_compression_dict_name) {
+                    co_await netw::announce_dict_to_shards(compressor_tracker, std::move(dict));
+                }
             };
+
+            sharded<db::view::view_building_state_machine> vbsm;
+            vbsm.start().get();
+            auto stop_vbsm = defer_verbose_shutdown("view_building_state_machine", [&vbsm] {
+                vbsm.stop().get();
+            });
 
             checkpoint(stop_signal, "starting system distributed keyspace");
             sys_dist_ks.start(std::ref(qp), std::ref(mm), std::ref(proxy)).get();
@@ -1698,19 +1764,43 @@ sharded<locator::shared_token_metadata> token_metadata;
                 view_builder.stop().get();
             });
 
+            checkpoint(stop_signal, "starting the view building worker");
+            view_building_worker.start(std::ref(db), std::ref(sys_ks), std::ref(mm_notifier), std::ref(group0_client), std::ref(view_update_generator), std::ref(messaging), std::ref(vbsm)).get();
+            auto stop_view_building_worker = defer_verbose_shutdown("view building worker", [] {
+                view_building_worker.stop().get();
+            });
+
             checkpoint(stop_signal, "starting repair service");
             auto max_memory_repair = memory::stats().total_memory() * 0.1;
-            repair.start(std::ref(tsm), std::ref(gossiper), std::ref(messaging), std::ref(db), std::ref(proxy), std::ref(bm), std::ref(sys_ks), std::ref(view_builder), std::ref(task_manager), std::ref(mm), max_memory_repair).get();
+            repair.start(std::ref(tsm), std::ref(gossiper), std::ref(messaging), std::ref(db), std::ref(proxy), std::ref(bm), std::ref(sys_ks), std::ref(view_builder), std::ref(view_building_worker), std::ref(task_manager), std::ref(mm), max_memory_repair).get();
             auto stop_repair_service = defer_verbose_shutdown("repair service", [&repair] {
                 repair.stop().get();
             });
-            repair.invoke_on_all(&repair_service::start).get();
+            repair.invoke_on_all(&repair_service::start, only_on_shard0(&*disk_space_monitor_shard0)).get();
             api::set_server_repair(ctx, repair, gossip_address_map).get();
             auto stop_repair_api = defer_verbose_shutdown("repair API", [&ctx] {
                 api::unset_server_repair(ctx).get();
             });
 
             utils::get_local_injector().inject("stop_after_starting_repair", [] { std::raise(SIGSTOP); });
+
+            debug::the_stream_manager = &stream_manager;
+            checkpoint(stop_signal, "starting streaming service");
+            stream_manager.start(std::ref(*cfg), std::ref(db), std::ref(view_builder), std::ref(view_building_worker), std::ref(messaging), std::ref(mm), std::ref(gossiper), maintenance_scheduling_group).get();
+            auto stop_stream_manager = defer_verbose_shutdown("stream manager", [&stream_manager] {
+                // FIXME -- keep the instances alive, just call .stop on them
+                stream_manager.invoke_on_all(&streaming::stream_manager::stop).get();
+            });
+
+            checkpoint(stop_signal, "starting streaming manager");
+            stream_manager.invoke_on_all([&stop_signal] (streaming::stream_manager& sm) {
+                return sm.start(stop_signal.as_local_abort_source());
+            }).get();
+
+            api::set_server_stream_manager(ctx, stream_manager).get();
+            auto stop_stream_manager_api = defer_verbose_shutdown("stream manager api", [&ctx] {
+                api::unset_server_stream_manager(ctx).get();
+            });
 
             checkpoint(stop_signal, "initializing storage service");
             debug::the_storage_service = &ss;
@@ -1719,11 +1809,17 @@ sharded<locator::shared_token_metadata> token_metadata;
                 std::ref(feature_service), std::ref(mm), std::ref(token_metadata), std::ref(erm_factory),
                 std::ref(messaging), std::ref(repair),
                 std::ref(stream_manager), std::ref(lifecycle_notifier), std::ref(bm), std::ref(snitch),
-                std::ref(tablet_allocator), std::ref(cdc_generation_service), std::ref(view_builder), std::ref(qp), std::ref(sl_controller),
-                std::ref(tsm), std::ref(task_manager), std::ref(gossip_address_map),
+                std::ref(tablet_allocator), std::ref(cdc_generation_service), std::ref(view_builder), std::ref(view_building_worker), std::ref(qp), std::ref(sl_controller),
+                std::ref(tsm), std::ref(vbsm), std::ref(task_manager), std::ref(gossip_address_map),
                 compression_dict_updated_callback,
                 only_on_shard0(&*disk_space_monitor_shard0)
             ).get();
+
+            ss.local().set_train_dict_callback([&rpc_dict_training_worker] (std::vector<std::vector<std::byte>> sample) {
+                return rpc_dict_training_worker.submit<std::vector<std::byte>>([sample = std::move(sample)] {
+                    return netw::zdict_train(sample, {});
+                });
+            });
 
             auto stop_storage_service = defer_verbose_shutdown("storage_service", [&] {
                 ss.stop().get();
@@ -1744,19 +1840,12 @@ sharded<locator::shared_token_metadata> token_metadata;
 
             checkpoint(stop_signal, "initializing virtual tables");
             smp::invoke_on_all([&] {
-                return db::initialize_virtual_tables(db, ss, gossiper, raft_gr, sys_ks, *cfg);
+                return db::initialize_virtual_tables(db, ss, gossiper, raft_gr, sys_ks, tablet_allocator, messaging, *cfg);
             }).get();
 
             // #293 - do not stop anything
             // engine().at_exit([&qp] { return qp.stop(); });
             sstables::init_metrics().get();
-
-            db::sstables_format_listener sst_format_listener(gossiper.local(), feature_service, sst_format_selector);
-
-            sst_format_listener.start().get();
-            auto stop_format_listener = defer_verbose_shutdown("sstables format listener", [&sst_format_listener] {
-                sst_format_listener.stop().get();
-            });
 
             checkpoint(stop_signal, "starting Raft Group Registry service");
             raft_gr.invoke_on_all(&service::raft_group_registry::start).get();
@@ -1780,19 +1869,19 @@ sharded<locator::shared_token_metadata> token_metadata;
                 api::unset_server_compaction_manager(ctx).get();
             });
 
-            cm.invoke_on_all([&](compaction_manager& cm) {
+            cm.invoke_on_all([&](compaction::compaction_manager& cm) {
                 auto cl = db.local().commitlog();
                 auto scl = db.local().schema_commitlog();
                 if (cl && scl) {
-                    cm.get_tombstone_gc_state().set_gc_time_min_source([cl, scl](const table_id& id) {
+                    cm.get_shared_tombstone_gc_state().set_gc_time_min_source([cl, scl](const table_id& id) {
                         return std::min(cl->min_gc_time(id), scl->min_gc_time(id));
                     });
                 } else if (cl) {
-                    cm.get_tombstone_gc_state().set_gc_time_min_source([cl](const table_id& id) {
+                    cm.get_shared_tombstone_gc_state().set_gc_time_min_source([cl](const table_id& id) {
                         return cl->min_gc_time(id);
                     });
                 } else if (scl) {
-                    cm.get_tombstone_gc_state().set_gc_time_min_source([scl](const table_id& id) {
+                    cm.get_shared_tombstone_gc_state().set_gc_time_min_source([scl](const table_id& id) {
                         return scl->min_gc_time(id);
                     });
                 }
@@ -1800,7 +1889,7 @@ sharded<locator::shared_token_metadata> token_metadata;
 
             checkpoint(stop_signal, "loading tablet metadata");
             try {
-                ss.local().load_tablet_metadata({}).get();
+                ss.local().update_tablet_metadata({}).get();
             } catch (...) {
                 if (!cfg->maintenance_mode()) {
                     throw;
@@ -1817,6 +1906,10 @@ sharded<locator::shared_token_metadata> token_metadata;
 
             checkpoint(stop_signal, "loading non-system sstables");
             replica::distributed_loader::init_non_system_keyspaces(db, proxy, sys_ks).get();
+
+            // Depends on all keyspaces being initialized because after this call
+            // we can be reloading schema.
+            mm.local().register_feature_listeners();
 
             checkpoint(stop_signal, "starting commit log");
             auto cl = db.local().commitlog();
@@ -1860,34 +1953,24 @@ sharded<locator::shared_token_metadata> token_metadata;
             }).get();
 
             checkpoint(stop_signal, "starting column family API");
-            api::set_server_column_family(ctx, sys_ks).get();
+            api::set_server_column_family(ctx, db).get();
             auto stop_cf_api = defer_verbose_shutdown("column family API", [&ctx] {
                 api::unset_server_column_family(ctx).get();
             });
             static seastar::sharded<memory_threshold_guard> mtg;
             mtg.start(cfg->large_memory_allocation_warning_threshold()).get();
+
+            checkpoint(stop_signal, "initializing paxos store");
+            static seastar::sharded<service::paxos::paxos_store> paxos_store;
+            paxos_store.start(std::ref(sys_ks), std::ref(feature_service), std::ref(db), std::ref(mm)).get();
+            auto stop_paxos_store = defer_verbose_shutdown("paxos store", [] {
+                paxos_store.stop().get();
+            });
+
             checkpoint(stop_signal, "initializing storage proxy RPC verbs");
-            proxy.invoke_on_all(&service::storage_proxy::start_remote, std::ref(messaging), std::ref(gossiper), std::ref(mm), std::ref(sys_ks), std::ref(group0_client), std::ref(tsm)).get();
+            proxy.invoke_on_all(&service::storage_proxy::start_remote, std::ref(messaging), std::ref(gossiper), std::ref(mm), std::ref(sys_ks), std::ref(paxos_store), std::ref(group0_client), std::ref(tsm), std::ref(vbsm)).get();
             auto stop_proxy_handlers = defer_verbose_shutdown("storage proxy RPC verbs", [&proxy] {
                 proxy.invoke_on_all(&service::storage_proxy::stop_remote).get();
-            });
-
-            debug::the_stream_manager = &stream_manager;
-            checkpoint(stop_signal, "starting streaming service");
-            stream_manager.start(std::ref(*cfg), std::ref(db), std::ref(view_builder), std::ref(messaging), std::ref(mm), std::ref(gossiper), maintenance_scheduling_group).get();
-            auto stop_stream_manager = defer_verbose_shutdown("stream manager", [&stream_manager] {
-                // FIXME -- keep the instances alive, just call .stop on them
-                stream_manager.invoke_on_all(&streaming::stream_manager::stop).get();
-            });
-
-            checkpoint(stop_signal, "starting streaming manager");
-            stream_manager.invoke_on_all([&stop_signal] (streaming::stream_manager& sm) {
-                return sm.start(stop_signal.as_local_abort_source());
-            }).get();
-
-            api::set_server_stream_manager(ctx, stream_manager).get();
-            auto stop_stream_manager_api = defer_verbose_shutdown("stream manager api", [&ctx] {
-                api::unset_server_stream_manager(ctx).get();
             });
 
             checkpoint(stop_signal, "starting hinted handoff manager");
@@ -1976,22 +2059,23 @@ sharded<locator::shared_token_metadata> token_metadata;
                 });
             };
 
-            checkpoint(stop_signal, "starting maintenance auth service");
-            auth::service_config maintenance_auth_config;
-            maintenance_auth_config.authorizer_java_name = sstring{auth::allow_all_authorizer_name};
-            maintenance_auth_config.authenticator_java_name = sstring{auth::allow_all_authenticator_name};
-            maintenance_auth_config.role_manager_java_name = sstring{auth::maintenance_socket_role_manager_name};
-
-            maintenance_auth_service.start(perm_cache_config, std::ref(qp), std::ref(group0_client),  std::ref(mm_notifier), std::ref(mm), maintenance_auth_config, maintenance_socket_enabled::yes).get();
-
-            cql_transport::controller cql_maintenance_server_ctl(maintenance_auth_service, mm_notifier, gossiper, qp, service_memory_limiter, sl_controller, lifecycle_notifier, *cfg, maintenance_cql_sg_stats_key, maintenance_socket_enabled::yes, dbcfg.statement_scheduling_group);
-
+            std::optional<cql_transport::controller> cql_maintenance_server_ctl;
             std::any stop_maintenance_auth_service;
             std::any stop_maintenance_cql;
 
             if (cfg->maintenance_socket() != "ignore") {
+                checkpoint(stop_signal, "starting maintenance auth service");
+                auth::service_config maintenance_auth_config;
+                maintenance_auth_config.authorizer_java_name = sstring{auth::allow_all_authorizer_name};
+                maintenance_auth_config.authenticator_java_name = sstring{auth::allow_all_authenticator_name};
+                maintenance_auth_config.role_manager_java_name = sstring{auth::maintenance_socket_role_manager_name};
+
+                maintenance_auth_service.start(perm_cache_config, std::ref(qp), std::ref(group0_client),  std::ref(mm_notifier), std::ref(mm), maintenance_auth_config, maintenance_socket_enabled::yes, std::ref(hashing_worker)).get();
+
+                cql_maintenance_server_ctl.emplace(maintenance_auth_service, mm_notifier, gossiper, qp, service_memory_limiter, sl_controller, lifecycle_notifier, *cfg, maintenance_cql_sg_stats_key, maintenance_socket_enabled::yes, dbcfg.statement_scheduling_group);
+
                 start_auth_service(maintenance_auth_service, stop_maintenance_auth_service, "maintenance auth service");
-                start_cql(cql_maintenance_server_ctl, stop_maintenance_cql, "maintenance native server");
+                start_cql(*cql_maintenance_server_ctl, stop_maintenance_cql, "maintenance native server");
             }
 
             checkpoint(stop_signal, "starting REST API");
@@ -2011,11 +2095,6 @@ sharded<locator::shared_token_metadata> token_metadata;
             api::set_server_tasks_compaction_module(ctx, ss, snapshot_ctl).get();
             auto stop_tasks_api = defer_verbose_shutdown("tasks API", [&ctx] {
                 api::unset_server_tasks_compaction_module(ctx).get();
-            });
-
-            api::set_server_cache(ctx).get();
-            auto stop_cache_api = defer_verbose_shutdown("cache API", [&ctx] {
-                api::unset_server_cache(ctx).get();
             });
 
             api::set_server_commitlog(ctx, db).get();
@@ -2054,7 +2133,7 @@ sharded<locator::shared_token_metadata> token_metadata;
             });
 
             checkpoint(stop_signal, "starting sstables loader");
-            sst_loader.start(std::ref(db), std::ref(messaging), std::ref(view_builder), std::ref(task_manager), std::ref(sstm), maintenance_scheduling_group).get();
+            sst_loader.start(std::ref(db), std::ref(ss), std::ref(messaging), std::ref(view_builder), std::ref(view_building_worker), std::ref(task_manager), std::ref(sstm), maintenance_scheduling_group).get();
             auto stop_sst_loader = defer_verbose_shutdown("sstables loader", [&sst_loader] {
                 sst_loader.stop().get();
             });
@@ -2076,7 +2155,8 @@ sharded<locator::shared_token_metadata> token_metadata;
             group0_service.start().get();
             auto stop_group0_service = defer_verbose_shutdown("group 0 service", [&group0_service] {
                 sl_controller.local().abort_group0_operations();
-                group0_service.abort().get();
+                group0_service.abort_and_drain().get();
+                group0_service.destroy();
             });
 
             utils::get_local_injector().inject("stop_after_starting_group0_service",
@@ -2130,10 +2210,61 @@ sharded<locator::shared_token_metadata> token_metadata;
 
             // At this point, `locator::topology` should be stable, i.e. we should have complete information
             // about the layout of the cluster (= list of nodes along with the racks/DCs).
-            if (cfg->rf_rack_valid_keyspaces()) {
-                startlog.info("Verifying that all of the keyspaces are RF-rack-valid");
-                db.local().check_rf_rack_validity(token_metadata.local().get());
-                startlog.info("All keyspaces are RF-rack-valid");
+            startlog.info("Verifying that all of the keyspaces are RF-rack-valid");
+            db.local().check_rf_rack_validity(cfg->rf_rack_valid_keyspaces(), token_metadata.local().get());
+
+            // Materialized views and secondary indexes are still restricted and require specific configuration
+            // options to work. Make sure that if there are existing views or indexes, they don't violate
+            // the requirements imposed on them.
+            db.local().validate_tablet_views_indexes();
+
+            // Semantic validation of sstable compression parameters from config.
+            // Adding here (i.e., after `join_cluster`) to ensure that the
+            // required SSTABLE_COMPRESSION_DICTS cluster feature has been negotiated.
+            //
+            // Also, if the dictionary compression feature is not enabled, use
+            // LZ4Compressor as the default algorithm instead of LZ4WithDictsCompressor.
+            const auto& dicts_feature_enabled = feature_service.local().sstable_compression_dicts;
+            auto& sstable_compression_options = cfg->sstable_compression_user_table_options;
+
+            gms::feature::listener_registration reg_listener;
+
+            if (!sstable_compression_options.is_set() && !dicts_feature_enabled) {
+                if (sstable_compression_options().get_algorithm() != compression_parameters::algorithm::lz4_with_dicts) {
+                    on_internal_error(startlog, "expected LZ4WithDictsCompressor as default algorithm for sstable_compression_user_table_options.");
+                }
+
+                startlog.info("SSTABLE_COMPRESSION_DICTS feature is disabled. Overriding default SSTable compression to use LZ4Compressor instead of LZ4WithDictsCompressor.");
+                compression_parameters original_params{sstable_compression_options().get_options()};
+                auto params = sstable_compression_options().get_options();
+                params[compression_parameters::SSTABLE_COMPRESSION] = sstring(compression_parameters::algorithm_to_name(compression_parameters::algorithm::lz4));
+                smp::invoke_on_all([&sstable_compression_options, params = std::move(params)] {
+                    if (!sstable_compression_options.is_set()) { // guard check; in case we ever make the option live updateable
+                        sstable_compression_options(compression_parameters{params}, utils::config_file::config_source::None);
+                    }
+                }).get();
+
+                // Register a callback to update the default compression algorithm when the feature is enabled.
+                // Precondition:
+                //   The callback must run inside seastar::async context:
+                //   - If the listener fires immediately, we are running inside seastar::async already.
+                //   - If the listener is deferred, `feature_service::enable()` runs it inside seastar::async.
+                reg_listener = feature_service.local().sstable_compression_dicts.when_enabled([&sstable_compression_options, params = std::move(original_params)] {
+                    startlog.info("SSTABLE_COMPRESSION_DICTS feature is now enabled. Overriding default SSTable compression to use LZ4WithDictsCompressor.");
+                    smp::invoke_on_all([&sstable_compression_options, params = std::move(params)] {
+                        if (!sstable_compression_options.is_set()) { // guard check; in case we ever make the option live updateable
+                            sstable_compression_options(params, utils::config_file::config_source::None);
+                        }
+                    }).get();
+                });
+            }
+
+            try {
+                cfg->sstable_compression_user_table_options().validate(
+                        compression_parameters::dicts_feature_enabled(bool(dicts_feature_enabled)));
+            } catch (const std::exception& e) {
+                startlog.error("Invalid sstable_compression_user_table_options: {}", e.what());
+                throw bad_configuration_error();
             }
 
             dictionary_service dict_service(
@@ -2153,6 +2284,16 @@ sharded<locator::shared_token_metadata> token_metadata;
             );
             auto stop_dict_service = defer_verbose_shutdown("dictionary training", [&] {
                 dict_service.stop().get();
+            });
+
+            auto sst_dict_autotrainer = sstable_dict_autotrainer(ss.local(), group0_client, sstable_dict_autotrainer::config{
+                .tick_period_in_seconds = cfg->sstable_compression_dictionaries_autotrainer_tick_period_in_seconds,
+                .retrain_period_in_seconds = cfg->sstable_compression_dictionaries_retrain_period_in_seconds,
+                .min_dataset_bytes = cfg->sstable_compression_dictionaries_min_training_dataset_bytes,
+                .min_improvement_factor = cfg->sstable_compression_dictionaries_min_training_improvement_factor,
+            });
+            auto stop_sst_dict_autotrainer = defer_verbose_shutdown("sstable_dict_autotrainer", [&] {
+                sst_dict_autotrainer.stop().get();
             });
 
             checkpoint(stop_signal, "starting tracing");
@@ -2187,13 +2328,20 @@ sharded<locator::shared_token_metadata> token_metadata;
             const qualified_name qualified_authenticator_name(auth::meta::AUTH_PACKAGE_NAME, cfg->authenticator());
             const qualified_name qualified_role_manager_name(auth::meta::AUTH_PACKAGE_NAME, cfg->role_manager());
 
+            // Reproducer of scylladb/scylladb#24792.
+            auto i24792_reproducer = defer([] {
+                if (utils::get_local_injector().enter("reload_service_level_cache_after_auth_service_is_stopped")) {
+                    sl_controller.local().update_cache(qos::update_both_cache_levels::yes).get();
+                }
+            });
+
             checkpoint(stop_signal, "starting auth service");
             auth::service_config auth_config;
             auth_config.authorizer_java_name = qualified_authorizer_name;
             auth_config.authenticator_java_name = qualified_authenticator_name;
             auth_config.role_manager_java_name = qualified_role_manager_name;
 
-            auth_service.start(std::move(perm_cache_config), std::ref(qp), std::ref(group0_client), std::ref(mm_notifier), std::ref(mm), auth_config, maintenance_socket_enabled::no).get();
+            auth_service.start(std::move(perm_cache_config), std::ref(qp), std::ref(group0_client), std::ref(mm_notifier), std::ref(mm), auth_config, maintenance_socket_enabled::no, std::ref(hashing_worker)).get();
 
             std::any stop_auth_service;
             // Has to be called after node joined the cluster (join_cluster())
@@ -2208,6 +2356,17 @@ sharded<locator::shared_token_metadata> token_metadata;
             api::set_server_authorization_cache(ctx, auth_service).get();
             auto stop_authorization_cache_api = defer_verbose_shutdown("authorization cache api", [&ctx] {
                 api::unset_server_authorization_cache(ctx).get();
+            });
+
+            // Precondition: we can only call this after `auth::service` has been initialized and started on all shards.
+            sl_controller.invoke_on_all([] (qos::service_level_controller& controller) {
+                controller.register_auth_integration(auth_service.local());
+            }).get();
+
+            auto unregister_sl_controller_integration = defer([] {
+                sl_controller.invoke_on_all([] (qos::service_level_controller& controller) {
+                    return controller.unregister_auth_integration();
+                }).get();
             });
 
             // update the service level cache after the SL data accessor and auth service are initialized.
@@ -2310,6 +2469,14 @@ sharded<locator::shared_token_metadata> token_metadata;
                 view_builder.invoke_on_all(&db::view::view_builder::drain).get();
             });
 
+            checkpoint(stop_signal, "starting view building worker's background fibers");
+            with_scheduling_group(maintenance_scheduling_group, [&] {
+                return view_building_worker.local().init();
+            }).get();
+            auto drain_view_buiding_worker = defer_verbose_shutdown("draining view building worker", [&] {
+                view_building_worker.invoke_on_all(&db::view::view_building_worker::drain).get();
+            });
+
             api::set_server_view_builder(ctx, view_builder, gossiper).get();
             auto stop_vb_api = defer_verbose_shutdown("view builder API", [&ctx] {
                 api::unset_server_view_builder(ctx).get();
@@ -2354,7 +2521,6 @@ sharded<locator::shared_token_metadata> token_metadata;
             api::set_server_service_levels(ctx, cql_server_ctl, qp).get();
 
             alternator::controller alternator_ctl(gossiper, proxy, mm, sys_dist_ks, cdc_generation_service, service_memory_limiter, auth_service, sl_controller, *cfg, dbcfg.statement_scheduling_group);
-            redis::controller redis_ctl(proxy, auth_service, mm, *cfg, gossiper, dbcfg.statement_scheduling_group);
 
             // Register at_exit last, so that storage_service::drain_on_shutdown will be called first
             auto do_drain = defer_verbose_shutdown("local storage", [&ss] {
@@ -2382,10 +2548,6 @@ sharded<locator::shared_token_metadata> token_metadata;
 
             if (bool enabled = cfg->alternator_port() || cfg->alternator_https_port()) {
                 ss.local().register_protocol_server(alternator_ctl, enabled).get();
-            }
-
-            if (bool enabled = cfg->redis_port() || cfg->redis_ssl_port()) {
-                ss.local().register_protocol_server(redis_ctl, enabled).get();
             }
 
             stop_signal.ready();

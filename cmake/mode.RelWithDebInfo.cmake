@@ -8,7 +8,7 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO
   CACHE
   INTERNAL
   "")
-update_cxx_flags(CMAKE_CXX_FLAGS_RELWITHDEBINFO
+update_build_flags(RelWithDebInfo
   WITH_DEBUG_INFO
   OPTIMIZATION_LEVEL "3")
 
@@ -30,5 +30,6 @@ if(_slp_vectorize_supported)
 endif()
 
 add_link_options($<$<CONFIG:RelWithDebInfo>:LINKER:--gc-sections>)
+add_link_options($<$<CONFIG:RelWithDebInfo>:LINKER:--no-lto-pgo-warn-mismatch>)
 
 maybe_limit_stack_usage_in_KB(13 RelWithDebInfo)

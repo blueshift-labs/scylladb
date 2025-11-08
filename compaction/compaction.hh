@@ -11,15 +11,16 @@
 
 #include "readers/combined_reader_stats.hh"
 #include "sstables/shared_sstable.hh"
+#include "sstables/generation_type.hh"
 #include "compaction/compaction_descriptor.hh"
+#include "mutation/mutation_tombstone_stats.hh"
 #include "gc_clock.hh"
 #include "utils/UUID.hh"
-#include "table_state.hh"
+#include "compaction_group_view.hh"
 #include <seastar/core/abort_source.hh>
+#include "sstables/basic_info.hh"
 
-using namespace compaction;
-
-namespace sstables {
+namespace compaction {
 
 bool is_eligible_for_compaction(const sstables::shared_sstable& sst) noexcept;
 
@@ -54,8 +55,8 @@ struct compaction_data {
     utils::UUID compaction_uuid;
     unsigned compaction_fan_in = 0;
     struct replacement {
-        const std::vector<shared_sstable> removed;
-        const std::vector<shared_sstable> added;
+        const std::vector<sstables::shared_sstable> removed;
+        const std::vector<sstables::shared_sstable> added;
     };
     std::vector<replacement> pending_replacements;
 
@@ -72,6 +73,7 @@ struct compaction_data {
 };
 
 struct compaction_stats {
+    std::chrono::time_point<db_clock> started_at;
     std::chrono::time_point<db_clock> ended_at;
     uint64_t start_size = 0;
     uint64_t end_size = 0;
@@ -79,13 +81,16 @@ struct compaction_stats {
     // Bloom filter checks during max purgeable calculation
     uint64_t bloom_filter_checks = 0;
     combined_reader_statistics reader_statistics;
+    tombstone_purge_stats tombstone_purge_stats;
 
     compaction_stats& operator+=(const compaction_stats& r) {
+        started_at = std::max(started_at, r.started_at);
         ended_at = std::max(ended_at, r.ended_at);
         start_size += r.start_size;
         end_size += r.end_size;
         validation_errors += r.validation_errors;
         bloom_filter_checks += r.bloom_filter_checks;
+        tombstone_purge_stats += r.tombstone_purge_stats;
         return *this;
     }
     friend compaction_stats operator+(const compaction_stats& l, const compaction_stats& r) {
@@ -96,23 +101,25 @@ struct compaction_stats {
 };
 
 struct compaction_result {
+    shard_id shard_id;
+    compaction_type type;
+    std::vector<sstables::basic_info> sstables_in;
+    std::vector<sstables::basic_info> sstables_out;
     std::vector<sstables::shared_sstable> new_sstables;
     compaction_stats stats;
 };
 
-class read_monitor_generator;
-
 class compaction_progress_monitor {
-    std::unique_ptr<read_monitor_generator> _generator = nullptr;
+    std::unique_ptr<sstables::read_monitor_generator> _generator = nullptr;
     uint64_t _progress = 0;
 public:
-    void set_generator(std::unique_ptr<read_monitor_generator> generator);
+    void set_generator(std::unique_ptr<sstables::read_monitor_generator> generator);
     void reset_generator();
     // Returns number of bytes processed with _generator.
     uint64_t get_progress() const;
 
     friend class compaction;
-    friend future<compaction_result> scrub_sstables_validate_mode(sstables::compaction_descriptor, compaction_data&, table_state&, compaction_progress_monitor&);
+    friend future<compaction_result> scrub_sstables_validate_mode(compaction_descriptor, compaction_data&, compaction_group_view&, compaction_progress_monitor&);
 };
 
 // Compact a list of N sstables into M sstables.
@@ -120,7 +127,7 @@ public:
 //
 // compaction_descriptor is responsible for specifying the type of compaction, and influencing
 // compaction behavior through its available member fields.
-future<compaction_result> compact_sstables(sstables::compaction_descriptor descriptor, compaction_data& cdata, table_state& table_s, compaction_progress_monitor& progress_monitor);
+future<compaction_result> compact_sstables(compaction_descriptor descriptor, compaction_data& cdata, compaction_group_view& table_s, compaction_progress_monitor& progress_monitor);
 
 // Return list of expired sstables for column family cf.
 // A sstable is fully expired *iff* its max_local_deletion_time precedes gc_before and its
@@ -128,9 +135,9 @@ future<compaction_result> compact_sstables(sstables::compaction_descriptor descr
 // In simpler words, a sstable is fully expired if all of its live cells with TTL is expired
 // and possibly doesn't contain any tombstone that covers cells in other sstables.
 std::unordered_set<sstables::shared_sstable>
-get_fully_expired_sstables(const table_state& table_s, const std::vector<sstables::shared_sstable>& compacting, gc_clock::time_point gc_before);
+get_fully_expired_sstables(const compaction_group_view& table_s, const std::vector<sstables::shared_sstable>& compacting, gc_clock::time_point gc_before);
 
 // For tests, can drop after we virtualize sstables.
-mutation_reader make_scrubbing_reader(mutation_reader rd, compaction_type_options::scrub::mode scrub_mode, uint64_t& validation_errors);
+mutation_reader make_scrubbing_reader(mutation_reader rd, compaction_type_options::scrub::mode scrub_mode, uint64_t& validation_errors, bool& failed_to_fix_sstable, compaction_type_options::scrub::drop_unfixable_sstables drop_unfixable_sstables);
 
 }

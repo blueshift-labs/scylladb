@@ -54,12 +54,23 @@ void set_token_metadata(http_context& ctx, routes& r, sharded<locator::shared_to
         for (const auto host_id: leaving_host_ids) {
             eps.insert(g.local().get_address_map().get(host_id));
         }
-        return container_to_vec(eps);
+        return eps | std::views::transform([] (auto& i) { return fmt::to_string(i); }) | std::ranges::to<std::vector>();
     });
 
     ss::get_moving_nodes.set(r, [](const_req req) {
         std::unordered_set<sstring> addr;
-        return container_to_vec(addr);
+        return addr | std::ranges::to<std::vector>();
+    });
+
+    ss::get_excluded_nodes.set(r, [&tm](const_req req) {
+        const auto& local_tm = *tm.local().get();
+        std::vector<sstring> eps;
+        local_tm.get_topology().for_each_node([&] (auto& node) {
+            if (node.is_excluded()) {
+                eps.push_back(node.host_id().to_sstring());
+            }
+        });
+        return eps;
     });
 
     ss::get_joining_nodes.set(r, [&tm, &g](const_req req) {
@@ -70,15 +81,21 @@ void set_token_metadata(http_context& ctx, routes& r, sharded<locator::shared_to
         for (const auto& [token, host_id]: points) {
             eps.insert(g.local().get_address_map().get(host_id));
         }
-        return container_to_vec(eps);
+        return eps | std::views::transform([] (auto& i) { return fmt::to_string(i); }) | std::ranges::to<std::vector>();
     });
 
     ss::get_host_id_map.set(r, [&tm, &g](const_req req) {
-        std::vector<ss::mapper> res;
-        auto map = tm.local().get()->get_host_ids() |
-            std::views::transform([&g] (locator::host_id id) { return std::make_pair(g.local().get_address_map().get(id), id); }) |
-            std::ranges::to<std::unordered_map>();
-        return map_to_key_value(std::move(map), res);
+        if (!g.local().is_enabled()) {
+            throw std::runtime_error("The gossiper is not ready yet");
+        }
+        return tm.local().get()->get_host_ids()
+            | std::views::transform([&g] (locator::host_id id) {
+                ss::mapper m;
+                m.key = fmt::to_string(g.local().get_address_map().get(id));
+                m.value = fmt::to_string(id);
+                return m;
+            })
+            | std::ranges::to<std::vector<ss::mapper>>();
     });
 
     static auto host_or_broadcast = [&tm](const_req req) {
@@ -124,6 +141,7 @@ void unset_token_metadata(http_context& ctx, routes& r) {
     ss::get_leaving_nodes.unset(r);
     ss::get_moving_nodes.unset(r);
     ss::get_joining_nodes.unset(r);
+    ss::get_excluded_nodes.unset(r);
     ss::get_host_id_map.unset(r);
     httpd::endpoint_snitch_info_json::get_datacenter.unset(r);
     httpd::endpoint_snitch_info_json::get_rack.unset(r);

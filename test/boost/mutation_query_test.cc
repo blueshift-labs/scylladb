@@ -11,8 +11,8 @@
 #include <fmt/ranges.h>
 
 #include <boost/test/unit_test.hpp>
-#include "query-result-set.hh"
-#include "query-result-writer.hh"
+#include "query/query-result-set.hh"
+#include "query/query-result-writer.hh"
 
 #include "test/lib/scylla_test_case.hh"
 #include <seastar/testing/thread_test_case.hh>
@@ -22,13 +22,13 @@
 #include "test/lib/reader_concurrency_semaphore.hh"
 #include "test/lib/test_utils.hh"
 
-#include "querier.hh"
+#include "replica/querier.hh"
 #include "mutation_query.hh"
 #include <seastar/core/do_with.hh>
 #include <seastar/core/thread.hh>
 #include "schema/schema_builder.hh"
 #include "partition_slice_builder.hh"
-#include "readers/from_mutations_v2.hh"
+#include "readers/from_mutations.hh"
 #include "mutation/mutation_rebuilder.hh"
 #include "readers/mutation_source.hh"
 
@@ -51,7 +51,7 @@ struct mutation_less_cmp {
         return m1.decorated_key().less_compare(*m1.schema(), m2.decorated_key());
     }
 };
-static mutation_source make_source(std::vector<mutation> mutations) {
+static mutation_source make_source(utils::chunked_vector<mutation> mutations) {
     return mutation_source([mutations = std::move(mutations)] (schema_ptr s, reader_permit permit, const dht::partition_range& range, const query::partition_slice& slice,
             tracing::trace_state_ptr, streamed_mutation::forwarding fwd, mutation_reader::forwarding fwd_mr) {
         SCYLLA_ASSERT(range.is_full()); // slicing not implemented yet
@@ -62,7 +62,7 @@ static mutation_source make_source(std::vector<mutation> mutations) {
                 SCYLLA_ASSERT(m.schema() == s);
             }
         }
-        return make_mutation_reader_from_mutations_v2(s, std::move(permit), mutations, slice, fwd);
+        return make_mutation_reader_from_mutations(s, std::move(permit), mutations, slice, fwd);
     });
 }
 
@@ -84,7 +84,7 @@ query::result_set to_result_set(const reconcilable_result& r, schema_ptr s, cons
 static reconcilable_result mutation_query(schema_ptr s, reader_permit permit, const mutation_source& source, const dht::partition_range& range,
         const query::partition_slice& slice, uint64_t row_limit, uint32_t partition_limit, gc_clock::time_point query_time) {
 
-    auto querier = query::querier(source, s, std::move(permit), range, slice, {});
+    auto querier = replica::querier(source, s, std::move(permit), range, slice, {}, tombstone_gc_state(nullptr));
     auto close_querier = deferred_close(querier);
     auto rrb = reconcilable_result_builder(*s, slice, make_accounter());
     return querier.consume_page(std::move(rrb), row_limit, partition_limit, query_time).get();
@@ -418,7 +418,7 @@ SEASTAR_TEST_CASE(test_partitions_with_only_expired_tombstones_are_dropped) {
         };
 
         auto make_ring = [&] (int n) {
-            std::vector<mutation> ring;
+            utils::chunked_vector<mutation> ring;
             while (n--) {
                 ring.push_back(mutation(s, new_key()));
             }
@@ -426,7 +426,7 @@ SEASTAR_TEST_CASE(test_partitions_with_only_expired_tombstones_are_dropped) {
             return ring;
         };
 
-        std::vector<mutation> ring = make_ring(4);
+        utils::chunked_vector<mutation> ring = make_ring(4);
 
         ring[0].set_clustered_cell(clustering_key::make_empty(), "v", data_value(bytes("v")), api::new_timestamp());
 
@@ -502,7 +502,7 @@ SEASTAR_TEST_CASE(test_partition_limit) {
         mutation m3(s, partition_key::from_single_value(*s, "key3"));
         m3.set_clustered_cell(clustering_key::from_single_value(*s, bytes("B")), "v1", data_value(bytes("B:v")), 1);
 
-        std::vector<mutation> muts = {m1, m2, m3};
+        utils::chunked_vector<mutation> muts = {m1, m2, m3};
         std::sort(muts.begin(), muts.end(), mutation_decorated_key_less_comparator{});
 
         auto src = make_source(muts);
@@ -538,7 +538,7 @@ SEASTAR_TEST_CASE(test_partition_limit) {
 
 static void data_query(schema_ptr s, reader_permit permit, const mutation_source& source, const dht::partition_range& range,
         const query::partition_slice& slice, query::result::builder& builder) {
-    auto querier = query::querier(source, s, std::move(permit), range, slice, {});
+    auto querier = replica::querier(source, s, std::move(permit), range, slice, {}, tombstone_gc_state(nullptr));
     auto close_querier = deferred_close(querier);
     auto qrb = query_result_builder(*s, builder);
     querier.consume_page(std::move(qrb), std::numeric_limits<uint32_t>::max(), std::numeric_limits<uint32_t>::max(), gc_clock::now()).get();
@@ -547,7 +547,7 @@ static void data_query(schema_ptr s, reader_permit permit, const mutation_source
 SEASTAR_THREAD_TEST_CASE(test_result_size_calculation) {
     tests::reader_concurrency_semaphore_wrapper semaphore;
     random_mutation_generator gen(random_mutation_generator::generate_counters::no);
-    std::vector<mutation> mutations = gen(1);
+    utils::chunked_vector<mutation> mutations = gen(1);
     schema_ptr s = gen.schema();
     mutation_source source = make_source(std::move(mutations));
     query::result_memory_limiter l(std::numeric_limits<ssize_t>::max());
@@ -568,7 +568,7 @@ SEASTAR_THREAD_TEST_CASE(test_result_size_calculation) {
 SEASTAR_THREAD_TEST_CASE(test_frozen_mutation_consumer) {
     random_mutation_generator gen(random_mutation_generator::generate_counters::no);
     schema_ptr s = gen.schema();
-    std::vector<mutation> mutations = gen(1);
+    utils::chunked_vector<mutation> mutations = gen(1);
     const mutation& m = mutations[0];
     frozen_mutation fm = freeze(m);
 

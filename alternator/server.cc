@@ -13,7 +13,6 @@
 #include <seastar/http/function_handlers.hh>
 #include <seastar/http/short_streams.hh>
 #include <seastar/core/coroutine.hh>
-#include <seastar/json/json_elements.hh>
 #include <seastar/util/defer.hh>
 #include <seastar/util/short_streams.hh>
 #include "seastarx.hh"
@@ -31,6 +30,8 @@
 #include "gms/gossiper.hh"
 #include "utils/overloaded_functor.hh"
 #include "utils/aws_sigv4.hh"
+#include "client_data.hh"
+#include "utils/updateable_value.hh"
 
 static logging::logger slogger("alternator-server");
 
@@ -100,6 +101,13 @@ static void handle_CORS(const request& req, reply& rep, bool preflight) {
 // the user directly. Other exceptions are unexpected, and reported as
 // Internal Server Error.
 class api_handler : public handler_base {
+    // Although the the DynamoDB API responses are JSON, additional
+    // conventions apply to these responses. For this reason, DynamoDB uses
+    // the content type "application/x-amz-json-1.0" instead of the standard
+    // "application/json". Some other AWS services use later versions instead
+    // of "1.0", but DynamoDB currently uses "1.0". Note that this content
+    // type applies to all replies, both success and error.
+    static constexpr const char* REPLY_CONTENT_TYPE = "application/x-amz-json-1.0";
 public:
     api_handler(const std::function<future<executor::request_return_type>(std::unique_ptr<request> req)>& _handle) : _f_handle(
          [this, _handle](std::unique_ptr<request> req, std::unique_ptr<reply> rep) {
@@ -124,22 +132,19 @@ public:
              }
              auto res = resf.get();
              std::visit(overloaded_functor {
-                 [&] (const json::json_return_type& json_return_value) {
-                     slogger.trace("api_handler success case");
-                     if (json_return_value._body_writer) {
-                         // Unfortunately, write_body() forces us to choose
-                         // from a fixed and irrelevant list of "mime-types"
-                         // at this point. But we'll override it with the
-                         // one (application/x-amz-json-1.0) below.
-                         rep->write_body("json", std::move(json_return_value._body_writer));
-                     } else {
-                         rep->_content += json_return_value._res;
-                     }
-                 },
-                 [&] (const api_error& err) {
-                     generate_error_reply(*rep, err);
-                 }
-             }, res);
+                [&] (std::string&& str) {
+                    // Note that despite the move, there is a copy here -
+                    // as str is std::string and rep->_content is sstring.
+                    rep->_content = std::move(str);
+                    rep->set_content_type(REPLY_CONTENT_TYPE);
+                },
+                [&] (executor::body_writer&& body_writer) {
+                    rep->write_body(REPLY_CONTENT_TYPE, std::move(body_writer));
+                },
+                [&] (const api_error& err) {
+                    generate_error_reply(*rep, err);
+                }
+             }, std::move(res));
 
              return make_ready_future<std::unique_ptr<reply>>(std::move(rep));
          });
@@ -151,7 +156,6 @@ public:
         handle_CORS(*req, *rep, false);
         return _f_handle(std::move(req), std::move(rep)).then(
                 [](std::unique_ptr<reply> rep) {
-                    rep->set_mime_type("application/x-amz-json-1.0");
                     rep->done();
                     return make_ready_future<std::unique_ptr<reply>>(std::move(rep));
                 });
@@ -167,6 +171,7 @@ protected:
         rjson::add(results, "message", err._msg);
         rep._content = rjson::print(std::move(results));
         rep._status = err._http_code;
+        rep.set_content_type(REPLY_CONTENT_TYPE);
         slogger.trace("api_handler error case: {}", rep._content);
     }
 
@@ -228,9 +233,8 @@ protected:
         // If the rack does not exist, we return an empty list - not an error.
         sstring query_rack = req->get_query_param("rack");
         for (auto& id : local_dc_nodes) {
-            auto ip = _gossiper.get_address_map().get(id);
             if (!query_rack.empty()) {
-                auto rack = _gossiper.get_application_state_value(ip, gms::application_state::RACK);
+                auto rack = _gossiper.get_application_state_value(id, gms::application_state::RACK);
                 if (rack != query_rack) {
                     continue;
                 }
@@ -238,10 +242,10 @@ protected:
             // Note that it's not enough for the node to be is_alive() - a
             // node joining the cluster is also "alive" but not responsive to
             // requests. We alive *and* normal. See #19694, #21538.
-            if (_gossiper.is_alive(id) && _gossiper.is_normal(ip)) {
+            if (_gossiper.is_alive(id) && _gossiper.is_normal(id)) {
                 // Use the gossiped broadcast_rpc_address if available instead
                 // of the internal IP address "ip". See discussion in #18711.
-                rjson::push_back(results, rjson::from_string(_gossiper.get_rpc_address(ip)));
+                rjson::push_back(results, rjson::from_string(_gossiper.get_rpc_address(id)));
             }
         }
         rep->set_status(reply::status_type::ok);
@@ -267,24 +271,57 @@ protected:
     }
 };
 
+// This function increments the authentication_failures counter, and may also
+// log a warn-level message and/or throw an exception, depending on what
+// enforce_authorization and warn_authorization are set to.
+// The username and client address are only used for logging purposes -
+// they are not included in the error message returned to the client, since
+// the client knows who it is.
+// Note that if enforce_authorization is false, this function will return
+// without throwing. So a caller that doesn't want to continue after an
+// authentication_error must explicitly return after calling this function.
+template<typename Exception>
+static void authentication_error(alternator::stats& stats, bool enforce_authorization, bool warn_authorization, Exception&& e, std::string_view user, gms::inet_address client_address) {
+    stats.authentication_failures++;
+    if (enforce_authorization) {
+        if (warn_authorization) {
+            slogger.warn("alternator_warn_authorization=true: {} for user {}, client address {}", e.what(), user, client_address);
+        }
+        throw std::move(e);
+    } else {
+        if (warn_authorization) {
+            slogger.warn("If you set alternator_enforce_authorization=true the following will be enforced: {} for user {}, client address {}", e.what(), user, client_address);
+        }
+    }
+}
+
 future<std::string> server::verify_signature(const request& req, const chunked_content& content) {
-    if (!_enforce_authorization) {
+    if (!_enforce_authorization.get() && !_warn_authorization.get()) {
         slogger.debug("Skipping authorization");
         return make_ready_future<std::string>();
     }
     auto host_it = req._headers.find("Host");
     if (host_it == req._headers.end()) {
-        throw api_error::invalid_signature("Host header is mandatory for signature verification");
+        authentication_error(_executor._stats, _enforce_authorization.get(), _warn_authorization.get(),
+            api_error::invalid_signature("Host header is mandatory for signature verification"), 
+            "", req.get_client_address());
+        return make_ready_future<std::string>();
     }
     auto authorization_it = req._headers.find("Authorization");
     if (authorization_it == req._headers.end()) {
-        throw api_error::missing_authentication_token("Authorization header is mandatory for signature verification");
+        authentication_error(_executor._stats, _enforce_authorization.get(), _warn_authorization.get(),
+            api_error::missing_authentication_token("Authorization header is mandatory for signature verification"),
+            "", req.get_client_address());
+        return make_ready_future<std::string>();
     }
     std::string host = host_it->second;
     std::string_view authorization_header = authorization_it->second;
     auto pos = authorization_header.find_first_of(' ');
     if (pos == std::string_view::npos || authorization_header.substr(0, pos) != "AWS4-HMAC-SHA256") {
-        throw api_error::invalid_signature(fmt::format("Authorization header must use AWS4-HMAC-SHA256 algorithm: {}", authorization_header));
+        authentication_error(_executor._stats, _enforce_authorization.get(), _warn_authorization.get(),
+            api_error::invalid_signature(fmt::format("Authorization header must use AWS4-HMAC-SHA256 algorithm: {}", authorization_header)),
+            "", req.get_client_address());
+        return make_ready_future<std::string>();
     }
     authorization_header.remove_prefix(pos+1);
     std::string credential;
@@ -319,7 +356,9 @@ future<std::string> server::verify_signature(const request& req, const chunked_c
 
     std::vector<std::string_view> credential_split = split(credential, '/');
     if (credential_split.size() != 5) {
-        throw api_error::validation(fmt::format("Incorrect credential information format: {}", credential));
+        authentication_error(_executor._stats, _enforce_authorization.get(), _warn_authorization.get(),
+            api_error::validation(fmt::format("Incorrect credential information format: {}", credential)), "", req.get_client_address());
+        return make_ready_future<std::string>();
     }
     std::string user(credential_split[0]);
     std::string datestamp(credential_split[1]);
@@ -343,7 +382,7 @@ future<std::string> server::verify_signature(const request& req, const chunked_c
     auto cache_getter = [&proxy = _proxy, &as = _auth_service] (std::string username) {
         return get_key_from_roles(proxy, as, std::move(username));
     };
-    return _key_cache.get_ptr(user, cache_getter).then([this, &req, &content,
+    return _key_cache.get_ptr(user, cache_getter).then_wrapped([this, &req, &content,
                                                     user = std::move(user),
                                                     host = std::move(host),
                                                     datestamp = std::move(datestamp),
@@ -351,18 +390,32 @@ future<std::string> server::verify_signature(const request& req, const chunked_c
                                                     signed_headers_map = std::move(signed_headers_map),
                                                     region = std::move(region),
                                                     service = std::move(service),
-                                                    user_signature = std::move(user_signature)] (key_cache::value_ptr key_ptr) {
+                                                    user_signature = std::move(user_signature)] (future<key_cache::value_ptr> key_ptr_fut) {
+        key_cache::value_ptr key_ptr(nullptr);
+        try {
+            key_ptr = key_ptr_fut.get();
+        } catch (const api_error& e) {
+            authentication_error(_executor._stats, _enforce_authorization.get(), _warn_authorization.get(),
+                e, user, req.get_client_address());
+            return std::string();
+        }
         std::string signature;
         try {
             signature = utils::aws::get_signature(user, *key_ptr, std::string_view(host), "/", req._method,
                 datestamp, signed_headers_str, signed_headers_map, &content, region, service, "");
         } catch (const std::exception& e) {
-            throw api_error::invalid_signature(e.what());
+            authentication_error(_executor._stats, _enforce_authorization.get(), _warn_authorization.get(),
+                api_error::invalid_signature(fmt::format("invalid signature: {}", e.what())),
+                user, req.get_client_address());
+            return std::string();
         }
 
         if (signature != std::string_view(user_signature)) {
             _key_cache.remove(user);
-            throw api_error::unrecognized_client("The security token included in the request is invalid.");
+            authentication_error(_executor._stats, _enforce_authorization.get(), _warn_authorization.get(),
+                api_error::unrecognized_client("wrong signature"),
+                user, req.get_client_address());
+            return std::string();
         }
         return user;
     });
@@ -375,35 +428,82 @@ static tracing::trace_state_ptr create_tracing_session(tracing::tracing& tracing
     return tracing_instance.create_session(tracing::trace_type::QUERY, props);
 }
 
-// truncated_content_view() prints a potentially long chunked_content for
-// debugging purposes. In the common case when the content is not excessively
-// long, it just returns a view into the given content, without any copying.
-// But when the content is very long, it is truncated after some arbitrary
-// max_len (or one chunk, whichever comes first), with "<truncated>" added at
-// the end. To do this modification to the string, we need to create a new
-// std::string, so the caller must pass us a reference to one, "buf", where
-// we can store the content. The returned view is only alive for as long this
-// buf is kept alive.
-static std::string_view truncated_content_view(const chunked_content& content, std::string& buf) {
-    constexpr size_t max_len = 1024;
-    if (content.empty()) {
-        return std::string_view();
-    } else if (content.size() == 1 && content.begin()->size() <= max_len) {
-        return std::string_view(content.begin()->get(), content.begin()->size());
-    } else {
-        buf = std::string(content.begin()->get(), std::min(content.begin()->size(), max_len)) + "<truncated>";
-        return std::string_view(buf);
+// A helper class to represent a potentially truncated view of a chunked_content.
+// If the content is short enough and single chunked, it just holds a view into the content.
+// Otherwise it will be copied into an internal buffer, possibly truncated (depending on maximum allowed size passed in),
+// and the view will point into that buffer.
+// `as_view()` method will return the view.
+// `take_as_sstring()` will either move out the internal buffer (if any), or create a new sstring from the view.
+// You should consider `as_view()` valid as long both the original chunked_content and the truncated_content object are alive.
+class truncated_content {
+    std::string_view _view;
+    sstring _content_maybe;
+
+    void copy_from_content(const chunked_content& content) {
+        size_t offset = 0;
+        for(auto &tmp : content) {
+            size_t to_copy = std::min(tmp.size(), _content_maybe.size() - offset);
+            std::copy(tmp.get(), tmp.get() + to_copy, _content_maybe.data() + offset);
+            offset += to_copy;
+            if (offset >= _content_maybe.size()) {
+                break;
+            }
+        }
     }
+public:
+    truncated_content(const chunked_content& content, size_t max_len = std::numeric_limits<size_t>::max()) {
+        if (content.empty()) return;
+        if (content.size() == 1 && content.begin()->size() <= max_len) {
+            _view = std::string_view(content.begin()->get(), content.begin()->size());
+            return;
+        }
+
+        constexpr std::string_view truncated_text = "<truncated>";
+        size_t content_size = 0;
+        for(auto &tmp : content) {
+            content_size += tmp.size();
+        }
+        if (content_size <= max_len) {
+            _content_maybe = sstring{ sstring::initialized_later{}, content_size };
+            copy_from_content(content);
+        }
+        else {
+            _content_maybe = sstring{ sstring::initialized_later{}, max_len + truncated_text.size() };
+            copy_from_content(content);
+            std::copy(truncated_text.begin(), truncated_text.end(), _content_maybe.data() + _content_maybe.size() - truncated_text.size());
+        }
+        _view = std::string_view(_content_maybe);
+    }
+
+    std::string_view as_view() const { return _view; }
+    sstring take_as_sstring() && {
+        if (_content_maybe.empty() && !_view.empty()) {
+            return sstring{_view};
+        }
+        return std::move(_content_maybe);
+    }
+};
+
+// `truncated_content_view` will produce an object representing a view to a passed content
+// possibly truncated at some length. The value returned is used in two ways:
+// - to print it in logs (use `as_view()` method for this)
+// - to pass it to tracing object, where it will be stored and used later
+//   (use `take_as_sstring()` method as this produces a copy in form of a sstring)
+// `truncated_content` delays constructing `sstring` object until it's actually needed.
+// `truncated_content` is valid as long as passed `content` is alive.
+// if the content is truncated, `<truncated>` will be appended at the maximum size limit
+// and total size will be `max_users_query_size_in_trace_output() + strlen("<truncated>")`.
+static truncated_content truncated_content_view(const chunked_content& content, size_t max_size) {
+    return truncated_content{content, max_size};
 }
 
-static tracing::trace_state_ptr maybe_trace_query(service::client_state& client_state, std::string_view username, std::string_view op, const chunked_content& query) {
+static tracing::trace_state_ptr maybe_trace_query(service::client_state& client_state, std::string_view username, std::string_view op, const chunked_content& query, size_t max_users_query_size_in_trace_output) {
     tracing::trace_state_ptr trace_state;
     tracing::tracing& tracing_instance = tracing::tracing::get_local_tracing_instance();
     if (tracing_instance.trace_next_query() || tracing_instance.slow_query_tracing_enabled()) {
         trace_state = create_tracing_session(tracing_instance);
-        std::string buf;
         tracing::add_session_param(trace_state, "alternator_op", op);
-        tracing::add_query(trace_state, truncated_content_view(query, buf));
+        tracing::add_query(trace_state, truncated_content_view(query, max_users_query_size_in_trace_output).take_as_sstring());
         tracing::begin(trace_state, seastar::format("Alternator {}", op), client_state.get_client_address());
         if (!username.empty()) {
             tracing::set_username(trace_state, auth::authenticated_user(username));
@@ -412,30 +512,92 @@ static tracing::trace_state_ptr maybe_trace_query(service::client_state& client_
     return trace_state;
 }
 
+// This read_entire_stream() is similar to Seastar's read_entire_stream()
+// which reads the given content_stream until its end into non-contiguous
+// memory. The difference is that this implementation takes an extra length
+// limit, and throws an error if we read more than this limit.
+// This length-limited variant would not have been needed if Seastar's HTTP
+// server's set_content_length_limit() worked in every case, but unfortunately
+// it does not - it only works if the request has a Content-Length header (see
+// issue #8196). In contrast this function can limit the request's length no
+// matter how it's encoded. We need this limit to protect Alternator from
+// oversized requests that can deplete memory.
+static future<chunked_content>
+read_entire_stream(input_stream<char>& inp, size_t length_limit) {
+    chunked_content ret;
+    // We try to read length_limit + 1 bytes, so that we can throw an
+    // exception if we managed to read more than length_limit.
+    ssize_t remain = length_limit + 1;
+    do {
+        temporary_buffer<char> buf = co_await inp.read_up_to(remain);
+        if (buf.empty()) {
+            break;
+        }
+        remain -= buf.size();
+        ret.push_back(std::move(buf));
+    } while (remain > 0);
+    // If we read the full length_limit + 1 bytes, we went over the limit:
+    if (remain <= 0) {
+        // By throwing here an error, we may send a reply (the error message)
+        // without having read the full request body. Seastar's httpd will
+        // realize that we have not read the entire content stream, and
+        // correctly mark the connection unreusable, i.e., close it.
+        // This means we are currently exposed to issue #12166 caused by
+        // Seastar issue 1325), where the client may get an RST instead of
+        // a FIN, and may rarely get a "Connection reset by peer" before
+        // reading the error we send.
+        throw api_error::payload_too_large(fmt::format("Request content length limit of {} bytes exceeded", length_limit));
+    }
+    co_return ret;
+}
+
 future<executor::request_return_type> server::handle_api_request(std::unique_ptr<request> req) {
     _executor._stats.total_operations++;
     sstring target = req->get_header("X-Amz-Target");
     // target is DynamoDB API version followed by a dot '.' and operation type (e.g. CreateTable)
     auto dot = target.find('.');
     std::string_view op = (dot == sstring::npos) ? std::string_view() : std::string_view(target).substr(dot+1);
+    if (req->content_length > request_content_length_limit) {
+        // If we have a Content-Length header and know the request will be too
+        // long, we don't need to wait for read_entire_stream() below to
+        // discover it. And we definitely mustn't try to get_units() below for
+        // for such a size.
+        co_return api_error::payload_too_large(fmt::format("Request content length limit of {} bytes exceeded", request_content_length_limit));
+    }
     // JSON parsing can allocate up to roughly 2x the size of the raw
     // document, + a couple of bytes for maintenance.
-    // TODO: consider the case where req->content_length is missing. Maybe
-    // we need to take the content_length_limit and return some of the units
-    // when we finish read_content_and_verify_signature?
-    size_t mem_estimate = req->content_length * 2 + 8000;
+    // If the Content-Length of the request is not available, we assume
+    // the largest possible request (request_content_length_limit, i.e., 16 MB)
+    // and after reading the request we return_units() the excess.
+    size_t mem_estimate = (req->content_length ? req->content_length : request_content_length_limit) * 2 + 8000;
     auto units_fut = get_units(*_memory_limiter, mem_estimate);
     if (_memory_limiter->waiters()) {
         ++_executor._stats.requests_blocked_memory;
     }
     auto units = co_await std::move(units_fut);
     SCYLLA_ASSERT(req->content_stream);
-    chunked_content content = co_await util::read_entire_stream(*req->content_stream);
+    chunked_content content = co_await read_entire_stream(*req->content_stream, request_content_length_limit);
+    // If the request had no Content-Length, we reserved too many units
+    // so need to return some
+    if (req->content_length == 0) {
+        size_t content_length = 0;
+        for (const auto& chunk : content) {
+            content_length += chunk.size();
+        }
+        size_t new_mem_estimate = content_length * 2 + 8000;
+        units.return_units(mem_estimate - new_mem_estimate);
+    }
     auto username = co_await verify_signature(*req, content);
+    // As long as the system_clients_entry object is alive, this request will
+    // be visible in the "system.clients" virtual table. When requested, this
+    // entry will be formatted by server::ongoing_request::make_client_data().
+    auto system_clients_entry = _ongoing_requests.emplace(
+        req->get_client_address(), req->get_header("User-Agent"),
+        username, current_scheduling_group(),
+        req->get_protocol_name() == "https");
 
     if (slogger.is_enabled(log_level::trace)) {
-        std::string buf;
-        slogger.trace("Request: {} {} {}", op, truncated_content_view(content, buf), req->_headers);
+        slogger.trace("Request: {} {} {}", op, truncated_content_view(content, _max_users_query_size_in_trace_output).as_view(), req->_headers);
     }
     auto callback_it = _callbacks.find(op);
     if (callback_it == _callbacks.end()) {
@@ -455,7 +617,7 @@ future<executor::request_return_type> server::handle_api_request(std::unique_ptr
     }
     co_await client_state.maybe_update_per_service_level_params();
 
-    tracing::trace_state_ptr trace_state = maybe_trace_query(client_state, username, op, content);
+    tracing::trace_state_ptr trace_state = maybe_trace_query(client_state, username, op, content, _max_users_query_size_in_trace_output.get());
     tracing::trace(trace_state, "{}", op);
 
     auto user = client_state.user();
@@ -463,6 +625,9 @@ future<executor::request_return_type> server::handle_api_request(std::unique_ptr
             client_state = std::move(client_state), trace_state = std::move(trace_state),
             units = std::move(units), req = std::move(req)] () mutable -> future<executor::request_return_type> {
                 rjson::value json_request = co_await _json_parser.parse(std::move(content));
+                if (!json_request.IsObject()) {
+                    co_return api_error::validation("Request content must be an object");
+                }
                 co_return co_await callback(_executor, client_state, trace_state,
                     make_service_permit(std::move(units)), std::move(json_request), std::move(req));
     };
@@ -503,9 +668,9 @@ server::server(executor& exec, service::storage_proxy& proxy, gms::gossiper& gos
         , _auth_service(auth_service)
         , _sl_controller(sl_controller)
         , _key_cache(1024, 1min, slogger)
-        , _enforce_authorization(false)
+        , _max_users_query_size_in_trace_output(1024)
         , _enabled_servers{}
-        , _pending_requests{}
+        , _pending_requests("alternator::server::pending_requests")
         , _timeout_config(_proxy.data_dictionary().get_config())
       , _callbacks{
         {"CreateTable", [] (executor& e, executor::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value json_request, std::unique_ptr<request> req) {
@@ -584,10 +749,13 @@ server::server(executor& exec, service::storage_proxy& proxy, gms::gossiper& gos
 }
 
 future<> server::init(net::inet_address addr, std::optional<uint16_t> port, std::optional<uint16_t> https_port, std::optional<tls::credentials_builder> creds,
-        utils::updateable_value<bool> enforce_authorization, semaphore* memory_limiter, utils::updateable_value<uint32_t> max_concurrent_requests) {
+        utils::updateable_value<bool> enforce_authorization, utils::updateable_value<bool> warn_authorization, utils::updateable_value<uint64_t> max_users_query_size_in_trace_output,
+        semaphore* memory_limiter, utils::updateable_value<uint32_t> max_concurrent_requests) {
     _memory_limiter = memory_limiter;
     _enforce_authorization = std::move(enforce_authorization);
+    _warn_authorization = std::move(warn_authorization);
     _max_concurrent_requests = std::move(max_concurrent_requests);
+    _max_users_query_size_in_trace_output = std::move(max_users_query_size_in_trace_output);
     if (!port && !https_port) {
         return make_exception_future<>(std::runtime_error("Either regular port or TLS port"
                 " must be specified in order to init an alternator HTTP server instance"));
@@ -597,14 +765,12 @@ future<> server::init(net::inet_address addr, std::optional<uint16_t> port, std:
 
         if (port) {
             set_routes(_http_server._routes);
-            _http_server.set_content_length_limit(server::content_length_limit);
             _http_server.set_content_streaming(true);
             _http_server.listen(socket_address{addr, *port}).get();
             _enabled_servers.push_back(std::ref(_http_server));
         }
         if (https_port) {
             set_routes(_https_server._routes);
-            _https_server.set_content_length_limit(server::content_length_limit);
             _https_server.set_content_streaming(true);
 
             if (this_shard_id() == 0) {
@@ -677,6 +843,37 @@ future<> server::json_parser::stop() {
     _document_waiting.signal();
     _document_parsed.broken();
     return std::move(_run_parse_json_thread);
+}
+
+// Convert an entry in the server's list of ongoing Alternator requests
+// (_ongoing_requests) into a client_data object. This client_data object
+// will then be used to produce a row for the "system.clients" virtual table.
+client_data server::ongoing_request::make_client_data() const {
+    client_data cd;
+    cd.ct = client_type::alternator;
+    cd.ip = _client_address.addr();
+    cd.port = _client_address.port();
+    cd.shard_id = this_shard_id();
+    cd.connection_stage = client_connection_stage::established;
+    cd.username = _username;
+    cd.scheduling_group_name = _scheduling_group.name();
+    cd.ssl_enabled = _is_https;
+    // For now, we save the full User-Agent header as the "driver name"
+    // and keep "driver_version" unset.
+    cd.driver_name = _user_agent;
+    // Leave "protocol_version" unset, it has no meaning in Alternator.
+    // Leave "hostname", "ssl_protocol" and "ssl_cipher_suite" unset.
+    // As reported in issue #9216, we never set these fields in CQL
+    // either (see cql_server::connection::make_client_data()).
+    return cd;
+}
+
+future<utils::chunked_vector<client_data>> server::get_client_data() {
+    utils::chunked_vector<client_data> ret;
+    co_await _ongoing_requests.for_each_gently([&ret] (const ongoing_request& r) {
+        ret.emplace_back(r.make_client_data());
+    });
+    co_return ret;
 }
 
 const char* api_error::what() const noexcept {

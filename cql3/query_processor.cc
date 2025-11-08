@@ -48,14 +48,16 @@ const std::chrono::minutes prepared_statements_cache::entry_expiry = std::chrono
 struct query_processor::remote {
     remote(service::migration_manager& mm, service::mapreduce_service& fwd,
            service::storage_service& ss, service::raft_group0_client& group0_client)
-            : mm(mm), mapreducer(fwd), ss(ss), group0_client(group0_client) {}
+            : mm(mm), mapreducer(fwd), ss(ss), group0_client(group0_client)
+            , gate("query_processor::remote")
+    {}
 
     service::migration_manager& mm;
     service::mapreduce_service& mapreducer;
     service::storage_service& ss;
     service::raft_group0_client& group0_client;
 
-    seastar::gate gate;
+    seastar::named_gate gate;
 };
 
 bool query_processor::topology_global_queue_empty() {
@@ -66,11 +68,12 @@ static service::query_state query_state_for_internal_call() {
     return {service::client_state::for_internal_calls(), empty_service_permit()};
 }
 
-query_processor::query_processor(service::storage_proxy& proxy, data_dictionary::database db, service::migration_notifier& mn, query_processor::memory_config mcfg, cql_config& cql_cfg, utils::loading_cache_config auth_prep_cache_cfg, lang::manager& langm)
+query_processor::query_processor(service::storage_proxy& proxy, data_dictionary::database db, service::migration_notifier& mn, vector_search::vector_store_client& vsc, query_processor::memory_config mcfg, cql_config& cql_cfg, utils::loading_cache_config auth_prep_cache_cfg, lang::manager& langm)
         : _migration_subscriber{std::make_unique<migration_subscriber>(this)}
         , _proxy(proxy)
         , _db(db)
         , _mnotifier(mn)
+        , _vector_store_client(vsc)
         , _mcfg(mcfg)
         , _cql_config(cql_cfg)
         , _prepared_cache(prep_cache_log, _mcfg.prepared_statment_cache_size)
@@ -677,15 +680,32 @@ query_processor::prepare(sstring query_string, service::query_state& query_state
 
 future<::shared_ptr<cql_transport::messages::result_message::prepared>>
 query_processor::prepare(sstring query_string, const service::client_state& client_state, cql3::dialect d) {
-    using namespace cql_transport::messages;
-    return prepare_one<result_message::prepared::cql>(
-            std::move(query_string),
-            client_state,
-            d,
-            [d] (std::string_view query_string, std::string_view keyspace) {
-                return compute_id(query_string, keyspace, d);
-            },
-            prepared_cache_key_type::cql_id);
+    try {
+        auto key = compute_id(query_string, client_state.get_raw_keyspace(), d);
+        auto prep_ptr = co_await _prepared_cache.get(key, [this, &query_string, &client_state, d] {
+                auto prepared = get_statement(query_string, client_state, d);
+                prepared->calculate_metadata_id();
+                auto bound_terms = prepared->statement->get_bound_terms();
+                if (bound_terms > std::numeric_limits<uint16_t>::max()) {
+                    throw exceptions::invalid_request_exception(
+                            format("Too many markers(?). {:d} markers exceed the allowed maximum of {:d}",
+                                bound_terms,
+                                std::numeric_limits<uint16_t>::max()));
+                }
+                SCYLLA_ASSERT(bound_terms == prepared->bound_names.size());
+                return make_ready_future<std::unique_ptr<statements::prepared_statement>>(std::move(prepared));
+            });
+
+        const auto& warnings = prep_ptr->warnings;
+        const auto msg = ::make_shared<result_message::prepared::cql>(prepared_cache_key_type::cql_id(key), std::move(prep_ptr),
+                    client_state.is_protocol_extension_set(cql_transport::cql_protocol_extension::LWT_ADD_METADATA_MARK));
+        for (const auto& w : warnings) {
+            msg->add_warning(w);
+        }
+        co_return ::shared_ptr<cql_transport::messages::result_message::prepared>(std::move(msg));
+    } catch(typename prepared_statements_cache::statement_is_too_big&) {
+        throw prepared_statement_is_too_big(query_string);
+    }
 }
 
 static std::string hash_target(std::string_view query_string, std::string_view keyspace) {
@@ -781,7 +801,8 @@ query_options query_processor::make_internal_options(
         const statements::prepared_statement::checked_weak_ptr& p,
         const std::vector<data_value_or_unset>& values,
         db::consistency_level cl,
-        int32_t page_size) const {
+        int32_t page_size,
+        service::node_local_only node_local_only) const {
     if (p->bound_names.size() != values.size()) {
         throw std::invalid_argument(
                 format("Invalid number of values. Expecting {:d} but got {:d}", p->bound_names.size(), values.size()));
@@ -808,16 +829,16 @@ query_options query_processor::make_internal_options(
         }, var);
         ++ni;
     }
-    if (page_size > 0) {
-        lw_shared_ptr<service::pager::paging_state> paging_state;
-        db::consistency_level serial_consistency = db::consistency_level::SERIAL;
-        api::timestamp_type ts = api::missing_timestamp;
-        return query_options(
-                cl,
-                std::move(bound_values),
-                cql3::query_options::specific_options{page_size, std::move(paging_state), serial_consistency, ts});
-    }
-    return query_options(cl, std::move(bound_values));
+    return query_options(
+            cl,
+            std::move(bound_values),
+            cql3::query_options::specific_options {
+                .page_size = page_size,
+                .state = {},
+                .serial_consistency = db::consistency_level::SERIAL,
+                .timestamp = api::missing_timestamp,
+                .node_local_only = node_local_only
+            });
 }
 
 statements::prepared_statement::checked_weak_ptr query_processor::prepare_internal(const sstring& query_string) {
@@ -937,7 +958,7 @@ query_processor::execute_internal(
     }
 }
 
-future<std::vector<mutation>> query_processor::get_mutations_internal(
+future<utils::chunked_vector<mutation>> query_processor::get_mutations_internal(
         const sstring query_string,
         service::query_state& query_state,
         api::timestamp_type timestamp,
@@ -1131,9 +1152,6 @@ void query_processor::migration_subscriber::on_update_view(
     // scylladb/scylladb#16392 - Materialized views are also tables so we need at least handle
     // them as such when changed.
     on_update_column_family(ks_name, view_name, columns_changed);
-}
-
-void query_processor::migration_subscriber::on_update_tablet_metadata(const locator::tablet_metadata_change_hint&) {
 }
 
 void query_processor::migration_subscriber::on_drop_keyspace(const sstring& ks_name) {

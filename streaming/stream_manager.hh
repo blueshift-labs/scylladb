@@ -13,7 +13,7 @@
 #include "streaming/progress_info.hh"
 #include "streaming/stream_reason.hh"
 #include <seastar/core/shared_ptr.hh>
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include "utils/updateable_value.hh"
 #include "utils/serialized_action.hh"
 #include "gms/i_endpoint_state_change_subscriber.hh"
@@ -29,6 +29,7 @@ namespace db {
 class config;
 namespace view {
 class view_builder;
+class view_building_worker;
 }
 }
 
@@ -84,6 +85,7 @@ class stream_manager : public gms::i_endpoint_state_change_subscriber, public en
 private:
     sharded<replica::database>& _db;
     db::view::view_builder& _view_builder;
+    sharded<db::view::view_building_worker>& _view_building_worker;
     sharded<netw::messaging_service>& _ms;
     sharded<service::migration_manager>& _mm;
     gms::gossiper& _gossiper;
@@ -105,6 +107,7 @@ private:
 public:
     stream_manager(db::config& cfg, sharded<replica::database>& db,
             db::view::view_builder& view_builder,
+            sharded<db::view::view_building_worker>& view_building_worker,
             sharded<netw::messaging_service>& ms,
             sharded<service::migration_manager>& mm,
             gms::gossiper& gossiper, scheduling_group sg);
@@ -169,7 +172,7 @@ public:
 
     shared_ptr<stream_session> get_session(streaming::plan_id plan_id, locator::host_id from, const char* verb, std::optional<table_id> cf_id = {});
 
-    reader_consumer_v2 make_streaming_consumer(
+    mutation_reader_consumer make_streaming_consumer(
             uint64_t estimated_partitions, stream_reason, service::frozen_topology_guard);
 public:
     virtual future<> on_dead(inet_address endpoint, locator::host_id id, endpoint_state_ptr state, gms::permit_id) override;

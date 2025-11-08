@@ -1,26 +1,28 @@
+=========================
 Administration Guide
-********************
+=========================
 
 For training material, also check out the `Admin Procedures lesson <https://university.scylladb.com/courses/scylla-operations/lessons/admin-procedures-and-basic-monitoring/>`_ on ScyllaDB University.
 
-System requirements
-===================
+System Requirements
+---------------------------
 Make sure you have met the :doc:`System Requirements </getting-started/system-requirements>`  before you install and configure ScyllaDB. 
 
 Download and Install
-====================
+---------------------------
 
 See the :doc:`getting started page </getting-started/index>` for info on installing ScyllaDB on your platform.
 
 
-System configuration
+System Configuration
 ====================
 See :ref:`System Configuration Guide <system-configuration-files-and-scripts>` for details on optimum OS settings for ScyllaDB. (These settings are performed automatically in the ScyllaDB packages, Docker containers, and Amazon AMIs.)
 
 .. _admin-scylla-configuration:
 
 ScyllaDB Configuration
-======================
+--------------------------------
+
 ScyllaDB configuration files are:
 
 +-------------------------------------------------------+-----------------------------------+
@@ -33,13 +35,11 @@ ScyllaDB configuration files are:
 +-------------------------------------------------------+-----------------------------------+
 | :code:`/etc/scylla/cassandra-rackdc.properties`       | Rack & dc configuration file      |
 +-------------------------------------------------------+-----------------------------------+
-| :code:`/etc/scylla/object_storage.yaml`               | Object storage configuration file |
-+-------------------------------------------------------+-----------------------------------+
 
 .. _check-your-current-version-of-scylla:
 
 Check your current version of ScyllaDB
---------------------------------------
+==============================================
 This command allows you to check your current version of ScyllaDB. Note that this command is not the :doc:`nodetool version </operating-scylla/nodetool-commands/version>` command which reports the CQL version.
 If you are looking for the CQL or Cassandra version, refer to the CQLSH reference for :ref:`SHOW VERSION <cqlsh-show-version>`.
 
@@ -56,7 +56,7 @@ Output displays the ScyllaDB version. Your results may differ.
 .. _admin-address-configuration-in-scylla:
 
 Address Configuration in ScyllaDB
----------------------------------
+=====================================
 
 The following addresses can be configured in scylla.yaml:
 
@@ -88,7 +88,7 @@ The following addresses can be configured in scylla.yaml:
 .. note:: When the listen_address, rpc_address, broadcast_address, and broadcast_rpc_address parameters are not set correctly, ScyllaDB does not work as expected.
 
 scylla-server
--------------
+===============
 The :code:`scylla-server` file contains configuration related to starting up the ScyllaDB server.
 
 .. _admin-scylla.yaml:
@@ -98,39 +98,40 @@ The :code:`scylla-server` file contains configuration related to starting up the
 .. _object-storage-configuration:
 
 Configuring Object Storage :label-caution:`Experimental`
-========================================================
+--------------------------------------------------------------
 
 Scylla has the ability to communicate directly with S3-compatible storage. This
 feature enables various functionalities, but requires proper configuration of
 storage endpoints.
 
-To enable S3-compatible storage features, you need to describe the endpoints and credentials
+To enable S3-compatible storage features, you need to describe the endpoints
 where SSTable files can be stored. This is done using a YAML configuration file.
 
-The ``object_storage.yaml`` file should follow this format:
+The relevant ``scylla.yaml`` section should follow this format:
 
 .. code-block:: yaml
 
-   endpoints:
+   object_storage_endpoints:
      - name: <endpoint_address_or_domain_name>
        port: <port_number>
        https: <true_or_false> # optional
        aws_region: <region_name> # optional, e.g. us-east-1
-       aws_access_key_id: <access_key> # optional
-       aws_secret_access_key: <secret_access_key> # optional
-       aws_session_token: <session_token> # optional
+       iam_role_arn: <iam_role> # optional
 
+The ``aws_region`` option can also be specified using 
+the ``AWS_DEFAULT_REGION`` environment variable.
 
-The AWS-related options (``aws_region``, ``aws_access_key_id``,
-``aws_secret_access_key``, ``aws_session_token``) can be configured in two ways:
+The AWS-related credentials options (``aws_access_key_id``,
+``aws_secret_access_key``, ``aws_session_token``) can be configured using
+the following environment variables:
 
-* Directly in the YAML file (as shown above).
-* Using environment variables:
-
-  - ``AWS_DEFAULT_REGION``
   - ``AWS_ACCESS_KEY_ID``
   - ``AWS_SECRET_ACCESS_KEY``
   - ``AWS_SESSION_TOKEN``
+
+The Scylla S3 client will first attempt to access credentials from environment variables.
+If it fails to obtain credentials, it will then try to retrieve them from the
+AWS Security Token Service (STS) or the EC2 Instance Metadata Service.
 
 .. note::
 
@@ -138,25 +139,16 @@ The AWS-related options (``aws_region``, ``aws_access_key_id``,
    - When set, these values are used by the S3 client to sign requests.
    - If not set, requests are sent unsigned, which may not be accepted by all servers.
 
-By default, Scylla looks for the configuration file named ``object_storage.yaml``
-in the same directory as ``scylla.yaml``. You can override this location using the
-:confval:`object_storage_config_file` option in ``scylla.yaml``:
-
-.. code-block:: yaml
-
-   object_storage_config_file: object_storage.yaml
-
 .. _aws-s3-configuration:
 
 Configuring AWS S3 access
--------------------------
+============================
 
-You can define endpoint details and authentication tokens in the
-``object_storage.yaml`` file. For example:
+You can define endpoint details in the ``scylla.yaml`` file. For example:
 
 .. code:: yaml
 
-   endpoints:
+   object_storage_endpoints:
      - name: s3.us-east-1.amazonaws.com
        port: 443
        https: true
@@ -165,33 +157,22 @@ You can define endpoint details and authentication tokens in the
 Local/Development Environment
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-In a local or development environment, you usually need to add
-authentication tokens to this file to ensure the client works properly.
+In a local or development environment, you usually need to set authentication
+tokens in environment variables to ensure the client works properly.
 For instance:
 
-.. code:: yaml
+.. code-block:: shell
 
-   endpoints:
-     - name: s3.us-east-2.amazonaws.com
-       port: 443
-       https: true
-       aws_region: us-east-2
-       aws_access_key_id: EXAMPLE_ACCESS_KEY_ID
-       aws_secret_access_key: EXAMPLE_SECRET_ACCESS_KEY
+   export AWS_ACCESS_KEY_ID=EXAMPLE_ACCESS_KEY_ID
+   export AWS_SECRET_ACCESS_KEY=EXAMPLE_SECRET_ACCESS_KEY
 
-Additionally, you may include an ``aws_session_token``, although this is
-not typically necessary for local or development environments:
+Additionally, you may include an `aws_session_token`, although this is not typically necessary for local or development environments:
 
-.. code:: yaml
-
-   endpoints:
-     - name: s3.us-east-2.amazonaws.com
-       port: 443
-       https: true
-       aws_region: us-east-2
-       aws_access_key_id: EXAMPLE_ACCESS_KEY_ID
-       aws_secret_access_key: EXAMPLE_SECRET_ACCESS_KEY
-       aws_session_token: EXAMPLE_TEMPORARY_SESSION_TOKEN
+.. code-block:: shell
+  
+   export AWS_ACCESS_KEY_ID=EXAMPLE_ACCESS_KEY_ID
+   export AWS_SECRET_ACCESS_KEY=EXAMPLE_SECRET_ACCESS_KEY
+   export AWS_SESSION_TOKEN=EXAMPLE_TEMPORARY_SESSION_TOKEN
 
 Important Note
 ^^^^^^^^^^^^^^^
@@ -205,11 +186,11 @@ Instance Metadata Service.
 
 For the EC2 Instance Metadata Service to function correctly, no
 additional configuration is required. However, STS requires the IAM Role
-ARN to be defined in the ``object_storage.yaml`` file, as shown below:
+ARN to be defined in the ``scylla.yaml`` file, as shown below:
 
 .. code:: yaml
 
-   endpoints:
+   object_storage_endpoints:
      - name: s3.us-east-1.amazonaws.com
        port: 443
        https: true
@@ -219,7 +200,7 @@ ARN to be defined in the ``object_storage.yaml`` file, as shown below:
 .. _admin-compression:
 
 Compression
------------
+----------------
 
 In ScyllaDB, you can configure compression at rest and compression in transit.
 For compression in transit, you can configure compression between nodes or between the client and the node.
@@ -228,7 +209,7 @@ For compression in transit, you can configure compression between nodes or betwe
 .. _admin-client-node-compression:
 
 Client - Node Compression
-^^^^^^^^^^^^^^^^^^^^^^^^^^
+===============================
 
 Compression between the client and the node is set by the driver that the application is using to access ScyllaDB.
 
@@ -243,7 +224,7 @@ Refer to the :doc:`Drivers Page </using-scylla/drivers/index>` for more drivers.
 .. _internode-compression:
 
 Internode Compression
-^^^^^^^^^^^^^^^^^^^^^
+===========================
 
 Internode compression is configured in the scylla.yaml
 
@@ -256,7 +237,7 @@ internode_compression controls whether traffic between nodes is compressed.
 Configuring TLS/SSL in scylla.yaml
 ----------------------------------
 
-ScyllaDB versions 1.1 and greater support encryption between nodes and between client and node. See the ScyllaDB :doc:`ScyllaDB TLS/SSL guide: </operating-scylla/security/index>` for configuration settings.
+ScyllaDB supports encryption between nodes and between client and node. See the ScyllaDB :doc:`ScyllaDB TLS/SSL guide: </operating-scylla/security/index>` for configuration settings.
 
 .. _cqlsh-networking:
 
@@ -272,7 +253,8 @@ The ScyllaDB ports are detailed in the table below. For ScyllaDB Manager ports, 
 All ports above need to be open to external clients (CQL) and other nodes (RPC). REST API port can be kept closed for incoming external connections.
 
 Advanced networking
--------------------
+======================
+
 It is possible that a client, or another node, may need to use a different IP address to connect to a ScyllaDB node from the address that the node is listening on. This is the case when a node is behind port forwarding. ScyllaDB allows for setting alternate IP addresses.
 
 Do not set any IP address to :code:`0.0.0.0`.
@@ -313,14 +295,14 @@ On RHEL and CentOS, the `Automatic Bug Reporting Tool <https://abrt.readthedocs.
 ScyllaDB places any core dumps in :code:`var/lib/scylla/coredump`. They are not visible with the :code:`coredumpctl` command. See the :doc:`System Configuration Guide </getting-started/system-configuration/>` for details on core dump configuration scripts. Check with ScyllaDB support before sharing any core dump, as they may contain sensitive data.
 
 Schedule fstrim
-===============
+----------------------
 
 ScyllaDB sets up daily fstrim on the filesystem(s),
 containing your ScyllaDB commitlog and data directory. This utility will
 discard, or trim, any blocks no longer in use by the filesystem.
 
 Experimental Features
-=====================
+-------------------------------
 
 ScyllaDB uses experimental flags to expose non-production-ready features safely. These features are not stable enough to be used in production, and their API will likely change, breaking backward or forward compatibility.
 
@@ -356,33 +338,29 @@ credentials and endpoint.
 
 .. _admin-views-with-tablets:
 
-Views with tablets
+Views with Tablets
 ------------------
 
-By default, Materialized Views (MV) and Secondary Indexes (SI)
-are disabled in keyspaces that use tablets.
-
-Support for MV and SI with tablets is experimental and must be explicitly
-enabled in the ``scylla.yaml`` configuration file by specifying
-the ``views-with-tablets`` option:
+Materialized Views (MV) and Secondary Indexes (SI) are enabled in keyspaces that use tablets
+only when :term:`RF-rack-valid keyspaces <RF-rack-valid keyspace>` are enforced. That can be
+done in the ``scylla.yaml`` configuration file by specifying
 
 .. code-block:: yaml
 
-   experimental_features:
-     - views-with-tablets
+   rf_rack_valid_keyspaces: true
 
 
 Monitoring
-==========
+---------------------
 ScyllaDB exposes interfaces for online monitoring, as described below.
 
 Monitoring Interfaces
----------------------
+==========================
 
 `ScyllaDB Monitoring Interfaces <https://monitoring.docs.scylladb.com/stable/reference/monitoring_apis.html>`_
 
 Monitoring Stack
-----------------
+=======================
 
 |mon_root|
 
@@ -396,13 +374,13 @@ Un-contents
 ScyllaDB is designed for high performance before tuning, for fewer layers that interact in unpredictable ways, and to use better algorithms that do not require manual tuning. The following items are found in the manuals for other data stores but do not need to appear here.
 
 Configuration un-contents
-^^^^^^^^^^^^^^^^^^^^^^^^^
+============================
 
 * Generating tokens
 * Configuring virtual nodes
 
 Operations un-contents
-^^^^^^^^^^^^^^^^^^^^^^
+============================
 
 * Tuning Bloom filters
 * Data caching
@@ -411,14 +389,14 @@ Operations un-contents
 * Compression
 
 Testing compaction and compression
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+====================================
 
 * Tuning Java resources
 * Purging gossip state on a node
 
 
 Help with ScyllaDB
-==================
+--------------------------
 Contact `Support <https://www.scylladb.com/product/support/>`_, or visit the ScyllaDB `Community <https://www.scylladb.com/open-source-community/>`_ page for peer support.
 
 .. include:: /rst_include/apache-copyrights-index.rst

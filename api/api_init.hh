@@ -18,7 +18,9 @@
 using request = http::request;
 using reply = http::reply;
 
+namespace compaction {
 class compaction_manager;
+}
 
 namespace service {
 
@@ -56,7 +58,6 @@ class sstables_format_selector;
 namespace view {
 class view_builder;
 }
-class system_keyspace;
 }
 namespace netw { class messaging_service; }
 class repair_service;
@@ -83,9 +84,9 @@ struct http_context {
     sstring api_dir;
     sstring api_doc;
     httpd::http_server_control http_server;
-    distributed<replica::database>& db;
+    sharded<replica::database>& db;
 
-    http_context(distributed<replica::database>& _db)
+    http_context(sharded<replica::database>& _db)
             : db(_db)
     {
     }
@@ -116,7 +117,7 @@ future<> set_server_token_metadata(http_context& ctx, sharded<locator::shared_to
 future<> unset_server_token_metadata(http_context& ctx);
 future<> set_server_gossip(http_context& ctx, sharded<gms::gossiper>& g);
 future<> unset_server_gossip(http_context& ctx);
-future<> set_server_column_family(http_context& ctx, sharded<db::system_keyspace>& sys_ks);
+future<> set_server_column_family(http_context& ctx, sharded<replica::database>& db);
 future<> unset_server_column_family(http_context& ctx);
 future<> set_server_messaging_service(http_context& ctx, sharded<netw::messaging_service>& ms);
 future<> unset_server_messaging_service(http_context& ctx);
@@ -126,9 +127,7 @@ future<> set_server_stream_manager(http_context& ctx, sharded<streaming::stream_
 future<> unset_server_stream_manager(http_context& ctx);
 future<> set_hinted_handoff(http_context& ctx, sharded<service::storage_proxy>& p, sharded<gms::gossiper>& g);
 future<> unset_hinted_handoff(http_context& ctx);
-future<> set_server_cache(http_context& ctx);
-future<> unset_server_cache(http_context& ctx);
-future<> set_server_compaction_manager(http_context& ctx, sharded<compaction_manager>& cm);
+future<> set_server_compaction_manager(http_context& ctx, sharded<compaction::compaction_manager>& cm);
 future<> unset_server_compaction_manager(http_context& ctx);
 future<> set_server_done(http_context& ctx);
 future<> set_server_task_manager(http_context& ctx, sharded<tasks::task_manager>& tm, lw_shared_ptr<db::config> cfg, sharded<gms::gossiper>& gossiper);
@@ -141,8 +140,6 @@ future<> set_server_raft(http_context&, sharded<service::raft_group_registry>&);
 future<> unset_server_raft(http_context&);
 future<> set_load_meter(http_context& ctx, service::load_meter& lm);
 future<> unset_load_meter(http_context& ctx);
-future<> set_format_selector(http_context& ctx, db::sstables_format_selector& sel);
-future<> unset_format_selector(http_context& ctx);
 future<> set_server_cql_server_test(http_context& ctx, cql_transport::controller& ctl);
 future<> unset_server_cql_server_test(http_context& ctx);
 future<> set_server_service_levels(http_context& ctx, cql_transport::controller& ctl, sharded<cql3::query_processor>& qp);

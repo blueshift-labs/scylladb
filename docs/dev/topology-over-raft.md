@@ -242,6 +242,8 @@ globally driven by the topology change coordinator and serialized per-tablet. Tr
 
 - rebuild - new tablet replica is rebuilt from existing ones, possibly dropping old replica afterwards (on node removal or replace)
 
+- rebuild_v2 - same as rebuild, but repairs a tablet and streams data from one replica, instead of streaming data from all replicas
+
 - repair - tablet replicas are repaired
 
 Each tablet has its own state machine for keeping state of transition stored in group0 which is part of the tablet state. It involves
@@ -332,6 +334,32 @@ stateDiagram-v2
 ```
 
 The above state transition state machine is the same for those tablet transition kinds: migration, intranode_migration, rebuild.
+
+In rebuild_v2 transition kind streaming stage is followed by the rebuild_repair stage:
+
+```mermaid
+stateDiagram-v2
+    state if_state <<choice>>
+    [*] --> allow_write_both_read_old
+    allow_write_both_read_old --> write_both_read_old
+    write_both_read_old --> rebuild_repair
+    rebuild_repair --> streaming
+    streaming --> write_both_read_new
+    write_both_read_new --> use_new
+    use_new --> cleanup
+    cleanup --> end_migration
+    end_migration --> [*]
+    allow_write_both_read_old --> cleanup_target: error
+    write_both_read_old --> cleanup_target: error
+    rebuild_repair --> cleanup_target: error
+    streaming --> cleanup_target: error
+    write_both_read_new --> if_state: error
+    if_state --> use_new: more new replicas
+    if_state --> cleanup_target: more old replicas
+    cleanup_target --> revert_migration
+    revert_migration --> [*]
+```
+
 The repair tablet transition kind is different. It transits only to the repair and end_repair stage because no token ownership is changed.
 
 The behavioral difference between "migration" and "intranode_migration" transitions is in the way "streaming" stage
@@ -445,6 +473,28 @@ tablets are co-located, their replica sets can be merged into one, since (s1 + s
 Once the new map is committed to group0, replicas will react to that by resizing their internal structure
 to match the new tablet count, and also merging the compaction groups (sstable(s) + memtable) that
 belonged to sibling tablets together.
+
+# Co-located tables
+
+Different tables within a keyspace can be co-located. This means they maintain the same tablet count, and the replica
+sets for each pair of corresponding tablets are identical.
+
+Within a group of co-located tables, one table is designated as the base table. The complete tablet map is stored in
+system.tablets for the base_table. The tablet maps for the other dependent tables consist of only a reference to the
+base table in the base_table column.  A table's co-location is determined at the time of its creation. Currently,
+altering the co-location property of an existing table is not supported. When a table is created and its tablet map is
+first created, it is determined whether the table should be co-located with another base table. If so, a tablet map
+containing a reference to the base table is created, rather than allocating new tablets.
+
+When handling tablet transitions, each operation (e.g. streaming, repair, cleanup) is applied to all tables in the
+co-location group, because the transition state is shared with all co-located tables.
+
+For many operations, it is more useful to work on groups of co-located tables as an atomic unit, instead of working on
+each table independently. For example, when the tablets load balancer makes migration decisions or resize decisions, or
+when generating migrations for keyspace_rf_change, add_tablet_replica, move_tablet in the storage service, we work on
+table groups, with the base table as a representative of the group, and we write tablet mutations only to the tablet map
+of the base table. This is because these operations generate migrations or tablet resize, which are shared operations
+for co-located tables.
 
 # Sharding with tablets
 
@@ -640,6 +690,7 @@ CREATE TABLE system.topology (
     new_cdc_generation_data_uuid timeuuid static,
     new_keyspace_rf_change_ks_name text static,
     new_keyspace_rf_change_data frozen<map<text, text>> static,
+    global_requests set<timeuuid_type> static,
     PRIMARY KEY (key, host_id)
 )
 ```
@@ -673,6 +724,8 @@ There are also a few static columns for cluster-global properties:
 - `upgrade_state` - describes the progress of the upgrade to raft-based topology.
 - `new_keyspace_rf_change_ks_name` - the name of the KS that is being the target of the scheduled ALTER KS statement
 - `new_keyspace_rf_change_data` - the KS options to be used when executing the scheduled ALTER KS statement
+- `global_requests` - contains a list of ids of pending global requests, the information about requests (type and parameters)
+                      can be obtained from topology_requests table by using request's id as a look up key.
 
 # Join procedure
 

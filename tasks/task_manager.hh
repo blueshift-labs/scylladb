@@ -153,12 +153,12 @@ public:
             task_id parent_id;
             std::string type;
             is_abortable abortable;
-            std::vector<task_essentials> failed_children;
+            utils::chunked_vector<task_essentials> failed_children;
         };
 
         class children {
             mutable foreign_task_map _children;
-            mutable std::vector<task_essentials> _finished_children;
+            mutable utils::chunked_vector<task_essentials> _finished_children;
             mutable rwlock _lock;
         public:
             bool all_finished() const noexcept;
@@ -171,7 +171,7 @@ public:
 
             // Make sure there is no race between map_children and the child's owner shard.
             template<typename Res>
-            future<std::vector<Res>> map_each_task(std::function<std::optional<Res>(const foreign_task_ptr&)> map_children,
+            future<utils::chunked_vector<Res>> map_each_task(std::function<std::optional<Res>(const foreign_task_ptr&)> map_children,
                     std::function<std::optional<Res>(const task_essentials&)> map_finished_children) const {
                 auto shared_holder = co_await _lock.hold_read_lock();
 
@@ -180,7 +180,7 @@ public:
 
                 auto kids = _children | std::views::values | std::views::transform(map_children) | deopt;
                 auto finished_kids = _finished_children | std::views::transform(map_finished_children) | deopt;
-                std::vector<Res> result;
+                utils::chunked_vector<Res> result;
                 // Want to use insert_range(), but libstd++ hasn't implemented it yet.
                 result.insert(result.end(), kids.begin(), kids.end());
                 result.insert(result.end(), finished_kids.begin(), finished_kids.end());
@@ -216,8 +216,11 @@ public:
             virtual future<> release_resources() noexcept {
                 return make_ready_future();
             }
-            future<std::vector<task_essentials>> get_failed_children() const;
+            future<utils::chunked_vector<task_essentials>> get_failed_children() const;
             void set_virtual_parent() noexcept;
+            task_id id() const noexcept;
+            task_manager::task::status& get_status() noexcept;
+            future<> done() const noexcept;
         protected:
             virtual future<> run() = 0;
             void run_to_completion();
@@ -226,8 +229,6 @@ public:
             future<> finish_failed(std::exception_ptr ex, std::string error) noexcept;
             future<> finish_failed(std::exception_ptr ex) noexcept;
             virtual future<std::optional<double>> expected_total_workload() const;
-            virtual std::optional<double> expected_children_number() const;
-            task_manager::task::progress get_binary_progress() const;
 
             friend task;
         };
@@ -260,7 +261,7 @@ public:
         void unregister_task() noexcept;
         const children& get_children() const noexcept;
         bool is_complete() const noexcept;
-        future<std::vector<task_essentials>> get_failed_children() const;
+        future<utils::chunked_vector<task_essentials>> get_failed_children() const;
         void set_virtual_parent() noexcept;
 
         friend class test_task;
@@ -280,7 +281,7 @@ public:
             impl& operator=(impl&&) = delete;
             virtual ~impl() = default;
         protected:
-            static future<std::vector<task_identity>> get_children(module_ptr module, task_id parent_id);
+            static future<utils::chunked_vector<task_identity>> get_children(module_ptr module, task_id parent_id, std::function<bool(locator::host_id)> is_host_alive);
         public:
             virtual task_group get_group() const noexcept = 0;
             // Returns std::nullopt if an operation with task_id isn't tracked by this virtual_task.
@@ -318,7 +319,7 @@ public:
         task_manager& _tm;
         std::string _name;
         tasks_collection _tasks;
-        gate _gate;
+        named_gate _gate;
         uint64_t _sequence_number = 0;
     private:
         abort_source _as;
@@ -331,7 +332,7 @@ public:
         task_manager& get_task_manager() noexcept;
         const task_manager& get_task_manager() const noexcept;
         seastar::abort_source& abort_source() noexcept;
-        gate& async_gate() noexcept;
+        named_gate& async_gate() noexcept;
         const std::string& get_name() const noexcept;
         task_manager::task_map& get_local_tasks() noexcept;
         const task_manager::task_map& get_local_tasks() const noexcept;
@@ -359,11 +360,11 @@ public:
         requires (module_ptr module, Args&&... args) {
             {TaskImpl(module, std::forward<Args>(args)...)} -> std::same_as<TaskImpl>;
         }
-        future<task_ptr> make_and_start_task(tasks::task_info parent_info, Args&&... args) {
+        future<shared_ptr<TaskImpl>> make_and_start_task(tasks::task_info parent_info, Args&&... args) {
             auto task_impl_ptr = seastar::make_shared<TaskImpl>(shared_from_this(), std::forward<Args>(args)...);
-            auto task = co_await make_task(std::move(task_impl_ptr), parent_info);
+            auto task = co_await make_task(task_impl_ptr, parent_info);
             task->start();
-            co_return task;
+            co_return task_impl_ptr;
         }
 
         // Must be called on target shard.

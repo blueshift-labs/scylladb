@@ -15,6 +15,7 @@
 
 #include "data_dictionary/storage_options.hh"
 #include "db/large_data_handler.hh"
+#include "db/corrupt_data_handler.hh"
 #include "sstables/version.hh"
 #include "sstables/sstable_directory.hh"
 #include "compaction/compaction_manager.hh"
@@ -24,7 +25,7 @@
 #include "test/lib/log.hh"
 
 namespace compaction {
-class table_state;
+class compaction_group_view;
 class compaction_task_executor;
 }
 
@@ -79,28 +80,28 @@ public:
 
 class test_env_compaction_manager {
     tasks::task_manager _tm;
-    compaction_manager _cm;
+    compaction::compaction_manager _cm;
 
 public:
     test_env_compaction_manager()
-        : _cm(_tm, compaction_manager::for_testing_tag{})
+        : _cm(_tm, compaction::compaction_manager::for_testing_tag{})
     {}
 
-    compaction_manager& get_compaction_manager() { return _cm; }
+    compaction::compaction_manager& get_compaction_manager() { return _cm; }
 
-    void propagate_replacement(compaction::table_state& table_s, const std::vector<shared_sstable>& removed, const std::vector<shared_sstable>& added);
+    void propagate_replacement(compaction::compaction_group_view& table_s, const std::vector<shared_sstable>& removed, const std::vector<shared_sstable>& added);
 
     future<> perform_compaction(shared_ptr<compaction::compaction_task_executor> task);
 };
 
 struct test_env_config {
     db::large_data_handler* large_data_handler = nullptr;
+    db::corrupt_data_handler* corrupt_data_handler = nullptr;
     data_dictionary::storage_options storage; // will be local by default
-    bool use_uuid = true;
     size_t available_memory = memory::stats().total_memory();
 };
 
-data_dictionary::storage_options make_test_object_storage_options();
+data_dictionary::storage_options make_test_object_storage_options(std::string_view type);
 
 class test_env {
     struct impl;
@@ -109,7 +110,7 @@ public:
 
     void maybe_start_compaction_manager(bool enable = true);
 
-    explicit test_env(test_env_config cfg = {}, sstables::storage_manager* sstm = nullptr, tmpdir* tmp = nullptr);
+    explicit test_env(test_env_config cfg, sstable_compressor_factory&, sstables::storage_manager* sstm = nullptr, tmpdir* tmp = nullptr);
     ~test_env();
     test_env(test_env&&) noexcept;
 
@@ -119,13 +120,13 @@ public:
 
     shared_sstable make_sstable(schema_ptr schema, sstring dir, sstables::generation_type generation,
             sstable::version_types v = sstables::get_highest_sstable_version(), sstable::format_types f = sstable::format_types::big,
-            size_t buffer_size = default_sstable_buffer_size, gc_clock::time_point now = gc_clock::now());
+            size_t buffer_size = default_sstable_buffer_size, db_clock::time_point now = db_clock::now());
 
     shared_sstable make_sstable(schema_ptr schema, sstring dir, sstable::version_types v = sstables::get_highest_sstable_version());
 
     shared_sstable make_sstable(schema_ptr schema, sstables::generation_type generation,
             sstable::version_types v = sstables::get_highest_sstable_version(), sstable::format_types f = sstable::format_types::big,
-            size_t buffer_size = default_sstable_buffer_size, gc_clock::time_point now = gc_clock::now());
+            size_t buffer_size = default_sstable_buffer_size, db_clock::time_point now = db_clock::now());
 
     shared_sstable make_sstable(schema_ptr schema, sstable::version_types v = sstables::get_highest_sstable_version());
 
@@ -176,15 +177,6 @@ public:
 
     replica::table::config make_table_config();
 
-    template <typename Func>
-    static inline auto do_with(Func&& func, test_env_config cfg = {}) {
-        return seastar::do_with(test_env(std::move(cfg)), [func = std::move(func)] (test_env& env) mutable {
-            return futurize_invoke(func, env).finally([&env] {
-                return env.stop();
-            });
-        });
-    }
-
     static future<> do_with_async(noncopyable_function<void (test_env&)> func, test_env_config cfg = {});
 
     static future<> do_with_sharded_async(noncopyable_function<void (sharded<test_env>&)> func);
@@ -192,7 +184,8 @@ public:
     template <typename T>
     static future<T> do_with_async_returning(noncopyable_function<T (test_env&)> func) {
         return seastar::async([func = std::move(func)] {
-            test_env env;
+            auto scf = make_sstable_compressor_factory_for_tests_in_thread();
+            test_env env({}, *scf);
             auto stop = defer([&] { env.stop().get(); });
             return func(env);
         });
@@ -201,6 +194,9 @@ public:
     table_for_tests make_table_for_tests(schema_ptr s, sstring dir);
 
     table_for_tests make_table_for_tests(schema_ptr s = nullptr);
+
+    // Must run in a thread.
+    sstables::sstable_set make_sstable_set(compaction::compaction_strategy& cs, schema_ptr s);
 
     void request_abort();
 };

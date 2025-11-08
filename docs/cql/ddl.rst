@@ -60,11 +60,11 @@ Keyspace and table names are defined by the following grammar:
    keyspace_name: `name`
    table_name: [ `keyspace_name` '.' ] `name`
    name: `unquoted_name` | `quoted_name`
-   unquoted_name: re('[a-zA-Z_0-9]{1, 48}')
+   unquoted_name: re('[a-zA-Z_0-9]{1, 192}')
    quoted_name: '"' `unquoted_name` '"'
 
 Both keyspace and table names consist of only alphanumeric characters, cannot be empty, and are limited in
-size to 48 characters (that limit exists mostly to avoid filenames, which may include the keyspace and table name, to go
+size to 192 characters (that limit exists mostly to avoid filenames, which may include the keyspace and table name, to go
 over the limits of certain file systems). By default, keyspace and table names are case insensitive (``myTable`` is
 equivalent to ``mytable``), but case sensitivity can be forced by using double-quotes (``"myTable"`` is different from
 ``mytable``).
@@ -88,7 +88,7 @@ We also define the notion of statement options for use in the following section:
 
 .. _create-keyspace-statement:
 
-In all cases, for creating keyspaces and tables, if you are using :doc:`Reserved Keywords </cql/reserved-keywords>`, enclose them in single or double-quotes.
+In all cases, for creating keyspaces and tables, if you are using :ref:`reserved keywords <appendix-A>`, enclose them in single or double-quotes.
 
 CREATE KEYSPACE
 ^^^^^^^^^^^^^^^
@@ -97,31 +97,35 @@ A keyspace is created using a ``CREATE KEYSPACE`` statement:
 
 .. code-block:: cql
 
-   create_keyspace_statement: CREATE KEYSPACE [ IF NOT EXISTS ] `keyspace_name` WITH `options`
+   create_keyspace_statement: CREATE KEYSPACE [ IF NOT EXISTS ] `keyspace_name` [ WITH `options` ]
 
 For example:
 
 .. code-block:: cql
 
    CREATE KEYSPACE Excalibur
-   WITH replication = {'class': 'NetworkTopologyStrategy', 'DC1' : 1, 'DC2' : 3}
+   WITH replication = {'class': 'NetworkTopologyStrategy', 'DC1' : ['RAC1', 'RAC2', 'RAC3'], 'DC2' : 3}
    AND durable_writes = true;
 
 The supported ``options`` are:
 
-=================== ========== =========== ========= ===================================================================
-name                 kind       mandatory   default   description
-=================== ========== =========== ========= ===================================================================
-``replication``      *map*      yes                   The replication strategy and options to use for the keyspace (see
-                                                      details below).
-``durable_writes``   *simple*   no          true      Whether to use the commit log for updates on this keyspace
-                                                      (disable this option at your own risk!).
-``tablets``          *map*      no                    Enables or disables tablets for the keyspace (see :ref:`tablets <tablets>`)
-=================== ========== =========== ========= ===================================================================
+=================== ========== =========== =========== ===================================================================
+name                 kind       mandatory    default    description
+=================== ========== =========== =========== ===================================================================
+``replication``      *map*      no                      The replication strategy and options to use for the keyspace (see
+                                                        details below).
+``durable_writes``   *simple*   no           true       Whether to use the commit log for updates on this keyspace
+                                                        (disable this option at your own risk!).
+``tablets``          *map*      no                      Enables or disables tablets for the keyspace (see :ref:`tablets <tablets>`)
+``consistency``      *simple*   no          `eventual`  Configures consistency mode for the keyspace (see :ref:`consistency <consistency-option>`).
+=================== ========== =========== =========== ===================================================================
 
-The ``replication`` property is mandatory and must at least contains the ``'class'`` sub-option, which defines the
-replication strategy class to use. The rest of the sub-options depend on what replication
-strategy is used. By default, ScyllaDB supports the following ``'class'``:
+The ``replication`` property is optional. Omitting it is equivalent to supplying an empty map (``replication = {}``),
+and default value will be applied for each sub-option.
+The ``replication`` property contains the ``'class'`` sub-option, which defines the replication strategy class to use.
+If ``'class'`` is not specified, it defaults to ``'NetworkTopologyStrategy'``.
+The rest of the sub-options depend on what replication strategy is used.
+By default, ScyllaDB supports the following ``'class'``:
 
 .. _replication-strategy:
 
@@ -154,23 +158,49 @@ factor independently for each data-center. The rest of the sub-options are
 key-value pairs where a key is a data-center name and its value is the
 associated replication factor. Options:
 
-===================================== ====== =============================================
-sub-option                             type  description
-===================================== ====== =============================================
-``'<datacenter>'``                     int   The number of replicas to store per range in
-                                             the provided datacenter.
-``'replication_factor'``               int   The number of replicas to use as a default
-                                             per datacenter if not specifically provided.
-                                             Note that this always defers to existing
-                                             definitions or explicit datacenter settings.
-                                             For example, to have three replicas per
-                                             datacenter, supply this with a value of 3.
+===================================== ========= =============================================
+sub-option                             type      description
+===================================== ========= =============================================
+``'<datacenter>'``                     int|list The number of replicas to store per range in
+                                                the provided datacenter, or a :ref:`list of rack names <rack_list_rf>`
+                                                to place replicas.
 
-                                             The replication factor configured for a DC
-                                             should be equal to or lower than the number
-                                             of nodes in that DC. Configuring a higher RF 
-                                             may prevent creating tables in that keyspace. 
-===================================== ====== =============================================
+                                                :ref:`Rack list <rack_list_rf>` is only allowed
+                                                for tablets-based keyspaces, and recommended.
+
+                                                Altering from a rack list to numerical RF
+                                                is not supported.
+
+``'replication_factor'``               int      The number of replicas to use as a default
+                                                per datacenter if not specifically provided.
+
+                                                Note that this always defers to existing
+                                                definitions or explicit datacenter settings.
+                                                For example, to have three replicas per
+                                                datacenter, supply this with a value of 3.
+
+                                                The replication factor configured for a DC
+                                                should be equal to or lower than the number
+                                                of nodes in that DC. Configuring a higher RF
+                                                may prevent creating tables in that keyspace.
+===================================== ========= =============================================
+
+If no datacenters are specified, and ``replication_factor`` is left unspecified,
+then every rack in every datacenter receives a replica, except for racks comprised
+of only :doc:`zero-token nodes </architecture/zero-token-nodes>`. Racks added after
+the keyspace creation do not receive replicas.
+
+When ``rf_rack_valid_keyspaces``` is enabled in the config and the keyspace is tablet-based,
+the numeric replication factor is automatically expanded into a rack list when the statement is
+executed, which can be observed in the DESCRIBE output afterwards. If the numeric RF is smaller than
+the number of racks in a DC, a subset of racks is chosen arbitrarily.
+
+Altering from a rack list to a numeric replication factor is not supported, except
+for two cases. One is setting replication factor to 0, in which case the number of replicas is reduced to 0 in that DC.
+The other is when the numeric replication factor is equal to the current number of replicas
+for a given datacanter, in which case the current rack list is preserved.
+
+Altering from a numeric replication factor to a rack list is not supported yet.
 
 Note that when ``ALTER`` ing keyspaces and supplying ``replication_factor``,
 auto-expansion will only *add* new datacenters for safety, it will not alter
@@ -202,6 +232,37 @@ An example that excludes a datacenter while using ``replication_factor``::
 
     DESCRIBE KEYSPACE excalibur
         CREATE KEYSPACE excalibur WITH replication = {'class': 'NetworkTopologyStrategy', 'DC1': '3'} AND durable_writes = true;
+
+An example that excludes class and uses only datacenter options::
+
+    CREATE KEYSPACE excalibur
+        WITH replication = {'DC1': '3'} ;
+
+    DESCRIBE KEYSPACE excalibur
+        CREATE KEYSPACE excalibur WITH replication = {'class': 'NetworkTopologyStrategy', 'DC1': '3'} AND durable_writes = true;
+
+An example that excludes datacenter options and uses only class::
+
+    CREATE KEYSPACE excalibur
+        WITH replication = {'class': 'NetworkTopologyStrategy'} ;
+
+    DESCRIBE KEYSPACE excalibur
+        CREATE KEYSPACE excalibur WITH replication = {'class': 'NetworkTopologyStrategy', 'DC1': '3', 'DC2': '2'} AND durable_writes = true;
+
+An example that excludes both class and datacenter options::
+
+    CREATE KEYSPACE excalibur
+        WITH replication = {} ;
+
+    DESCRIBE KEYSPACE excalibur
+        CREATE KEYSPACE excalibur WITH replication = {'class': 'NetworkTopologyStrategy', 'DC1': '3', 'DC2': '2'} AND durable_writes = true;
+
+An example that excludes the whole ``replication`` option::
+
+    CREATE KEYSPACE excalibur ;
+
+    DESCRIBE KEYSPACE excalibur
+        CREATE KEYSPACE excalibur WITH replication = {'class': 'NetworkTopologyStrategy', 'DC1': '3', 'DC2': '2'} AND durable_writes = true;
 
 .. _tablets:
 
@@ -259,6 +320,20 @@ As an alternative, you can configure your keyspace to be stored
 on Amazon S3 or another S3-compatible object store.
 See :ref:`Keyspace storage options <admin-keyspace-storage-options>` for details.
 
+.. _consistency-option:
+
+Keyspace ``consistency`` options :label-caution:`Experimental`
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Experimental option that allows to configure consistency for all tables in
+a keyspace.  By default the consistency is `eventual`. But you can change
+it to strong consistency by setting the `consistency` option to `local`
+or `global` where `local` means that strong consistency is guaranteed
+only for operations going to the same DC and `global` means that strong
+consistency is guaranteed for operations going to all DCs. Note that
+`local` or `global` consistencies are guaranteed only for requests that
+are going to the same partition.
+
 .. _use-statement:        
         
 USE
@@ -302,6 +377,60 @@ Modifying a keyspace with tablets enabled is possible and doesn't require any sp
 - The ``ALTER`` statement may take longer than the regular query timeout, and even if it times out, it will continue to execute in the background.
 - The replication strategy cannot be modified, as keyspaces with tablets only support ``NetworkTopologyStrategy``.
 - The ``ALTER`` statement will fail if it would make the keyspace :term:`RF-rack-invalid <RF-rack-valid keyspace>`.
+- After the ``ALTER`` statement that increases the RF finishes, client applications should be restarted. Without a restart, drivers will not know about new replicas, which may cause request imbalance.
+
+.. _rack_list_rf:
+
+Rack-list replication factor
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+With tablets, replication factor can be a rack list instead of a number. This will limit placement of replicas to those
+specific racks in a given DC, with exactly one replica per rack. It guarantees that replicas never move across racks
+during load balancing.
+
+This is the recommended way of specifying replication with tablets. Some features will only work with keyspaces which
+are using rack lists for replication factor, and attempt to use them will be rejected otherwise.
+Also, load-balancing is more efficient if keyspaces specify replication like this.
+The numerical replication factor for tablets will be deprecated in the future.
+
+To create a keyspace using rack-list replication factor:
+
+.. code-block:: cql
+
+  CREATE KEYSPACE Excelsior
+   WITH replication = { 'class' : 'NetworkTopologyStrategy', 'dc1' : ['RAC1', 'RAC2']};
+
+The rack list can be altered, and it must differ by exactly one rack from the current list, with rack being either removed or added.
+For example:
+
+.. code-block:: cql
+
+  CREATE KEYSPACE Excelsior
+   WITH replication = { 'class' : 'NetworkTopologyStrategy', 'dc1' : ['RAC1', 'RAC2']};
+
+  ALTER KEYSPACE Excelsior
+   WITH replication = { 'class' : 'NetworkTopologyStrategy', 'dc1' : ['RAC1', 'RACK2', 'RAC3']};
+
+  ALTER KEYSPACE Excelsior
+   WITH replication = { 'class' : 'NetworkTopologyStrategy', 'dc1' : ['RAC2', 'RAC3']};
+
+  ALTER KEYSPACE Excelsior
+   WITH replication = { 'class' : 'NetworkTopologyStrategy', 'dc1' : ['RAC2', 'RAC3'], 'dc2': ['RAC4']};
+
+Altering a rack list triggers tablet rebuild in the new rack, and the statement completes when rebuild is finished.
+No need for manual repair afterwards.
+
+An empty list is allowed, and it's equivalent to numeric replication factor of 0:
+
+.. code-block:: cql
+
+  ALTER KEYSPACE Excelsior
+   WITH replication = { 'class' : 'NetworkTopologyStrategy', dc2' : []};
+
+
+Altering from a rack list to a numeric replication factor is not supported.
+
+Keyspaces which use rack lists are :term:`RF-rack-valid <RF-rack-valid keyspace>`.
 
 .. _drop-keyspace-statement:
 

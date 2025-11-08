@@ -23,14 +23,15 @@ async def test_not_enough_token_owners(manager: ManagerClient):
     """
     logging.info('Trying to add a zero-token server as the first server in the cluster')
     await manager.server_add(config={'join_ring': False},
+                             property_file={"dc": "dc1", "rack": "rz"},
                              expected_error='Cannot start the first node in the cluster as zero-token')
 
     logging.info('Adding the first server')
-    server_a = await manager.server_add()
+    server_a = await manager.server_add(property_file={"dc": "dc1", "rack": "r1"})
 
     logging.info('Adding two zero-token servers')
     # The second server is needed only to preserve the Raft majority.
-    server_b = (await manager.servers_add(2, config={'join_ring': False}))[0]
+    server_b = (await manager.servers_add(2, config={'join_ring': False}, property_file={"dc": "dc1", "rack": "rz"}))[0]
 
     logging.info(f'Trying to decommission the only token owner {server_a}')
     await manager.decommission_node(server_a.server_id,
@@ -47,7 +48,7 @@ async def test_not_enough_token_owners(manager: ManagerClient):
     await manager.server_start(server_a.server_id)
 
     logging.info('Adding a normal server')
-    await manager.server_add()
+    await manager.server_add(property_file={"dc": "dc1", "rack": "r2"})
 
     cql = manager.get_cql()
 
@@ -60,11 +61,11 @@ async def test_not_enough_token_owners(manager: ManagerClient):
         # FIXME: Once scylladb/scylladb#16195 is fixed, we will have to replace the expected error message.
         # A similar change may be needed for remove_node below.
         logging.info(f'Trying to decommission {server_a} - one of the two token owners')
-        await manager.decommission_node(server_a.server_id, expected_error='Unable to find new replica for tablet')
+        await manager.decommission_node(server_a.server_id, expected_error='Decommission failed')
 
         logging.info(f'Stopping {server_a}')
         await manager.server_stop_gracefully(server_a.server_id)
 
         logging.info(f'Trying to remove {server_a}, one of the two token owners, by {server_b}')
         await manager.remove_node(server_b.server_id, server_a.server_id,
-                                  expected_error='Unable to find new replica for tablet')
+                                  expected_error='Removenode failed')

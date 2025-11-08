@@ -20,7 +20,7 @@
 #include "utils/extremum_tracking.hh"
 #include "mutation/mutation_cleaner.hh"
 #include "utils/double-decker.hh"
-#include "readers/empty_v2.hh"
+#include "readers/empty.hh"
 #include "readers/mutation_source.hh"
 
 class frozen_mutation;
@@ -104,7 +104,11 @@ class dirty_memory_manager;
 struct table_stats;
 
 // Managed by lw_shared_ptr<>.
-class memtable final : public enable_lw_shared_from_this<memtable>, private dirty_memory_manager_logalloc::size_tracked_region {
+class memtable final
+    : public enable_lw_shared_from_this<memtable>
+    , public boost::intrusive::list_base_hook<boost::intrusive::link_mode<boost::intrusive::auto_unlink>>
+    , private dirty_memory_manager_logalloc::size_tracked_region
+    , public logalloc::region_listener {
 public:
     using partitions_type = double_decker<int64_t, memtable_entry,
                             dht::raw_token_less_comparator, dht::ring_position_comparator,
@@ -126,7 +130,25 @@ private:
     // mutation_source is necessary for the combined mutation source to be
     // monotonic. That combined source in this case is cache + memtable.
     mutation_source_opt _underlying;
-    uint64_t _flushed_memory = 0;
+    bool _merging_into_cache = false;
+    // Tracks the difference between the amount of memory "spooled" during the flush
+    // and the memory freed during the flush.
+    //
+    // If positive, this is equal to the difference between the amount of "spooled" memory
+    // registered in dirty_memory_manager with account_potentially_cleaned_up_memory
+    // and unregistered with revert_potentially_cleaned_up_memory.
+    // If negative, the above difference is 0.
+    int64_t _flushed_memory = 0;
+    // For most of the time, this is equal to occupancy().total_memory.
+    // But we want to know the current memory usage in our logalloc::region_listener
+    // handlers, and at that point in time occupancy() is undefined. (LSA can choose to
+    // update it before or after the handler). So we track it ourselves, based on the deltas
+    // passed to the handlers.
+    uint64_t _total_memory = 0;
+    // During LSA compaction, _total_memory can fluctuate up and down.
+    // But we are only interested in the maximal total decrease since the beginning of flush.
+    // This tracks the lowest value of _total_memory seen during the flush.
+    uint64_t _total_memory_low_watermark_during_flush = 0;
     bool _merged_into_cache = false;
     replica::table_stats& _table_stats;
 
@@ -180,6 +202,8 @@ private:
         }
     } _stats_collector;
 
+    std::optional<tombstone_gc_state_snapshot> _tombstone_gc_snapshot;
+
     void update(db::rp_handle&&);
     friend class ::row_cache;
     friend class memtable_entry;
@@ -194,12 +218,12 @@ private:
     void add_flushed_memory(uint64_t);
     void remove_flushed_memory(uint64_t);
     void clear() noexcept;
-    uint64_t dirty_size() const;
 public:
     explicit memtable(schema_ptr schema, dirty_memory_manager&,
             memtable_table_shared_data& shared_data,
             replica::table_stats& table_stats, memtable_list *memtable_list = nullptr,
-            seastar::scheduling_group compaction_scheduling_group = seastar::current_scheduling_group());
+            seastar::scheduling_group compaction_scheduling_group = seastar::current_scheduling_group(),
+            shared_tombstone_gc_state* shared_gc_state = nullptr);
     // Used for testing that want to control the flush process.
     explicit memtable(schema_ptr schema);
     ~memtable();
@@ -269,21 +293,21 @@ public:
     // The 'range' parameter must be live as long as the reader is being used
     //
     // Mutations returned by the reader will all have given schema.
-    mutation_reader make_flat_reader(schema_ptr s,
+    mutation_reader make_mutation_reader(schema_ptr s,
                                              reader_permit permit,
                                              const dht::partition_range& range,
                                              const query::partition_slice& slice,
                                              tracing::trace_state_ptr trace_state_ptr = nullptr,
                                              streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
                                              mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes) {
-        if (auto reader_opt = make_flat_reader_opt(s, permit, range, slice, std::move(trace_state_ptr), fwd, fwd_mr)) {
+        if (auto reader_opt = make_mutation_reader_opt(s, permit, range, slice, std::move(trace_state_ptr), fwd, fwd_mr)) {
             return std::move(*reader_opt);
         }
-        [[unlikely]] return make_empty_flat_reader_v2(std::move(s), std::move(permit));
+        [[unlikely]] return make_empty_mutation_reader(std::move(s), std::move(permit));
     }
-    // Same as make_flat_reader, but returns an empty optional instead of a no-op reader when there is nothing to
+    // Same as make_mutation_reader, but returns an empty optional instead of a no-op reader when there is nothing to
     // read. This is an optimization.
-    mutation_reader_opt make_flat_reader_opt(schema_ptr query_schema,
+    mutation_reader_opt make_mutation_reader_opt(schema_ptr query_schema,
                                           reader_permit permit,
                                           const dht::partition_range& range,
                                           const query::partition_slice& slice,
@@ -291,11 +315,11 @@ public:
                                           streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
                                           mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes);
 
-    mutation_reader make_flat_reader(schema_ptr s,
+    mutation_reader make_mutation_reader(schema_ptr s,
                                              reader_permit permit,
                                              const dht::partition_range& range = query::full_partition_range) {
         auto& full_slice = s->full_slice();
-        return make_flat_reader(s, std::move(permit), range, full_slice);
+        return make_mutation_reader(s, std::move(permit), range, full_slice);
     }
 
     mutation_reader make_flush_reader(schema_ptr, reader_permit permit);
@@ -304,6 +328,7 @@ public:
 
     bool empty() const noexcept { return partitions.empty(); }
     void mark_flushed(mutation_source) noexcept;
+    bool is_merging_to_cache() const noexcept;
     bool is_flushed() const noexcept;
     void on_detach_from_region_group() noexcept;
     void revert_flushed_memory() noexcept;
@@ -325,6 +350,18 @@ public:
     dirty_memory_manager& get_dirty_memory_manager() noexcept {
         return _dirty_mgr;
     }
+
+    const tombstone_gc_state_snapshot* get_tombstone_gc_state_snapshot() const noexcept {
+        return _tombstone_gc_snapshot ? &_tombstone_gc_snapshot.value() : nullptr;
+    }
+
+    // Implementation of region_listener.
+    virtual void increase_usage(logalloc::region* r, ssize_t delta) override;
+    virtual void decrease_evictable_usage(logalloc::region* r) override;
+    virtual void decrease_usage(logalloc::region* r, ssize_t delta) override;
+    virtual void add(logalloc::region* r) override;
+    virtual void del(logalloc::region* r) override;
+    virtual void moved(logalloc::region* old_address, logalloc::region* new_address) override;
 
     friend fmt::formatter<memtable>;
 };

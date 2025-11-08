@@ -13,6 +13,7 @@
 #include <seastar/core/app-template.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/thread.hh>
+#include <seastar/core/coroutine.hh>
 #include <seastar/rpc/rpc_types.hh>
 #include <seastar/util/closeable.hh>
 #include "db/config.hh"
@@ -75,8 +76,8 @@ public:
             digests.push_back(gms::gossip_digest(ep1, gen++, ver++));
             digests.push_back(gms::gossip_digest(ep2, gen++, ver++));
             std::map<inet_address, endpoint_state> eps{
-                {ep1, endpoint_state()},
-                {ep2, endpoint_state()},
+                {ep1, endpoint_state(ep1)},
+                {ep2, endpoint_state(ep2)},
             };
             gms::gossip_digest_ack ack(std::move(digests), std::move(eps));
             // FIXME: discarded future.
@@ -92,7 +93,7 @@ public:
             // Prepare gossip_digest_ack2 message
             auto ep1 = inet_address("3.3.3.3");
             std::map<inet_address, endpoint_state> eps{
-                {ep1, endpoint_state()},
+                {ep1, endpoint_state(ep1)},
             };
             gms::gossip_digest_ack2 ack2(std::move(eps));
             // FIXME: discarded future.
@@ -108,7 +109,7 @@ public:
             return make_ready_future<rpc::no_wait_type>(netw::messaging_service::no_wait());
         });
 
-        ser::gossip_rpc_verbs::register_gossip_shutdown(&ms, [] (inet_address from, rpc::optional<int64_t> generation_number_opt) {
+        ser::gossip_rpc_verbs::register_gossip_shutdown(&ms, [] (const rpc::client_info& cinfo, inet_address from, rpc::optional<int64_t> generation_number_opt) {
             test_logger.info("Server got shutdown msg = {}", from);
             return make_ready_future<rpc::no_wait_type>(netw::messaging_service::no_wait());
         });
@@ -137,7 +138,7 @@ public:
         utils::chunked_vector<gms::gossip_digest> digests;
         digests.push_back(gms::gossip_digest(ep1, gen++, ver++));
         digests.push_back(gms::gossip_digest(ep2, gen++, ver++));
-        gms::gossip_digest_syn syn("my_cluster", "my_partition", digests, utils::null_uuid());
+        gms::gossip_digest_syn syn("my_cluster", "my_partition", digests, utils::null_uuid(), utils::null_uuid());
         return ser::gossip_rpc_verbs::send_gossip_digest_syn(&ms, id, std::move(syn)).then([this] {
             test_logger.info("Sent gossip sigest syn. Waiting for digest_test_done...");
             return digest_test_done.get_future();
@@ -157,15 +158,12 @@ public:
     future<> test_echo() {
         test_logger.info("=== {} ===", __func__);
         int64_t gen = 0x1;
-        return ser::gossip_rpc_verbs::send_gossip_echo(&ms, _server_id, netw::messaging_service::clock_type::now() + std::chrono::seconds(10), gen, false).then_wrapped([] (auto&& f) {
-            try {
-                f.get();
-                return make_ready_future<>();
-            } catch (std::runtime_error& e) {
-                test_logger.error("test_echo: {}", e.what());
-            }
-            return make_ready_future<>();
-        });
+        abort_source as;
+        try {
+            co_await ser::gossip_rpc_verbs::send_gossip_echo(&ms, _server_id, netw::messaging_service::clock_type::now() + std::chrono::seconds(10), as, gen, false);
+        } catch (...) {
+            test_logger.error("test_echo: {}", std::current_exception());
+        }
     }
 };
 
@@ -181,10 +179,10 @@ int main(int ac, char ** av) {
         ("stay-alive", bpo::value<bool>()->default_value(false), "Do not kill the test server after the test")
         ("cpuid", bpo::value<uint32_t>()->default_value(0), "Server cpuid");
 
-    distributed<replica::database> db;
+    sharded<replica::database> db;
     sharded<auth::service> auth_service;
     locator::shared_token_metadata tm({}, {});
-    distributed<qos::service_level_controller> sl_controller;
+    sharded<qos::service_level_controller> sl_controller;
 
     return app.run_deprecated(ac, av, [&app, &auth_service, &tm, &sl_controller] {
         return seastar::async([&app, &auth_service, &tm, &sl_controller] {
@@ -202,11 +200,11 @@ int main(int ac, char ** av) {
             as.start().get();
             auto stop_as = defer([&as] { as.stop().get(); });
             sl_controller.start(std::ref(auth_service), std::ref(tm), std::ref(as), qos::service_level_options{.shares = 1000}, default_scheduling_group).get();
-            seastar::sharded<utils::walltime_compressor_tracker> compressor_tracker;
-            compressor_tracker.start([] { return utils::walltime_compressor_tracker::config{}; }).get();
+            seastar::sharded<netw::walltime_compressor_tracker> compressor_tracker;
+            compressor_tracker.start([] { return netw::walltime_compressor_tracker::config{}; }).get();
             auto stop_compressor_tracker = deferred_stop(compressor_tracker);
             seastar::sharded<gms::feature_service> feature_service;
-            auto cfg = gms::feature_config_from_db_config(db::config(), {});
+            gms::feature_config cfg;
             feature_service.start(cfg).get();
             seastar::sharded<gms::gossip_address_map> gossip_address_map;
             gossip_address_map.start().get();

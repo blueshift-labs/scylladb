@@ -14,6 +14,7 @@
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/lowres_clock.hh>
+#include "init.hh"
 #include "data_dictionary/user_types_metadata.hh"
 #include "schema/schema_registry.hh"
 #include "schema/schema_builder.hh"
@@ -26,6 +27,7 @@
 #include "test/lib/cql_test_env.hh"
 #include "gms/feature_service.hh"
 #include "view_info.hh"
+#include "mutation/async_utils.hh"
 
 BOOST_AUTO_TEST_SUITE(schema_registry_test)
 
@@ -46,7 +48,7 @@ struct dummy_init {
     seastar::lowres_clock::duration grace_period;
     dummy_init()
             : config(std::make_unique<db::config>())
-            , fs(gms::feature_config_from_db_config(*config))
+            , fs({get_disabled_features_from_db_config(*config)})
             , grace_period(std::chrono::seconds(config->schema_registry_grace_period())) {
         local_schema_registry().init(db::schema_ctxt(*config, std::make_shared<data_dictionary::dummy_user_types_storage>(), fs));
     }
@@ -62,7 +64,7 @@ SEASTAR_THREAD_TEST_CASE(test_load_with_non_nantive_type) {
            .build();
 
     local_schema_registry().get_or_load(s->version(), [s] (table_schema_version) {
-        return make_ready_future<base_and_view_schemas>(frozen_schema(s));
+        return make_ready_future<view_schema_and_base_info>(frozen_schema(s));
     }).get();
 }
 
@@ -73,7 +75,7 @@ SEASTAR_TEST_CASE(test_async_loading) {
         auto s2 = random_schema();
 
         auto s1_loaded = local_schema_registry().get_or_load(s1->version(), [s1] (table_schema_version) {
-            return make_ready_future<base_and_view_schemas>(frozen_schema(s1));
+            return make_ready_future<view_schema_and_base_info>(frozen_schema(s1));
         }).get();
 
         BOOST_REQUIRE(s1_loaded);
@@ -82,7 +84,7 @@ SEASTAR_TEST_CASE(test_async_loading) {
         BOOST_REQUIRE(s1_later);
 
         auto s2_loaded = local_schema_registry().get_or_load(s2->version(), [s2] (table_schema_version) {
-            return yield().then([s2] -> base_and_view_schemas { return {frozen_schema(s2)}; });
+            return yield().then([s2] -> view_schema_and_base_info { return {frozen_schema(s2)}; });
         }).get();
 
         BOOST_REQUIRE(s2_loaded);
@@ -96,7 +98,7 @@ SEASTAR_TEST_CASE(test_schema_is_synced_when_syncer_doesnt_defer) {
     return seastar::async([] {
         dummy_init dummy;
         auto s = random_schema();
-        s = local_schema_registry().get_or_load(s->version(), [s] (table_schema_version) -> base_and_view_schemas { return {frozen_schema(s)}; });
+        s = local_schema_registry().get_or_load(s->version(), [s] (table_schema_version) -> view_schema_and_base_info { return {frozen_schema(s)}; });
         BOOST_REQUIRE(!s->is_synced());
         s->registry_entry()->maybe_sync([] { return make_ready_future<>(); }).get();
         BOOST_REQUIRE(s->is_synced());
@@ -107,7 +109,7 @@ SEASTAR_TEST_CASE(test_schema_is_synced_when_syncer_defers) {
     return seastar::async([] {
         dummy_init dummy;
         auto s = random_schema();
-        s = local_schema_registry().get_or_load(s->version(), [s] (table_schema_version) -> base_and_view_schemas { return {frozen_schema(s)}; });
+        s = local_schema_registry().get_or_load(s->version(), [s] (table_schema_version) -> view_schema_and_base_info { return {frozen_schema(s)}; });
         BOOST_REQUIRE(!s->is_synced());
         s->registry_entry()->maybe_sync([] { return yield(); }).get();
         BOOST_REQUIRE(s->is_synced());
@@ -118,7 +120,7 @@ SEASTAR_TEST_CASE(test_failed_sync_can_be_retried) {
     return seastar::async([] {
         dummy_init dummy;
         auto s = random_schema();
-        s = local_schema_registry().get_or_load(s->version(), [s] (table_schema_version) -> base_and_view_schemas { return {frozen_schema(s)}; });
+        s = local_schema_registry().get_or_load(s->version(), [s] (table_schema_version) -> view_schema_and_base_info { return {frozen_schema(s)}; });
         BOOST_REQUIRE(!s->is_synced());
 
         promise<> fail_sync;
@@ -172,9 +174,9 @@ SEASTAR_THREAD_TEST_CASE(test_table_is_attached) {
         // Use schema mutations so that table id is the same as in s0.
         {
             auto sm0 = db::schema_tables::make_schema_mutations(s0, api::new_timestamp(), true);
-            std::vector<mutation> muts;
+            utils::chunked_vector<mutation> muts;
             sm0.copy_to(muts);
-            db::schema_tables::merge_schema(e.get_system_keyspace(), e.get_storage_proxy(),
+            db::schema_tables::merge_schema(e.get_system_keyspace(), e.get_storage_proxy(), e.get_storage_service(),
                                             e.get_feature_service().local(), muts).get();
         }
 
@@ -206,7 +208,7 @@ SEASTAR_THREAD_TEST_CASE(test_table_is_attached) {
                 .with_column(random_column_name(), bytes_type)
                 .build();
 
-        auto learned_s2 = local_schema_registry().get_or_load(s2->version(), [&] (table_schema_version) -> base_and_view_schemas {
+        auto learned_s2 = local_schema_registry().get_or_load(s2->version(), [&] (table_schema_version) -> view_schema_and_base_info {
             return {frozen_schema(s2)};
         });
         BOOST_REQUIRE(learned_s2->maybe_table() == s0->maybe_table());
@@ -225,9 +227,9 @@ SEASTAR_THREAD_TEST_CASE(test_table_is_attached) {
                 .build();
         utils::throttle s3_thr;
         auto s3_entered = s3_thr.block();
-        auto learned_s3 = local_schema_registry().get_or_load(s3->version(), [&, fs = frozen_schema(s3)] (table_schema_version) -> future<base_and_view_schemas> {
+        auto learned_s3 = local_schema_registry().get_or_load(s3->version(), [&, fs = frozen_schema(s3)] (table_schema_version) -> future<view_schema_and_base_info> {
             co_await s3_thr.enter();
-            co_return base_and_view_schemas{fs};
+            co_return view_schema_and_base_info{fs};
         });
         s3_entered.get();
         local_schema_registry().learn(s3);
@@ -242,12 +244,12 @@ SEASTAR_THREAD_TEST_CASE(test_table_is_attached) {
                 .build();
         utils::throttle s4_thr;
         auto s4_entered = s4_thr.block();
-        auto learned_s4 = local_schema_registry().get_or_load(s4->version(), [&, fs = frozen_schema(s4)] (table_schema_version) -> future<base_and_view_schemas> {
+        auto learned_s4 = local_schema_registry().get_or_load(s4->version(), [&, fs = frozen_schema(s4)] (table_schema_version) -> future<view_schema_and_base_info> {
             co_await s4_thr.enter();
-            co_return base_and_view_schemas(fs);
+            co_return view_schema_and_base_info(fs);
         });
         s4_entered.get();
-        s4 = local_schema_registry().get_or_load(s4->version(), [&, fs = frozen_schema(s4)] (table_schema_version) -> base_and_view_schemas { return {fs}; });
+        s4 = local_schema_registry().get_or_load(s4->version(), [&, fs = frozen_schema(s4)] (table_schema_version) -> view_schema_and_base_info { return {fs}; });
         s4_thr.unblock();
         auto s4_s = learned_s4.get();
         BOOST_REQUIRE(s4_s->maybe_table() == s0->maybe_table());
@@ -269,13 +271,10 @@ SEASTAR_THREAD_TEST_CASE(test_schema_is_recovered_after_dying) {
         .with_column("v", int32_type)
         .build();
     auto base_registry_schema = local_schema_registry().get_or_load(base_schema->version(),
-        [base_schema] (table_schema_version) -> base_and_view_schemas { return {frozen_schema(base_schema)}; });
+        [base_schema] (table_schema_version) -> view_schema_and_base_info { return {frozen_schema(base_schema)}; });
     base_registry_schema = nullptr;
     auto recovered_registry_schema = local_schema_registry().get_or_null(base_schema->version());
-    BOOST_REQUIRE(recovered_registry_schema);
-    recovered_registry_schema = nullptr;
-    seastar::sleep(dummy.grace_period).get();
-    BOOST_REQUIRE(!local_schema_registry().get_or_null(base_schema->version()));
+    BOOST_REQUIRE(recovered_registry_schema->version() == base_schema->version());
 }
 
 SEASTAR_THREAD_TEST_CASE(test_view_info_is_recovered_after_dying) {
@@ -288,14 +287,34 @@ SEASTAR_THREAD_TEST_CASE(test_view_info_is_recovered_after_dying) {
     auto view_schema = schema_builder("ks", "cf_view")
             .with_column("v", int32_type, column_kind::partition_key)
             .with_column("pk", int32_type)
-            .with_view_info(*base_schema, false, "pk IS NOT NULL AND v IS NOT NULL")
+            .with_view_info(base_schema, false, "pk IS NOT NULL AND v IS NOT NULL")
             .build();
-    view_schema->view_info()->set_base_info(view_schema->view_info()->make_base_dependent_view_info(*base_schema));
+    auto base_info = view_schema->view_info()->make_base_dependent_view_info(*base_schema);
     local_schema_registry().get_or_load(view_schema->version(),
-        [view_schema, base_schema] (table_schema_version) -> base_and_view_schemas { return {frozen_schema(view_schema), base_schema}; });
+        [view_schema, base_info] (table_schema_version) -> view_schema_and_base_info { return {frozen_schema(view_schema), base_info}; });
     auto view_registry_schema = local_schema_registry().get_or_null(view_schema->version());
     BOOST_REQUIRE(view_registry_schema);
-    BOOST_REQUIRE(view_registry_schema->view_info()->base_info());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_merge_schema_with_large_collection_of_mutations) {
+    do_with_cql_env_thread([] (cql_test_env& e) {
+        utils::chunked_vector<mutation> mutations;
+        for (auto i : std::views::iota(0, 1000)) {
+            auto s0 = schema_builder("ks", fmt::format("cf_{}", i))
+                    .with_column("pk", bytes_type, column_kind::partition_key)
+                    .with_column("v1", bytes_type)
+                    .build();
+
+            db::schema_tables::make_schema_mutations(s0, api::new_timestamp(), true).copy_to(mutations);
+        }
+
+        BOOST_REQUIRE(seastar::memory::stats().large_allocations() == 0);
+        seastar::memory::scoped_large_allocation_warning_threshold guard((size_t(128) << 10)+1); // 128 KiB + 1 byte
+        db::schema_tables::merge_schema(e.get_system_keyspace(), e.get_storage_proxy(), e.get_storage_service(),
+                                        e.get_feature_service().local(), mutations).get();
+        BOOST_REQUIRE(seastar::memory::stats().large_allocations() == 0);
+
+    }).get();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -26,6 +26,7 @@
 #include "cql3/statements/request_validations.hh"
 #include "cql3/functions/token_fct.hh"
 #include "dht/i_partitioner.hh"
+#include "db/schema_tables.hh"
 #include "types/tuple.hh"
 
 namespace {
@@ -196,16 +197,6 @@ value_list get_IN_values(
     return to_sorted_vector(std::move(list_elems) | non_null | deref, comparator);
 }
 
-/// Returns possible values for k-th column from t, which must be RHS of IN.
-value_list get_IN_values(const expression& e, size_t k, const query_options& options,
-                         const serialized_compare& comparator) {
-    const cql3::raw_value in_list = evaluate(e, options);
-    const auto split_values = get_list_of_tuples_elements(in_list, *type_of(e)); // Need lvalue from which to make std::view.
-    const auto result_range = split_values
-            | std::views::transform([k] (const std::vector<managed_bytes_opt>& v) { return v[k]; }) | non_null | deref;
-    return to_sorted_vector(std::move(result_range), comparator);
-}
-
 static constexpr bool inclusive = true, exclusive = false;
 
 } // anonymous namespace
@@ -308,34 +299,9 @@ static value_set possible_lhs_values(const column_definition* cdef,
                             throw std::logic_error(format("possible_lhs_values: unhandled operator {}", oper));
                         },
                         [&] (const tuple_constructor& tuple) -> value_set {
-                            if (!cdef) {
-                                return unbounded_value_set;
-                            }
-                            const auto found = std::ranges::find_if(
-                                    tuple.elements, [&] (const expression& c) { return expr::as<column_value>(c).col == cdef; });
-                            if (found == tuple.elements.end()) {
-                                return unbounded_value_set;
-                            }
-                            const auto column_index_on_lhs = std::distance(tuple.elements.begin(), found);
-                            if (is_compare(oper.op)) {
-                                // RHS must be a tuple due to upstream checks.
-                                managed_bytes_opt val = get_tuple_elements(evaluate(oper.rhs, options), *type_of(oper.rhs)).at(column_index_on_lhs);
-                                if (!val) {
-                                    return empty_value_set; // All NULL comparisons fail; no column values match.
-                                }
-                                if (oper.op == oper_t::EQ) {
-                                    return value_list{std::move(*val)};
-                                }
-                                if (column_index_on_lhs > 0) {
-                                    // A multi-column comparison restricts only the first column, because
-                                    // comparison is lexicographical.
-                                    return unbounded_value_set;
-                                }
-                                return to_range(oper.op, std::move(*val));
-                            } else if (oper.op == oper_t::IN) {
-                                return get_IN_values(oper.rhs, column_index_on_lhs, options, type->as_less_comparator());
-                            }
-                            return unbounded_value_set;
+                            on_internal_error(rlogger,
+                                    fmt::format("possible_lhs_values: trying to solve for {} on tuple inequality",
+                                            cdef ? "single column" : "token"));
                         },
                         [&] (const function_call& token_fun_call) -> value_set {
                             if (!is_partition_token_for_schema(token_fun_call, *table_schema_opt)) {
@@ -1274,14 +1240,16 @@ statement_restrictions::statement_restrictions(data_dictionary::database db,
         }
 
         const auto& im = index_opt->metadata();
-        sstring index_table_name = im.name() + "_index";
-        schema_ptr view_schema = db.find_schema(schema->ks_name(), index_table_name);
-        _view_schema = view_schema;
+        if (db::schema_tables::view_should_exist(im)) {
+            sstring index_table_name = im.name() + "_index";
+            schema_ptr view_schema = db.find_schema(schema->ks_name(), index_table_name);
+            _view_schema = view_schema;
 
-        if (im.local()) {
-            prepare_indexed_local(*view_schema);
-        } else {
-            prepare_indexed_global(*view_schema);
+            if (im.local()) {
+                prepare_indexed_local(*view_schema);
+            } else {
+                prepare_indexed_global(*view_schema);
+            }
         }
     }
 }
@@ -2315,7 +2283,7 @@ std::vector<query::clustering_range> get_single_column_clustering_bounds(
                 // For example, the expression `c1=1 AND c2=2 AND c3>3` makes lower CK bound (1,2,3) exclusive and
                 // upper CK bound (1,2) inclusive.
                 ck_ranges.reserve(product_size);
-                const auto extra_lb = last_range->start(), extra_ub = last_range->end();
+                const auto extra_lb = last_range->start_copy(), extra_ub = last_range->end_copy();
                 for (auto& b : cartesian_product(prior_column_values)) {
                     auto new_lb = b, new_ub = b;
                     if (extra_lb) {

@@ -8,13 +8,16 @@
 
 #pragma once
 
+#include "cdc/cdc_options.hh"
+#include "cdc/log.hh"
 #include "seastarx.hh"
 #include "service/paxos/cas_request.hh"
+#include "service/cas_shard.hh"
 #include "utils/rjson.hh"
 #include "consumed_capacity.hh"
 #include "executor.hh"
 #include "tracing/trace_state.hh"
-#include "keys.hh"
+#include "keys/keys.hh"
 
 namespace alternator {
 
@@ -55,7 +58,7 @@ public:
     static write_isolation get_write_isolation_for_schema(schema_ptr schema);
 
     static write_isolation default_write_isolation;
-public:
+
     static void set_default_write_isolation(std::string_view mode);
 
 protected:
@@ -106,21 +109,27 @@ public:
     // violating this). We mark apply() "const" to let the compiler validate
     // this for us. The output-only field _return_attributes is marked
     // "mutable" above so that apply() can still write to it.
-    virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, api::timestamp_type ts) const = 0;
+    virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, api::timestamp_type ts, cdc::per_request_options& cdc_opts) const = 0;
     // Convert the above apply() into the signature needed by cas_request:
-    virtual std::optional<mutation> apply(foreign_ptr<lw_shared_ptr<query::result>> qr, const query::partition_slice& slice, api::timestamp_type ts) override;
+    virtual std::optional<mutation> apply(foreign_ptr<lw_shared_ptr<query::result>> qr, const query::partition_slice& slice, api::timestamp_type ts, cdc::per_request_options& cdc_opts) override;
     virtual ~rmw_operation() = default;
+    const wcu_consumed_capacity_counter& consumed_capacity() const noexcept { return _consumed_capacity; }
     schema_ptr schema() const { return _schema; }
     const rjson::value& request() const { return _request; }
     rjson::value&& move_request() && { return std::move(_request); }
     future<executor::request_return_type> execute(service::storage_proxy& proxy,
+            std::optional<service::cas_shard> cas_shard,
             service::client_state& client_state,
             tracing::trace_state_ptr trace_state,
             service_permit permit,
             bool needs_read_before_write,
-            stats& stats,
+            stats& global_stats,
+            stats& per_table_stats,
             uint64_t& wcu_total);
-    std::optional<shard_id> shard_for_execute(bool needs_read_before_write);
+    std::optional<service::cas_shard> shard_for_execute(bool needs_read_before_write);
+
+private:
+    inline bool should_fill_preimage() const { return _schema->cdc_options().enabled(); }
 };
 
 } // namespace alternator

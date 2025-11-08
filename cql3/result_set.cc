@@ -8,7 +8,9 @@
  * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
+#include <cstdint>
 #include "utils/assert.hh"
+#include "utils/hashers.hh"
 #include "cql3/result_set.hh"
 
 namespace cql3 {
@@ -16,14 +18,22 @@ namespace cql3 {
 metadata::metadata(std::vector<lw_shared_ptr<column_specification>> names_)
         : _flags(flag_enum_set())
         , _column_info(make_lw_shared<column_info>(std::move(names_)))
-{ }
+{
+    if (!_column_info->_names.empty() && column_specification::all_in_same_table(_column_info->_names)) {
+        _flags.set<flag::GLOBAL_TABLES_SPEC>();
+    }
+}
 
 metadata::metadata(flag_enum_set flags, std::vector<lw_shared_ptr<column_specification>> names_, uint32_t column_count,
         lw_shared_ptr<const service::pager::paging_state> paging_state)
     : _flags(flags)
     , _column_info(make_lw_shared<column_info>(std::move(names_), column_count))
     , _paging_state(std::move(paging_state))
-{ }
+{
+    if (!_column_info->_names.empty() && column_specification::all_in_same_table(_column_info->_names)) {
+        _flags.set<flag::GLOBAL_TABLES_SPEC>();
+    }
+}
 
 // The maximum number of values that the ResultSet can hold. This can be bigger than columnCount due to CASSANDRA-4911
 uint32_t metadata::value_count() const {
@@ -34,14 +44,6 @@ void metadata::add_non_serialized_column(lw_shared_ptr<column_specification> nam
     // See comment above. Because columnCount doesn't account the newly added name, it
     // won't be serialized.
     _column_info->_names.emplace_back(std::move(name));
-}
-
-bool metadata::all_in_same_cf() const {
-    if (_flags.contains<flag::NO_METADATA>()) {
-        return false;
-    }
-
-    return column_specification::all_in_same_table(_column_info->_names);
 }
 
 void metadata::set_paging_state(lw_shared_ptr<const service::pager::paging_state> paging_state) {
@@ -69,6 +71,18 @@ metadata::flag_enum_set metadata::flags() const {
 
 lw_shared_ptr<const service::pager::paging_state> metadata::paging_state() const {
     return _paging_state;
+}
+
+// Metadata_id is a checksum computed from given metadata to track schema changes in prepared statements.
+// Originally introduced in CQLv5.
+cql3::cql_metadata_id_type metadata::calculate_metadata_id() const {
+    auto h = sha256_hasher();
+    for (uint32_t i = 0; i < _column_info->_column_count; ++i) {
+        feed_hash(h, _column_info->_names[i]->name->name());
+        feed_hash(h, _column_info->_names[i]->type->name());
+    }
+    // Return first 16 bytes to have the same length as Cassandra's MD5
+    return cql_metadata_id_type(h.finalize().substr(0, 16));
 }
 
 prepared_metadata::prepared_metadata(const std::vector<lw_shared_ptr<column_specification>>& names,

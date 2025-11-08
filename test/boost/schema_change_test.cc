@@ -7,9 +7,11 @@
  */
 
 
+#include "bytes.hh"
 #include <iostream>
 #include <fmt/ranges.h>
 #include <seastar/core/thread.hh>
+#include <utility>
 #undef SEASTAR_TESTING_MAIN
 #include <seastar/testing/test_case.hh>
 #include <seastar/util/defer.hh>
@@ -22,6 +24,7 @@
 #include "schema/schema_registry.hh"
 #include "db/extensions.hh"
 #include "db/schema_tables.hh"
+#include "db/object_storage_endpoint_param.hh"
 #include "types/list.hh"
 #include "types/user.hh"
 #include "db/config.hh"
@@ -30,6 +33,7 @@
 #include "test/lib/exception_utils.hh"
 #include "test/lib/log.hh"
 #include "cdc/cdc_extension.hh"
+#include "test/lib/test_utils.hh"
 
 BOOST_AUTO_TEST_SUITE(schema_change_test)
 
@@ -140,7 +144,7 @@ SEASTAR_TEST_CASE(test_tombstones_are_ignored_in_version_calculation) {
                 mutation m(s, pkey);
                 auto ckey = clustering_key::from_exploded(*s, {utf8_type->decompose(table_schema->cf_name()), "v1"});
                 m.partition().apply_delete(*s, ckey, tombstone(api::min_timestamp, gc_clock::now()));
-                mm.announce(std::vector<mutation>({m}), mm.start_group0_operation().get(), "").get();
+                mm.announce(utils::chunked_vector<mutation>({m}), mm.start_group0_operation().get(), "").get();
             }
 
             auto new_table_version = e.db().local().find_schema(table_schema->id())->version();
@@ -201,7 +205,7 @@ SEASTAR_TEST_CASE(test_concurrent_column_addition) {
             {
                 auto group0_guard = mm.start_group0_operation().get();
                 auto&& keyspace = e.db().local().find_keyspace(s0->ks_name()).metadata();
-                auto muts = db::schema_tables::make_update_table_mutations(e.db().local(), keyspace, s0, s2,
+                auto muts = db::schema_tables::make_update_table_mutations(e.get_storage_proxy().local(), keyspace, s0, s2,
                         group0_guard.write_timestamp());
                 mm.announce(std::move(muts), std::move(group0_guard), "").get();
             }
@@ -367,7 +371,7 @@ SEASTAR_TEST_CASE(test_combined_column_add_and_drop) {
             // Drop v1
             {
                 auto group0_guard = mm.start_group0_operation().get();
-                auto muts = db::schema_tables::make_update_table_mutations(e.db().local(), keyspace, s1, s2,
+                auto muts = db::schema_tables::make_update_table_mutations(e.get_storage_proxy().local(), keyspace, s1, s2,
                     group0_guard.write_timestamp());
                 mm.announce(std::move(muts), std::move(group0_guard), "").get();
             }
@@ -385,7 +389,7 @@ SEASTAR_TEST_CASE(test_combined_column_add_and_drop) {
                         .build();
 
                 auto group0_guard = mm.start_group0_operation().get();
-                auto muts = db::schema_tables::make_update_table_mutations(e.db().local(), keyspace, s3, s4,
+                auto muts = db::schema_tables::make_update_table_mutations(e.get_storage_proxy().local(), keyspace, s3, s4,
                     group0_guard.write_timestamp());
                 mm.announce(std::move(muts), std::move(group0_guard), "").get();
             }
@@ -458,7 +462,7 @@ SEASTAR_TEST_CASE(test_merging_does_not_alter_tables_which_didnt_change) {
                 return e.db().local().find_column_family("ks", "table1");
             };
 
-            std::vector<mutation> muts1;
+            utils::chunked_vector<mutation> muts1;
             {
                 auto group0_guard = mm.start_group0_operation().get();
                 muts1 = db::schema_tables::make_create_table_mutations(s0, group0_guard.write_timestamp());
@@ -506,12 +510,12 @@ SEASTAR_TEST_CASE(test_merging_creates_a_table_even_if_keyspace_was_recreated) {
                 return e.db().local().find_column_family("ks", "table1");
             };
 
-            std::vector<mutation> all_muts;
+            utils::chunked_vector<mutation> all_muts;
 
             {
                 auto group0_guard = mm.start_group0_operation().get();
                 const auto ts = group0_guard.write_timestamp();
-                auto muts = service::prepare_keyspace_drop_announcement(e.local_db(), "ks", ts).get();
+                auto muts = service::prepare_keyspace_drop_announcement(e.get_storage_proxy().local(), "ks", ts).get();
                 std::ranges::copy(muts, std::back_inserter(all_muts));
                 mm.announce(muts, std::move(group0_guard), "").get();
             }
@@ -557,7 +561,6 @@ public:
     int update_function_count = 0;
     int update_aggregate_count = 0;
     int update_view_count = 0;
-    int update_tablets = 0;
     int drop_keyspace_count = 0;
     int drop_column_family_count = 0;
     int drop_user_type_count = 0;
@@ -580,7 +583,6 @@ public:
     virtual void on_update_function(const sstring&, const sstring&) override { ++update_function_count; }
     virtual void on_update_aggregate(const sstring&, const sstring&) override { ++update_aggregate_count; }
     virtual void on_update_view(const sstring&, const sstring&, bool) override { ++update_view_count; }
-    virtual void on_update_tablet_metadata(const locator::tablet_metadata_change_hint&) override { ++update_tablets; }
     virtual void on_drop_keyspace(const sstring&) override { ++drop_keyspace_count; }
     virtual void on_drop_column_family(const sstring&, const sstring&) override { ++drop_column_family_count; }
     virtual void on_drop_user_type(const sstring&, const sstring&) override { ++drop_user_type_count; }
@@ -773,9 +775,7 @@ future<> test_schema_digest_does_not_change_with_disabled_features(sstring data_
     auto& db_cfg = *db_cfg_ptr;
     db_cfg.enable_user_defined_functions({true}, db::config::config_source::CommandLine);
     db_cfg.experimental_features({experimental_features_t::feature::UDF, experimental_features_t::feature::KEYSPACE_STORAGE_OPTIONS}, db::config::config_source::CommandLine);
-    std::unordered_map<sstring, s3::endpoint_config> so_config;
-    so_config["localhost"] = s3::endpoint_config{};
-    db_cfg.object_storage_config.set(std::move(so_config));
+    db_cfg.object_storage_endpoints({db::object_storage_endpoint_param{"localhost", s3::endpoint_config{}}}, db::config::config_source::CommandLine);
     if (regenerate) {
         db_cfg.data_file_directories({data_dir}, db::config::config_source::CommandLine);
     } else {
@@ -1157,6 +1157,141 @@ SEASTAR_TEST_CASE(test_system_schema_version_is_stable) {
         // If you changed the schema of system.batchlog then this is expected to fail.
         // Just replace expected version with the new version.
         BOOST_REQUIRE_EQUAL(s->version(), table_schema_version(utils::UUID("1f504ac7-350f-37aa-8a9e-105b1325d8e3")));
+    });
+}
+
+// The purpose of this check is to make sure that we don't accidentally change the metadata_id.
+// The metadata_id should be stable to avoid ping-pong when driver connects to a mixed cluster.
+void verify_metadata_id_is_stable(cql3::cql_metadata_id_type metadata_id, sstring known_hash) {
+    BOOST_REQUIRE_EQUAL(metadata_id._metadata_id, from_hex(known_hash));
+}
+
+BOOST_AUTO_TEST_CASE(metadata_id_from_empty_metadata) {
+    auto m = cql3::metadata{std::vector<lw_shared_ptr<cql3::column_specification>>{}};
+    auto metadata_id = m.calculate_metadata_id();
+    BOOST_REQUIRE_EQUAL(metadata_id._metadata_id.size(), 16);
+    verify_metadata_id_is_stable(metadata_id, "e3b0c44298fc1c149afbf4c8996fb924");
+}
+
+cql3::cql_metadata_id_type compute_metadata_id(std::vector<std::pair<sstring, shared_ptr<const abstract_type>>> columns, sstring ks = "ks", sstring cf = "cf") {
+    std::vector<lw_shared_ptr<cql3::column_specification>> columns_specification;
+    for (const auto& column : columns) {
+        columns_specification.push_back(make_lw_shared(cql3::column_specification(ks, cf, make_shared<cql3::column_identifier>(column.first, false), column.second)));
+    }
+    return cql3::metadata{columns_specification}.calculate_metadata_id();
+}
+
+BOOST_AUTO_TEST_CASE(metadata_id_with_different_keyspace_and_table) {
+    const auto c = std::make_pair("id", uuid_type);
+    auto h1 = compute_metadata_id({c}, "ks1", "cf1");
+    auto h2 = compute_metadata_id({c}, "ks2", "cf2");
+
+    BOOST_REQUIRE_EQUAL(h1, h2);
+    verify_metadata_id_is_stable(h1, "d0c38eb409a57bb14497c35b80dfaaf1");
+}
+
+BOOST_AUTO_TEST_CASE(metadata_id_with_different_column_name) {
+    auto h1 = compute_metadata_id({{"id", uuid_type}});
+    auto h2 = compute_metadata_id({{"id2", uuid_type}});
+
+    BOOST_REQUIRE_NE(h1, h2);
+    verify_metadata_id_is_stable(h1, "d0c38eb409a57bb14497c35b80dfaaf1");
+    verify_metadata_id_is_stable(h2, "ae0bc2741d0480f0ebf4ee18a9bca7c7");
+}
+
+BOOST_AUTO_TEST_CASE(metadata_id_with_different_column_type) {
+    const auto column_name = "id";
+    auto h1 = compute_metadata_id({{column_name, uuid_type}});
+    auto h2 = compute_metadata_id({{column_name, int32_type}});
+
+    BOOST_REQUIRE_NE(h1, h2);
+    verify_metadata_id_is_stable(h1, "d0c38eb409a57bb14497c35b80dfaaf1");
+    verify_metadata_id_is_stable(h2, "b62d95c978e2e2498100ad8d20979868");
+}
+
+BOOST_AUTO_TEST_CASE(metadata_id_with_different_column_number) {
+    const auto c1 = std::make_pair("val1", int32_type);
+    const auto c2 = std::make_pair("val2", int32_type);
+    auto h1 = compute_metadata_id({c1});
+    auto h2 = compute_metadata_id({c1, c2});
+
+    BOOST_REQUIRE_NE(h1, h2);
+    verify_metadata_id_is_stable(h1, "f38171ab2b2e4d98e3f76a4640de5b32");
+    verify_metadata_id_is_stable(h2, "31c5cb5d0d41fbc426266248cc37941a");
+}
+
+BOOST_AUTO_TEST_CASE(metadata_id_with_different_column_order) {
+    const auto c1 = std::make_pair("val1", int32_type);
+    const auto c2 = std::make_pair("val2", int32_type);
+    auto h1 = compute_metadata_id({c1, c2});
+    auto h2 = compute_metadata_id({c2, c1});
+
+    BOOST_REQUIRE_NE(h1, h2);
+    verify_metadata_id_is_stable(h1, "31c5cb5d0d41fbc426266248cc37941a");
+    verify_metadata_id_is_stable(h2, "b52512f2b76d3e0695dcaf7b0a71efac");
+}
+
+BOOST_AUTO_TEST_CASE(metadata_id_with_udt) {
+
+    auto compute_metadata_id_for_type = [&](
+        const std::vector<bytes>& names,
+        const std::vector<data_type>& types,
+        const char* udt_name = "udt_name",
+        const bool multi_cell = true) {
+        BOOST_REQUIRE_EQUAL(names.size(), types.size());
+        return compute_metadata_id({{
+            "val1",
+            user_type_impl::get_instance("ks", udt_name, names, types, multi_cell)}}
+        );
+    };
+
+    auto h1 = compute_metadata_id_for_type({"f1"}, {int32_type});
+
+    // Different field number
+    auto h2 = compute_metadata_id_for_type({"f1", "f2"}, {int32_type, int32_type});
+    BOOST_REQUIRE_NE(h1, h2);
+
+    // Different field name
+    auto h3 = compute_metadata_id_for_type({"f2"}, {int32_type});
+    BOOST_REQUIRE_NE(h1, h3);
+
+    // Different field type
+    auto h4 = compute_metadata_id_for_type({"f1"}, {float_type});
+    BOOST_REQUIRE_NE(h1, h4);
+
+    // Different UDT name
+    auto h5 = compute_metadata_id_for_type({"f1"}, {int32_type}, "different_udt_name");
+    BOOST_REQUIRE_NE(h1, h5);
+
+    // False multi_cell mark
+    auto h6 = compute_metadata_id_for_type({"f1"}, {int32_type}, "udt_name", false);
+    BOOST_REQUIRE_NE(h1, h6);
+
+    verify_metadata_id_is_stable(h1, "9e556a9632191ac829c961c94719073a");
+    verify_metadata_id_is_stable(h2, "f0a58cd95fed3009b67ff6b4bda1fae1");
+    verify_metadata_id_is_stable(h3, "6a99234baebad33d9b9081cbdef9cd8b");
+    verify_metadata_id_is_stable(h4, "72780d64c71ec0265bb48194ec5b0f75");
+    verify_metadata_id_is_stable(h5, "767b01cdb5a61f90af9d824338de40e9");
+    verify_metadata_id_is_stable(h6, "02f16bdc4b235791a44983fe56618006");
+}
+
+cql3::cql_metadata_id_type get_metadata_id(cql_test_env& e, sstring const& table) {
+    auto msg = e.execute_cql(format("SELECT * FROM {};", table)).get();
+    auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(msg);
+    return rows->rs().get_metadata().calculate_metadata_id();
+}
+
+SEASTAR_TEST_CASE(metadata_id_unchanged) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        cquery_nofail(e, "CREATE TABLE t(p int PRIMARY KEY, c1 int)");
+        cquery_nofail(e, "INSERT INTO  t(p, c1) VALUES (0, 0)");
+        const auto initial_metadata_id = get_metadata_id(e, "t");
+
+        cquery_nofail(e, "ALTER TABLE t ADD (c2 int)");
+        BOOST_REQUIRE_NE(initial_metadata_id, get_metadata_id(e, "t"));
+
+        cquery_nofail(e, "ALTER TABLE t DROP c2");
+        BOOST_REQUIRE_EQUAL(initial_metadata_id, get_metadata_id(e, "t"));
     });
 }
 

@@ -10,9 +10,11 @@
 
 #include <chrono>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <optional>
 #include <ranges>
+#include <stdexcept>
 #include <unordered_set>
 #include <vector>
 #include <algorithm>
@@ -22,9 +24,15 @@
 #include <seastar/core/future-util.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/maybe_yield.hh>
+#include <flat_map>
 
+#include "db/config.hh"
+#include "db/view/base_info.hh"
+#include "db/view/view_build_status.hh"
+#include "db/view/view_consumer.hh"
+#include "mutation/canonical_mutation.hh"
 #include "replica/database.hh"
-#include "clustering_bounds_comparator.hh"
+#include "keys/clustering_bounds_comparator.hh"
 #include "cql3/statements/select_statement.hh"
 #include "cql3/util.hh"
 #include "cql3/restrictions/statement_restrictions.hh"
@@ -44,14 +52,17 @@
 #include "dht/sharder.hh"
 #include "gms/inet_address.hh"
 #include "gms/feature_service.hh"
-#include "keys.hh"
+#include "keys/keys.hh"
 #include "locator/abstract_replication_strategy.hh"
 #include "locator/network_topology_strategy.hh"
 #include "mutation/mutation.hh"
 #include "mutation/mutation_partition.hh"
+#include "seastar/core/on_internal_error.hh"
 #include "service/migration_manager.hh"
+#include "service/raft/raft_group0_client.hh"
 #include "service/storage_proxy.hh"
 #include "compaction/compaction_manager.hh"
+#include "mutation/timestamp.hh"
 #include "utils/assert.hh"
 #include "utils/small_vector.hh"
 #include "view_info.hh"
@@ -61,14 +72,15 @@
 #include "utils/error_injection.hh"
 #include "utils/exponential_backoff_retry.hh"
 #include "utils/labels.hh"
-#include "query-result-writer.hh"
-#include "readers/from_fragments_v2.hh"
+#include "query/query-result-writer.hh"
+#include "readers/from_fragments.hh"
 #include "readers/evictable.hh"
 #include "readers/multishard.hh"
 #include "readers/filtering.hh"
 #include "delete_ghost_rows_visitor.hh"
 #include "locator/host_id.hh"
 #include "cartesian_product.hh"
+#include "idl/view.dist.hh"
 
 using namespace std::chrono_literals;
 
@@ -79,10 +91,16 @@ static inline void inject_failure(std::string_view operation) {
             [operation] { throw std::runtime_error(std::string(operation)); });
 }
 
-view_info::view_info(const schema& schema, const raw_view_info& raw_view_info)
+view_info::view_info(const schema& schema, const raw_view_info& raw_view_info, schema_ptr base_schema)
         : _schema(schema)
         , _raw(raw_view_info)
-        , _has_computed_column_depending_on_base_non_primary_key(false)
+        , _base_info(make_base_dependent_view_info(*base_schema))
+{ }
+
+view_info::view_info(const schema& schema, const raw_view_info& raw_view_info, db::view::base_dependent_view_info base_info)
+        : _schema(schema)
+        , _raw(raw_view_info)
+        , _base_info(std::move(base_info))
 { }
 
 cql3::statements::select_statement& view_info::select_statement(data_dictionary::database db) const {
@@ -133,117 +151,63 @@ const column_definition* view_info::view_column(const column_definition& base_de
     return _schema.get_column_definition(base_def.name());
 }
 
-void view_info::set_base_info(db::view::base_info_ptr base_info) {
-    _base_info = std::move(base_info);
+void view_info::reset_view_info() {
     // Forget the cached objects which may refer to the base schema.
     _select_statement = nullptr;
     _partition_slice = std::nullopt;
 }
 
 // A constructor for a base info that can facilitate reads and writes from the materialized view.
-db::view::base_dependent_view_info::base_dependent_view_info(schema_ptr base_schema,
-        std::vector<column_id>&& base_regular_columns_in_view_pk,
-        std::vector<column_id>&& base_static_columns_in_view_pk)
-        : _base_schema{std::move(base_schema)}
-        , _base_regular_columns_in_view_pk{std::move(base_regular_columns_in_view_pk)}
-        , _base_static_columns_in_view_pk{std::move(base_static_columns_in_view_pk)}
-        , has_base_non_pk_columns_in_view_pk{!_base_regular_columns_in_view_pk.empty() || !_base_static_columns_in_view_pk.empty()}
-        , use_only_for_reads{false} {
-
-}
-
-// A constructor for a base info that can facilitate only reads from the materialized view.
-db::view::base_dependent_view_info::base_dependent_view_info(bool has_base_non_pk_columns_in_view_pk, std::optional<bytes>&& column_missing_in_base)
-        : _base_schema{nullptr}
-        , _column_missing_in_base{std::move(column_missing_in_base)}
+db::view::base_dependent_view_info::base_dependent_view_info(bool has_computed_column_depending_on_base_non_primary_key,
+        bool is_partition_key_permutation_of_base_partition_key,
+        bool has_base_non_pk_columns_in_view_pk)
+        : has_computed_column_depending_on_base_non_primary_key{has_computed_column_depending_on_base_non_primary_key}
+        , is_partition_key_permutation_of_base_partition_key{is_partition_key_permutation_of_base_partition_key}
         , has_base_non_pk_columns_in_view_pk{has_base_non_pk_columns_in_view_pk}
-        , use_only_for_reads{true} {
-}
+{ }
 
-const std::vector<column_id>& db::view::base_dependent_view_info::base_regular_columns_in_view_pk() const {
-    if (use_only_for_reads) {
-        on_internal_error(vlogger,
-                seastar::format("base_regular_columns_in_view_pk(): operation unsupported when initialized only for view reads. "
-                "Missing column in the base table: {}", to_string_view(_column_missing_in_base.value_or(bytes()))));
-    }
-    return _base_regular_columns_in_view_pk;
-}
-
-const std::vector<column_id>& db::view::base_dependent_view_info::base_static_columns_in_view_pk() const {
-    if (use_only_for_reads) {
-        on_internal_error(vlogger,
-                seastar::format("base_static_columns_in_view_pk(): operation unsupported when initialized only for view reads. "
-                "Missing column in the base table: {}", to_string_view(_column_missing_in_base.value_or(bytes()))));
-    }
-    return _base_static_columns_in_view_pk;
-}
-
-const schema_ptr& db::view::base_dependent_view_info::base_schema() const {
-    if (use_only_for_reads) {
-        on_internal_error(vlogger,
-                seastar::format("base_schema(): operation unsupported when initialized only for view reads. "
-                "Missing column in the base table: {}", to_string_view(_column_missing_in_base.value_or(bytes()))));
-    }
-    return _base_schema;
-}
-
-db::view::base_info_ptr view_info::make_base_dependent_view_info(const schema& base) const {
-    std::vector<column_id> base_regular_columns_in_view_pk;
-    std::vector<column_id> base_static_columns_in_view_pk;
-
-    _is_partition_key_permutation_of_base_partition_key =
+db::view::base_dependent_view_info view_info::make_base_dependent_view_info(const schema& base) const {
+    bool is_partition_key_permutation_of_base_partition_key =
         std::ranges::all_of(_schema.partition_key_columns(), [&base] (const column_definition& view_col) {
             const column_definition* base_col = base.get_column_definition(view_col.name());
             return base_col && base_col->is_partition_key();
             })
         && _schema.partition_key_size() == base.partition_key_size();
 
+    bool has_computed_column_depending_on_base_non_primary_key = false;
+    bool has_base_non_pk_columns_in_view_pk = false;
     for (auto&& view_col : _schema.primary_key_columns()) {
         if (view_col.is_computed()) {
             // we are not going to find it in the base table...
             if (view_col.get_computation().depends_on_non_primary_key_column()) {
-                _has_computed_column_depending_on_base_non_primary_key = true;
+                has_computed_column_depending_on_base_non_primary_key = true;
             }
             continue;
         }
         const bytes& view_col_name = view_col.name();
         auto* base_col = base.get_column_definition(view_col_name);
         if (base_col && base_col->is_regular()) {
-            base_regular_columns_in_view_pk.push_back(base_col->id);
+            has_base_non_pk_columns_in_view_pk = true;
         } else if (base_col && base_col->is_static()) {
-            base_static_columns_in_view_pk.push_back(base_col->id);
+            has_base_non_pk_columns_in_view_pk = true;
         } else if (!base_col) {
-            vlogger.error("Column {} in view {}.{} was not found in the base table {}.{}",
-                    to_string_view(view_col_name), _schema.ks_name(), _schema.cf_name(), base.ks_name(), base.cf_name());
-            if (to_string_view(view_col_name) == "idx_token") {
-                vlogger.warn("Missing idx_token column is caused by an incorrect upgrade of a secondary index. "
-                        "Please recreate index {}.{} to avoid future issues.", _schema.ks_name(), _schema.cf_name());
-            }
-            // If we didn't find the column in the base column then it must have been deleted
-            // or not yet added (by alter command), this means it is for sure not a pk column
-            // in the base table. This can happen if the version of the base schema is not the
-            // one that the view was created with. Setting this schema as the base can't harm since
-            // if we got to such a situation then it means it is only going to be used for reading
-            // (computation of shadowable tombstones) and in that case the existence of such a column
-            // is the only thing that is of interest to us.
-            return make_lw_shared<db::view::base_dependent_view_info>(true, view_col_name);
+            has_base_non_pk_columns_in_view_pk = true;
         }
     }
-
-    return make_lw_shared<db::view::base_dependent_view_info>(base.shared_from_this(), std::move(base_regular_columns_in_view_pk), std::move(base_static_columns_in_view_pk));
+    return db::view::base_dependent_view_info(has_computed_column_depending_on_base_non_primary_key,
+        is_partition_key_permutation_of_base_partition_key, has_base_non_pk_columns_in_view_pk);
 }
 
 bool view_info::has_base_non_pk_columns_in_view_pk() const {
-    // The base info is not always available, this is because
-    // the base info initialization is separate from the view
-    // info construction. If we are trying to get this info without
-    // initializing the base information it means that we have a
-    // schema integrity problem as the creator of owning view schema
-    // didn't make sure to initialize it with base information.
-    if (!_base_info) {
-        on_internal_error(vlogger, "Tried to perform a view query which is base info dependent without initializing it");
-    }
-    return _base_info->has_base_non_pk_columns_in_view_pk;
+    return _base_info.has_base_non_pk_columns_in_view_pk;
+}
+
+bool view_info::has_computed_column_depending_on_base_non_primary_key() const {
+    return _base_info.has_computed_column_depending_on_base_non_primary_key;
+}
+
+bool view_info::is_partition_key_permutation_of_base_partition_key() const {
+    return _base_info.is_partition_key_permutation_of_base_partition_key;
 }
 
 clustering_row db::view::clustering_or_static_row::as_clustering_row(const schema& s) const {
@@ -344,11 +308,11 @@ bool may_be_affected_by(data_dictionary::database db, const schema& base, const 
 }
 
 static bool update_requires_read_before_write(data_dictionary::database db, const schema& base,
-        const std::vector<view_and_base>& views,
+        const std::vector<view_ptr>& views,
         const dht::decorated_key& key,
         const rows_entry& update) {
     for (auto&& v : views) {
-        view_info& vf = *v.view->view_info();
+        view_info& vf = *v->view_info();
         if (may_be_affected_by(db, base, vf, key, update)) {
             return true;
         }
@@ -421,24 +385,6 @@ public:
     }
 };
 
-static query::partition_slice make_partition_slice(const schema& s) {
-    query::partition_slice::option_set opts;
-    opts.set(query::partition_slice::option::send_partition_key);
-    opts.set(query::partition_slice::option::send_clustering_key);
-    opts.set(query::partition_slice::option::send_timestamp);
-    opts.set(query::partition_slice::option::send_ttl);
-    opts.set(query::partition_slice::option::always_return_static_content);
-    return query::partition_slice(
-            {query::full_clustering_range},
-            s.static_columns()
-                    | std::views::transform(std::mem_fn(&column_definition::id))
-                    | std::ranges::to<query::column_id_vector>(),
-            s.regular_columns()
-                    | std::views::transform(std::mem_fn(&column_definition::id))
-                    | std::ranges::to<query::column_id_vector>(),
-            std::move(opts));
-}
-
 class data_query_result_builder {
 public:
     using result_type = query::result;
@@ -483,6 +429,30 @@ bool matches_view_filter(data_dictionary::database db, const schema& base, const
 
     return clustering_prefix_matches(db, base, view, key, *update.key())
             && visitor.matches_view_filter();
+}
+
+view_updates::view_updates(view_ptr v, schema_ptr base)
+    : _view(std::move(v))
+    , _view_info(*_view->view_info())
+    , _base(std::move(base))
+    , _base_info(_view_info.base_info())
+    , _updates(8, partition_key::hashing(*_view), partition_key::equality(*_view))
+{
+    for (auto&& view_col : _view->primary_key_columns()) {
+        if (view_col.is_computed()) {
+            continue;
+        }
+        const bytes& view_col_name = view_col.name();
+        auto* base_col = _base->get_column_definition(view_col_name);
+        if (base_col && base_col->is_regular()) {
+            _base_regular_columns_in_view_pk.push_back(base_col->id);
+        } else if (base_col && base_col->is_static()) {
+            _base_static_columns_in_view_pk.push_back(base_col->id);
+        } else if (!base_col) {
+            on_internal_error(vlogger, format("Column {} in view {}.{} was not found in the base table {}.{}",
+                    view_col_name, _view->ks_name(), _view->cf_name(), _base->ks_name(), _base->cf_name()));
+        }
+    }
 }
 
 future<> view_updates::move_to(utils::chunked_vector<frozen_mutation_and_schema>& mutations) {
@@ -914,8 +884,8 @@ void view_updates::do_delete_old_entry(const partition_key& base_key, const clus
     const auto kind = existing.column_kind();
     for (const auto& [r, action] : view_rows) {
         const auto& col_ids = existing.is_clustering_row()
-                ? _base_info->base_regular_columns_in_view_pk()
-                : _base_info->base_static_columns_in_view_pk();
+                ? _base_regular_columns_in_view_pk
+                : _base_static_columns_in_view_pk;
         if (!col_ids.empty() || _view_info.has_computed_column_depending_on_base_non_primary_key()) {
             // The view key could have been modified because it contains or
             // depends on a non-primary-key. The fact that this function was
@@ -969,7 +939,7 @@ bool view_updates::can_skip_view_updates(const clustering_or_static_row& update,
         // as part of its PK, there are NO virtual columns corresponding to the unselected columns in the view.
         // Because of that, we don't generate view updates when the value in an unselected column is created
         // or changes.
-        if (!column_is_selected && _base_info->has_base_non_pk_columns_in_view_pk) {
+        if (!column_is_selected && _base_info.has_base_non_pk_columns_in_view_pk) {
             return true;
         }
 
@@ -1144,7 +1114,7 @@ void view_updates::generate_update(
     // may change the view key and may require deleting an old view row and
     // inserting a new row. The other case, which we'll handle here first,
     // is easier and require just modifying one view row.
-    if (!_base_info->has_base_non_pk_columns_in_view_pk &&
+    if (!_base_info.has_base_non_pk_columns_in_view_pk &&
         !_view_info.has_computed_column_depending_on_base_non_primary_key()) {
         if (update.is_static_row()) {
             // TODO: support static rows in views with pk only including columns from base pk
@@ -1673,17 +1643,12 @@ view_update_builder make_view_update_builder(
         data_dictionary::database db,
         const replica::table& base_table,
         const schema_ptr& base,
-        std::vector<view_and_base>&& views_to_update,
+        std::vector<view_ptr>&& views_to_update,
         mutation_reader&& updates,
         mutation_reader_opt&& existings,
         gc_clock::time_point now) {
-    auto vs = views_to_update | std::views::transform([&] (view_and_base v) {
-        if (base->version() != v.base->base_schema()->version()) {
-            on_internal_error(vlogger, format("Schema version used for view updates ({}) does not match the current"
-                                              " base schema version of the view ({}) for view {}.{} of {}.{}",
-                base->version(), v.base->base_schema()->version(), v.view->ks_name(), v.view->cf_name(), base->ks_name(), base->cf_name()));
-        }
-        return view_updates(std::move(v));
+    auto vs = views_to_update | std::views::transform([&] (view_ptr v) {
+        return view_updates(std::move(v), base);
     }) | std::ranges::to<std::vector<view_updates>>();
     return view_update_builder(std::move(db), base_table, base, std::move(vs), std::move(updates), std::move(existings), now);
 }
@@ -1692,7 +1657,7 @@ future<query::clustering_row_ranges> calculate_affected_clustering_ranges(data_d
         const schema& base,
         const dht::decorated_key& key,
         const mutation_partition& mp,
-        const std::vector<view_and_base>& views) {
+        const std::vector<view_ptr>& views) {
     // WARNING: interval<clustering_key_prefix_view> is unsafe - refer to scylladb#22817 and scylladb#21604
     utils::chunked_vector<interval<clustering_key_prefix_view>> row_ranges;
     utils::chunked_vector<interval<clustering_key_prefix_view>> view_row_ranges;
@@ -1700,11 +1665,11 @@ future<query::clustering_row_ranges> calculate_affected_clustering_ranges(data_d
     if (mp.partition_tombstone() || !mp.row_tombstones().empty()) {
         for (auto&& v : views) {
             // FIXME: #2371
-            if (v.view->view_info()->select_statement(db).get_restrictions()->has_unrestricted_clustering_columns()) {
+            if (v->view_info()->select_statement(db).get_restrictions()->has_unrestricted_clustering_columns()) {
                 view_row_ranges.push_back(interval<clustering_key_prefix_view>::make_open_ended_both_sides());
                 break;
             }
-            for (auto&& r : v.view->view_info()->partition_slice(db).default_row_ranges()) {
+            for (auto&& r : v->view_info()->partition_slice(db).default_row_ranges()) {
                 view_row_ranges.push_back(r.transform(std::mem_fn(&clustering_key_prefix::view)));
                 co_await coroutine::maybe_yield();
             }
@@ -1754,7 +1719,7 @@ future<query::clustering_row_ranges> calculate_affected_clustering_ranges(data_d
     co_return result_ranges;
 }
 
-bool needs_static_row(const mutation_partition& mp, const std::vector<view_and_base>& views) {
+bool needs_static_row(const mutation_partition& mp, const std::vector<view_ptr>& views) {
     // TODO: We could also check whether any of the views need static rows
     // and return false if none of them do
     return mp.partition_tombstone() || !mp.static_row().empty();
@@ -1764,12 +1729,19 @@ bool should_generate_view_updates_on_this_shard(const schema_ptr& base, const lo
     // Based on the computation in get_view_natural_endpoint, this is used
     // to detect beforehand the case that we're a "normal" replica which is
     // paired with a view replica and sends view updates to.
-    // For a pending replica, for example, this will return false.
+    // A base replica can be paired with a view replica if it's a "normal" non-pending replica that is
+    // returned by get_replicas() or it could be a pending replica that is also a read replica
+    // and returned by get_replicas_for_reading().
+    // For a pending replica that is not ready for reading, for example, this will return false.
     // Also, for the case of intra-node migration, we check that this shard is ready for reads.
-    const auto my_host_id = ermp->get_token_metadata_ptr()->get_topology().my_host_id();
-    const auto replicas = ermp->get_replicas(token);
-    return std::find(replicas.begin(), replicas.end(), my_host_id) != replicas.end()
-        && ermp->shard_for_reads(*base, token) == this_shard_id();
+
+    const auto me = ermp->get_token_metadata_ptr()->get_topology().my_host_id();
+    const auto base_replicas = ermp->get_replicas(token);
+    const auto read_replicas = ermp->get_replicas_for_reading(token);
+    const auto shards = ermp->shards_ready_for_reads(*base, token);
+
+    return (std::ranges::contains(base_replicas, me) || std::ranges::contains(read_replicas, me))
+        && std::ranges::contains(shards, this_shard_id());
 }
 
 // Calculate the node ("natural endpoint") to which this node should send
@@ -1810,8 +1782,24 @@ bool should_generate_view_updates_on_this_shard(const schema_ptr& base, const lo
 //
 // If the assumption that the given base token belongs to this replica
 // does not hold, we return an empty optional.
-std::optional<locator::host_id>
-get_view_natural_endpoint(
+//
+// Aside from the paired replica, we may return another replica that we should
+// send the update to - the extra replica is then returned as the second replica
+// in the pair. The second replica is returned when it can't get paired with
+// any base replica. This can happen when the base table is undergoing
+// an increase in the replication factor. The view replica may finish the
+// RF change before the base replica, and since we only pair replicas that
+// finished the change, the view replica may not have a base replica to pair with.
+// To make sure it gets the update regardless, each base replica which detects such
+// a scenario will also send the update to the new view replica.
+// If this scenario does not occur, we return an empty optional as the
+// second replica.
+// We don't need to return the second replica if we have more base replicas than
+// view replicas - in that case the corresponding view replica will get the
+// update anyway, because either the streaming didn't start yet, so the update
+// will get streamed later, or it's still pending and it will get the update
+// because we also send updates from all base replicas to the pending view replicas.
+endpoints_to_update get_view_natural_endpoint(
         locator::host_id me,
         const locator::effective_replication_map_ptr& base_erm,
         const locator::effective_replication_map_ptr& view_erm,
@@ -1822,6 +1810,7 @@ get_view_natural_endpoint(
         bool use_tablets_rack_aware_view_pairing,
         replica::cf_stats& cf_stats) {
     auto& topology = base_erm->get_token_metadata_ptr()->get_topology();
+    auto& view_topology = view_erm->get_token_metadata_ptr()->get_topology();
     auto& my_location = topology.get_location(me);
     auto& my_datacenter = my_location.dc;
     auto* network_topology = dynamic_cast<const locator::network_topology_strategy*>(&replication_strategy);
@@ -1831,7 +1820,89 @@ get_view_natural_endpoint(
     node_vector orig_base_endpoints, orig_view_endpoints;
     node_vector base_endpoints, view_endpoints;
 
-    if (rack_aware_pairing) {
+    auto resolve = [&] (const locator::topology& topology, const locator::host_id& ep, bool is_view) -> const locator::node& {
+        if (auto* np = topology.find_node(ep)) {
+            return *np;
+        }
+        throw std::runtime_error(format("get_view_natural_endpoint: {} replica {} not found in topology", is_view ? "view" : "base", ep));
+    };
+
+    // We need to use get_replicas() for pairing to be stable in case base or view tablet
+    // is rebuilding a replica which has left the ring. get_natural_endpoints() filters such replicas.
+    auto base_nodes = base_erm->get_replicas(base_token) | std::views::transform([&] (const locator::host_id& ep) -> const locator::node& {
+        return resolve(topology, ep, false);
+    }) | std::ranges::to<node_vector>();
+    auto view_nodes = view_erm->get_replicas(view_token) | std::views::transform([&] (const locator::host_id& ep) -> const locator::node& {
+        return resolve(view_topology, ep, true);
+    }) | std::ranges::to<node_vector>();
+
+    // if we're a pending base replica and we're ready for reading then we should generate view updates same as
+    // the base replica that we are about to replace in the base-view pairing.
+    if (!std::ranges::contains(base_nodes, me, std::mem_fn(&locator::node::host_id))) {
+        // if we got here it's probably because we're a pending base replica that is ready for reads.
+        auto base_reading_replicas = std::unordered_set(std::from_range, base_erm->get_replicas_for_reading(base_token));
+        if (base_reading_replicas.contains(me)) {
+            // find a normal base replica that is not a reading replica - it's a leaving base replica that we replace.
+            auto it = std::ranges::find_if(base_nodes, [&] (const locator::node& n) {
+                return !base_reading_replicas.contains(n.host_id());
+            });
+            if (it != base_nodes.end()) {
+                // call get_view_natural_endpoint recursively with the leaving base replica as 'me' to get the same
+                // view pairing as the leaving base replica.
+                // note that the recursive call will not recurse again because leaving_base is in base_nodes.
+                auto leaving_base = it->get().host_id();
+                return get_view_natural_endpoint(leaving_base, base_erm, view_erm, replication_strategy, base_token,
+                        view_token, use_legacy_self_pairing, use_tablets_rack_aware_view_pairing, cf_stats);
+            }
+        }
+    }
+
+    std::function<bool(const locator::node&)> is_candidate;
+    if (network_topology) {
+        is_candidate = [&] (const locator::node& node) { return node.dc() == my_datacenter; };
+    } else {
+        is_candidate = [&] (const locator::node&) { return true; };
+    }
+    auto process_candidate = [&] (node_vector& nodes, std::reference_wrapper<const locator::node> node) {
+        if (is_candidate(node)) {
+            nodes.emplace_back(node);
+        }
+    };
+
+    for (auto&& base_node : base_nodes) {
+        process_candidate(base_endpoints, base_node);
+    }
+
+    if (use_legacy_self_pairing) {
+        for (auto&& view_node : view_nodes) {
+            auto it = std::ranges::find(base_endpoints, view_node.get().host_id(), std::mem_fn(&locator::node::host_id));
+            // If this base replica is also one of the view replicas, we use
+            // ourselves as the view replica.
+            // We don't return an extra endpoint, as it's only needed when
+            // using tablets (so !use_legacy_self_pairing)
+            if (view_node.get().host_id() == me && it != base_endpoints.end()) {
+                return {.natural_endpoint = me};
+            }
+
+            // We have to remove any endpoint which is shared between the base
+            // and the view, as it will select itself and throw off the counts
+            // otherwise.
+            if (it != base_endpoints.end()) {
+                base_endpoints.erase(it);
+            } else if (is_candidate(view_node)) {
+                view_endpoints.push_back(view_node);
+            }
+        }
+    } else {
+        for (auto&& view_node : view_nodes) {
+            process_candidate(view_endpoints, view_node);
+        }
+    }
+
+    // Try optimizing for simple rack-aware pairing
+    // If the numbers of base and view replica differ, that means an RF change is taking place
+    // and we can't use simple rack-aware pairing.
+    if (rack_aware_pairing && base_endpoints.size() == view_endpoints.size()) {
         auto dc_rf = network_topology->get_replication_factor(my_datacenter);
         const auto& racks = topology.get_datacenter_rack_nodes().at(my_datacenter);
         // Simple rack-aware pairing is possible when the datacenter replication factor
@@ -1848,60 +1919,14 @@ get_view_natural_endpoint(
                 }
             }
         }
-    }
-
-    auto resolve = [&] (const locator::topology& topology, const locator::host_id& ep, bool is_view) -> const locator::node& {
-        if (auto* np = topology.find_node(ep)) {
-            return *np;
+        if (dc_rf != base_endpoints.size()) {
+            // If the datacenter replication factor is not equal to the number of base replicas,
+            // we're in progress of a RF change and we can't use simple rack-aware pairing.
+            simple_rack_aware_pairing = false;
         }
-        throw std::runtime_error(format("get_view_natural_endpoint: {} replica {} not found in topology", is_view ? "view" : "base", ep));
-    };
-    std::function<bool(const locator::node&)> is_candidate;
-    if (simple_rack_aware_pairing) {
-        is_candidate = [&] (const locator::node& node) { return node.dc_rack() == my_location; };
-    } else if (network_topology) {
-        // Also for the (rack_aware_pairing && !simple_rack_aware_pairing) case
-        is_candidate = [&] (const locator::node& node) { return node.dc() == my_datacenter; };
-    } else {
-        is_candidate = [&] (const locator::node&) { return true; };
-    }
-    auto process_candidate = [&] (node_vector& nodes, const locator::topology& topology, const locator::host_id& ep, bool is_view) {
-        auto& node = resolve(topology, ep, is_view);
-        if (is_candidate(node)) {
-            nodes.emplace_back(node);
-        }
-    };
-
-    // We need to use get_replicas() for pairing to be stable in case base or view tablet
-    // is rebuilding a replica which has left the ring. get_natural_endpoints() filters such replicas.
-    for (auto&& base_endpoint : base_erm->get_replicas(base_token)) {
-        process_candidate(base_endpoints, topology, base_endpoint, false);
-    }
-
-    auto& view_topology = view_erm->get_token_metadata_ptr()->get_topology();
-    if (use_legacy_self_pairing) {
-        for (auto&& view_endpoint : view_erm->get_replicas(view_token)) {
-            auto it = std::ranges::find(base_endpoints, view_endpoint, std::mem_fn(&locator::node::host_id));
-            // If this base replica is also one of the view replicas, we use
-            // ourselves as the view replica.
-            if (view_endpoint == me && it != base_endpoints.end()) {
-                return me;
-            }
-            // We have to remove any endpoint which is shared between the base
-            // and the view, as it will select itself and throw off the counts
-            // otherwise.
-            if (it != base_endpoints.end()) {
-                base_endpoints.erase(it);
-            } else {
-                auto& node = resolve(view_topology, view_endpoint, true);
-                if (!network_topology || node.dc() == my_datacenter) {
-                    view_endpoints.push_back(node);
-                }
-            }
-        }
-    } else {
-        for (auto&& view_endpoint : view_erm->get_replicas(view_token)) {
-            process_candidate(view_endpoints, view_topology, view_endpoint, true);
+        if (simple_rack_aware_pairing) {
+            std::erase_if(base_endpoints, [&] (const locator::node& node) { return node.dc_rack() != my_location; });
+            std::erase_if(view_endpoints, [&] (const locator::node& node) { return node.dc_rack() != my_location; });
         }
     }
 
@@ -1911,6 +1936,7 @@ get_view_natural_endpoint(
     // For the complex rack_aware_pairing case, nodes are already filtered by datacenter
     // Use best-match, for the minimum number of base and view replicas in each rack,
     // and ordinal match for the rest.
+    std::optional<std::reference_wrapper<const locator::node>> paired_replica;
     if (rack_aware_pairing && !simple_rack_aware_pairing) {
         struct indexed_replica {
             size_t idx;
@@ -1932,12 +1958,18 @@ get_view_natural_endpoint(
         const auto& my_base_replicas = base_racks[my_location.rack];
         auto base_it = std::ranges::find(my_base_replicas, me, [] (const indexed_replica& ir) { return ir.node.get().host_id(); });
         if (base_it == my_base_replicas.end()) {
-            return std::nullopt;
+            return {};
         }
         const auto& my_view_replicas = view_racks[my_location.rack];
         size_t idx = base_it - my_base_replicas.begin();
         if (idx < my_view_replicas.size()) {
-            return my_view_replicas[idx].node.get().host_id();
+            if (orig_view_endpoints.size() <= orig_base_endpoints.size()) {
+                return {.natural_endpoint = my_view_replicas[idx].node.get().host_id()};
+            } else {
+                // If the number of view replicas is larger than the number of base replicas,
+                // we need to find the unpaired view replica, so we can't return yet.
+                paired_replica = my_view_replicas[idx].node;
+            }
         }
 
         // Collect all unpaired base and view replicas,
@@ -1968,7 +2000,7 @@ get_view_natural_endpoint(
     }
 
     auto base_it = std::ranges::find(base_endpoints, me, std::mem_fn(&locator::node::host_id));
-    if (base_it == base_endpoints.end()) {
+    if (!paired_replica && base_it == base_endpoints.end()) {
         // This node is not a base replica of this key, so we return empty
         // FIXME: This case shouldn't happen, and if it happens, a view update
         // would be lost.
@@ -1978,7 +2010,8 @@ get_view_natural_endpoint(
         return {};
     }
     size_t idx = base_it - base_endpoints.begin();
-    if (idx >= view_endpoints.size()) {
+    std::optional<std::reference_wrapper<const locator::node>> no_pairing_replica;
+    if (!paired_replica && idx >= view_endpoints.size()) {
         // There are fewer view replicas than base replicas
         // FIXME: This might still happen when reducing replication factor with tablets,
         // see https://github.com/scylladb/scylladb/issues/21492
@@ -1988,8 +2021,41 @@ get_view_natural_endpoint(
                 orig_base_endpoints | std::views::transform(std::mem_fn(&locator::node::host_id)),
                 orig_view_endpoints | std::views::transform(std::mem_fn(&locator::node::host_id)));
         return {};
+    } else if (base_endpoints.size() < view_endpoints.size()) {
+        // There are fewer base replicas than view replicas.
+        // This can happen as a result of an RF change when the view replica finishes streaming
+        // before the base replica.
+        // Because of this, a view replica might not get paired with any base replica, so we need
+        // to send an additional update to it.
+        ++cf_stats.total_view_updates_due_to_replica_count_mismatch;
+        no_pairing_replica = view_endpoints.back();
+        if (base_endpoints.size() < view_endpoints.size() - 1) {
+            // We only expect one extra replica to appear due to an RF change. If there's more, that's an error,
+            // but we'll still perform updates to the paired and last replicas to minimize degradation.
+            vlogger.warn("There are too many view endpoints for base-view pairing. View updates may get lost on view_endpoints={}",
+                    std::span(view_endpoints.begin() + base_endpoints.size(), view_endpoints.end() - 1) | std::views::transform(std::mem_fn(&locator::node::host_id)));
+        }
     }
 
+    if (!paired_replica) {
+        paired_replica = view_endpoints[idx];
+    }
+    if (!no_pairing_replica && base_nodes.size() < view_nodes.size()) {
+        // This can happen when the view replica with no pairing is in another DC.
+        // We need to send an update to it if there are no base replicas in that DC yet,
+        // as it won't receive updates otherwise.
+        std::unordered_set<sstring> dcs_with_base_replicas;
+        for (const auto& base_node : base_nodes) {
+            dcs_with_base_replicas.insert(base_node.get().dc());
+        }
+        for (const auto& view_node : view_nodes) {
+            if (!dcs_with_base_replicas.contains(view_node.get().dc())) {
+                ++cf_stats.total_view_updates_due_to_replica_count_mismatch;
+                no_pairing_replica = view_node;
+                break;
+            }
+        }
+    }
     // https://github.com/scylladb/scylladb/issues/19439
     // With tablets, a node being replaced might transition to "left" state
     // but still be kept as a replica.
@@ -1997,12 +2063,20 @@ get_view_natural_endpoint(
     // but are still replicas. Therefore, there is no other sensible option
     // right now but to give up attempt to send the update or write a hint
     // to the paired, permanently down replica.
-    const auto& node = view_endpoints[idx].get();
-    if (!node.left()) {
-        return node.host_id();
-    } else {
-        return std::nullopt;
-    }
+    // We use the same workaround for the extra replica.
+    auto return_host_id_if_not_left = [] (const auto& replica) -> std::optional<locator::host_id> {
+        if (!replica) {
+            return std::nullopt;
+        }
+        const auto& node = replica->get();
+        if (!node.left()) {
+            return node.host_id();
+        } else {
+            return std::nullopt;
+        }
+    };
+    return {.natural_endpoint = return_host_id_if_not_left(paired_replica),
+            .endpoint_with_no_pairing = return_host_id_if_not_left(no_pairing_replica)};
 }
 
 static future<> apply_to_remote_endpoints(service::storage_proxy& proxy, locator::effective_replication_map_ptr ermp,
@@ -2056,7 +2130,7 @@ future<> view_update_generator::mutate_MV(
         db::view::stats& stats,
         replica::cf_stats& cf_stats,
         tracing::trace_state_ptr tr_state,
-        db::timeout_semaphore_units pending_view_updates,
+        db::timeout_semaphore_units pending_view_update_memory_units,
         service::allow_hints allow_hints,
         wait_for_all_updates wait_for_all)
 {
@@ -2090,10 +2164,20 @@ future<> view_update_generator::mutate_MV(
     co_await max_concurrent_for_each(view_updates, max_concurrent_updates, [&] (frozen_mutation_and_schema mut) mutable -> future<> {
         auto view_token = dht::get_token(*mut.s, mut.fm.key());
         auto view_ermp = erms.at(mut.s->id());
-        auto target_endpoint = get_view_natural_endpoint(me, base_ermp, view_ermp, replication, base_token, view_token,
+        auto [target_endpoint, no_pairing_endpoint] = get_view_natural_endpoint(me, base_ermp, view_ermp, replication, base_token, view_token,
                 use_legacy_self_pairing, use_tablets_rack_aware_view_pairing, cf_stats);
         auto remote_endpoints = view_ermp->get_pending_replicas(view_token);
-        auto sem_units = seastar::make_lw_shared<db::timeout_semaphore_units>(pending_view_updates.split(memory_usage_of(mut)));
+        auto memory_units = seastar::make_lw_shared<db::timeout_semaphore_units>(pending_view_update_memory_units.split(memory_usage_of(mut)));
+        if (no_pairing_endpoint) {
+            // The no_pairing_endpoint can appear during a replication factor increase when the base tablet migration finished after
+            // the corresponding (for current token) view tablet migration. In this case, the view replica is no longer
+            // in migration (so it's not present in the pending endpoints list), but the base replica didn't start the migration yet
+            // or is still pending. We don't pair pending replicas, so no base replica will pair with this view replica and we need
+            // to send the update to it.
+            // FIXME: Here we may unnecessarily send the update to the no_pairing_endpoint from many base replicas,
+            // similarly to https://github.com/scylladb/scylladb/issues/7711
+            remote_endpoints.push_back(std::move(*no_pairing_endpoint));
+        }
 
         const bool update_synchronously = should_update_synchronously(*mut.s);
         if (update_synchronously) {
@@ -2144,11 +2228,15 @@ future<> view_update_generator::mutate_MV(
             auto mut_ptr = remote_endpoints.empty() ? std::make_unique<frozen_mutation>(std::move(mut.fm)) : std::make_unique<frozen_mutation>(mut.fm);
             tracing::trace(tr_state, "Locally applying view update for {}.{}; base token = {}; view token = {}",
                     mut.s->ks_name(), mut.s->cf_name(), base_token, view_token);
+            // For local view updates, we limit the number of concurrent view updates on each shard and for each service level
+            // to database::max_concurrent_local_view_updates. Local view updates are cpu-bound, so the cpu won't idle even
+            // if the concurrency is low and executing too many view updates concurrently can unnecessarily increase latency and memory usage.
+            auto count_units = co_await seastar::get_units(_db.get_view_update_concurrency_sem(), 1);
             local_view_update = _proxy.local().mutate_mv_locally(mut.s, *mut_ptr, tr_state, db::commitlog::force_sync::no).then_wrapped(
                     [s = mut.s, &stats, &cf_stats, tr_state, base_token, view_token, my_address, mut_ptr = std::move(mut_ptr),
-                            sem_units, this] (future<>&& f) mutable {
+                            count_units = std::move(count_units), memory_units, this] (future<>&& f) mutable {
                 --stats.writes;
-                sem_units = nullptr;
+                memory_units = nullptr;
                 _proxy.local().update_view_update_backlog();
                 if (f.failed()) {
                     ++stats.view_updates_failed_local;
@@ -2184,8 +2272,8 @@ future<> view_update_generator::mutate_MV(
             schema_ptr s = mut.s;
             future<> remote_view_update = apply_to_remote_endpoints(_proxy.local(), std::move(view_ermp), *target_endpoint, std::move(remote_endpoints), std::move(mut), base_token, view_token, allow_hints, tr_state).then_wrapped(
                 [s = std::move(s), &stats, &cf_stats, tr_state, base_token, view_token, target_endpoint, updates_pushed_remote,
-                 sem_units, apply_update_synchronously, this] (future<>&& f) mutable {
-                sem_units = nullptr;
+                 memory_units, apply_update_synchronously, this] (future<>&& f) mutable {
+                memory_units = nullptr;
                 _proxy.local().update_view_update_backlog();
                 if (f.failed()) {
                     stats.view_updates_failed_remote += updates_pushed_remote;
@@ -2226,7 +2314,9 @@ view_builder::view_builder(replica::database& db, db::system_keyspace& sys_ks, d
         , _qp(qp)
         , _mnotifier(mn)
         , _vug(vug)
-        , _permit(_db.get_reader_concurrency_semaphore().make_tracking_only_permit(nullptr, "view_builder", db::no_timeout, {})) {
+        , _permit(_db.get_reader_concurrency_semaphore().make_tracking_only_permit(nullptr, "view_builder", db::no_timeout, {}))
+        , _upgrade_phaser("view_builder::upgrade_phaser")
+{
     setup_metrics();
 }
 
@@ -2351,24 +2441,25 @@ future<> view_builder::initialize_reader_at_current_token(build_step& step) {
   });
 }
 
-void view_builder::load_view_status(view_builder::view_build_status status, std::unordered_set<table_id>& loaded_views) {
-    if (!status.next_token) {
+void view_builder::load_view_status(view_builder::view_build_init_status status, std::unordered_set<table_id>& loaded_views) {
+    if (!status.first_token || !status.next_token) {
         // No progress was made on this view, so we'll treat it as new.
         return;
     }
     vlogger.info0("Resuming to build view {}.{} at {}", status.view->ks_name(), status.view->cf_name(), *status.next_token);
     loaded_views.insert(status.view->id());
-    if (status.first_token == *status.next_token) {
+    if (*status.first_token == *status.next_token) {
         // Completed, so nothing to do for this shard. Consider the view
         // as loaded and not as a new view.
         _built_views.emplace(status.view->id());
         return;
     }
-    get_or_create_build_step(status.view->view_info()->base_id()).build_status.emplace_back(std::move(status));
+    get_or_create_build_step(status.view->view_info()->base_id()).build_status.emplace_back(
+            view_build_status { status.view, *status.first_token, status.next_token });
 }
 
 void view_builder::reshard(
-        std::vector<std::vector<view_builder::view_build_status>> view_build_status_per_shard,
+        std::vector<std::vector<view_builder::view_build_init_status>> view_build_status_per_shard,
         std::unordered_set<table_id>& loaded_views) {
     // We must reshard. We aim for a simple algorithm, a step above not starting from scratch.
     // Shards build entries at different paces, so both first and last tokens will differ. We
@@ -2391,17 +2482,17 @@ void view_builder::reshard(
             auto& my_range = my_status.emplace(
                     std::move(view),
                     interval<dht::token>::make_open_ended_both_sides()).first->second;
-            if (!next_token || !my_range) {
+            if (!first_token || !next_token || !my_range) {
                 // A previous shard made no progress, so for this view we'll start over.
                 my_range = std::nullopt;
                 continue;
             }
-            if (first_token == *next_token) {
+            if (*first_token == *next_token) {
                 // Completed, so don't consider this shard's progress. We know that if the view
                 // is marked as in-progress, then at least one shard will have a non-full range.
                 continue;
             }
-            wrapping_interval<dht::token> other_range(first_token, *next_token);
+            wrapping_interval<dht::token> other_range(*first_token, *next_token);
             if (other_range.is_wrap_around(dht::token_comparator())) {
                 // The intersection of a wrapping range with a non-wrapping range may yield more
                 // multiple non-contiguous ranges. To avoid the complexity of dealing with more
@@ -2424,7 +2515,7 @@ void view_builder::reshard(
         }
         auto start_bound = opt_range->start() ? std::move(opt_range->start()->value()) : dht::minimum_token();
         auto end_bound = opt_range->end() ? std::move(opt_range->end()->value()) : dht::minimum_token();
-        auto s = view_build_status{std::move(view), std::move(start_bound), std::move(end_bound)};
+        auto s = view_build_init_status{std::move(view), std::move(start_bound), std::move(end_bound)};
         load_view_status(std::move(s), loaded_views);
     }
 }
@@ -2481,7 +2572,7 @@ void view_builder::setup_shard_build_step(
                 continue;
             }
             vbi.status_per_shard.resize(std::max(vbi.status_per_shard.size(), size_t(cpu_id + 1)));
-            vbi.status_per_shard[cpu_id].emplace_back(view_build_status{
+            vbi.status_per_shard[cpu_id].emplace_back(view_build_init_status{
                     std::move(view),
                     std::move(first_token),
                     std::move(next_token_opt)});
@@ -2509,6 +2600,9 @@ future<> view_builder::calculate_shard_build_step(view_builder_init_state& vbi) 
     }
 
     auto all_views = _db.get_views();
+    auto doesnt_use_tablets = [&] (const view_ptr& v) {
+        return !_db.find_keyspace(v->ks_name()).uses_tablets();
+    };
     auto is_new = [&] (const view_ptr& v) {
         // This is a safety check in case this node missed a create MV statement
         // but got a drop table for the base, and another node didn't get the
@@ -2516,7 +2610,7 @@ future<> view_builder::calculate_shard_build_step(view_builder_init_state& vbi) 
         return _db.column_family_exists(v->view_info()->base_id()) && !loaded_views.contains(v->id())
                 && !vbi.built_views.contains(v->id());
     };
-    for (auto&& view : all_views | std::views::filter(is_new)) {
+    for (auto&& view : all_views | std::views::filter(doesnt_use_tablets) | std::views::filter(is_new)) {
         vbi.bookkeeping_ops.push_back(add_new_view(view, get_or_create_build_step(view->view_info()->base_id())));
     }
 
@@ -2542,8 +2636,7 @@ static future<> announce_with_raft(
         cql3::query_processor& qp,
         ::service::raft_group0_client& group0_client,
         seastar::abort_source& as,
-        const sstring query_string,
-        std::vector<data_value_or_unset> values,
+        noncopyable_function<future<mutation>(api::timestamp_type)> mutation_gen,
         std::string_view description) {
     SCYLLA_ASSERT(this_shard_id() == 0);
 
@@ -2553,12 +2646,9 @@ static future<> announce_with_raft(
         auto guard = co_await group0_client.start_operation(as);
         auto timestamp = guard.write_timestamp();
 
-        auto muts = co_await qp.get_mutations_internal(
-                query_string,
-                view_builder_query_state(),
-                timestamp,
-                values);
-        std::vector<canonical_mutation> cmuts = {muts.begin(), muts.end()};
+        auto mut = co_await mutation_gen(guard.write_timestamp());
+        utils::chunked_vector<canonical_mutation> cmuts;
+        cmuts.emplace_back(std::move(mut));
 
         auto group0_cmd = group0_client.prepare_command(
             ::service::write_mutations{
@@ -2582,12 +2672,10 @@ future<> view_builder::mark_view_build_started(sstring ks_name, sstring view_nam
     co_await write_view_build_status(
         [this, ks_name, view_name] () -> future<> {
             co_await utils::get_local_injector().inject("view_builder_pause_add_new_view", utils::wait_for_message(5min));
-            const sstring query_string = format("INSERT INTO {}.{} (keyspace_name, view_name, host_id, status) VALUES (?, ?, ?, ?)",
-                    db::system_keyspace::NAME, db::system_keyspace::VIEW_BUILD_STATUS_V2);
             auto host_id = _db.get_token_metadata().get_my_id();
-            co_await announce_with_raft(_qp, _group0_client, _as, std::move(query_string),
-                    {std::move(ks_name), std::move(view_name), host_id.uuid(), "STARTED"},
-                    "view builder: mark view build STARTED");
+            co_await announce_with_raft(_qp, _group0_client, _as, [this, ks_name = std::move(ks_name), view_name = std::move(view_name), host_id] (auto ts) {
+                        return _sys_ks.make_view_build_status_mutation(ts, {ks_name, view_name}, host_id, build_status::STARTED);
+                    }, "view builder: mark view build STARTED");
         },
         [this, ks_name, view_name] () -> future<> {
             co_await utils::get_local_injector().inject("view_builder_pause_add_new_view", utils::wait_for_message(5min));
@@ -2600,12 +2688,10 @@ future<> view_builder::mark_view_build_success(sstring ks_name, sstring view_nam
     co_await write_view_build_status(
         [this, ks_name, view_name] () -> future<> {
             co_await utils::get_local_injector().inject("view_builder_pause_mark_success", utils::wait_for_message(5min));
-            const sstring query_string = format("UPDATE {}.{} SET status = ? WHERE keyspace_name = ? AND view_name = ? AND host_id = ?",
-                    db::system_keyspace::NAME, db::system_keyspace::VIEW_BUILD_STATUS_V2);
             auto host_id = _db.get_token_metadata().get_my_id();
-            co_await announce_with_raft(_qp, _group0_client, _as, std::move(query_string),
-                    {"SUCCESS", std::move(ks_name), std::move(view_name), host_id.uuid()},
-                    "view builder: mark view build SUCCESS");
+            co_await announce_with_raft(_qp, _group0_client, _as, [this, ks_name = std::move(ks_name), view_name = std::move(view_name), host_id] (auto ts) {
+                        return _sys_ks.make_view_build_status_update_mutation(ts, {ks_name, view_name}, host_id, build_status::SUCCESS);
+                    }, "view builder: mark view build SUCCESS");
         },
         [this, ks_name, view_name] () -> future<> {
             co_await utils::get_local_injector().inject("view_builder_pause_mark_success", utils::wait_for_message(5min));
@@ -2617,11 +2703,9 @@ future<> view_builder::mark_view_build_success(sstring ks_name, sstring view_nam
 future<> view_builder::remove_view_build_status(sstring ks_name, sstring view_name) {
     co_await write_view_build_status(
         [this, ks_name, view_name] () -> future<> {
-            const sstring query_string = format("DELETE FROM {}.{} WHERE keyspace_name = ? AND view_name = ?",
-                    db::system_keyspace::NAME, db::system_keyspace::VIEW_BUILD_STATUS_V2);
-            co_await announce_with_raft(_qp, _group0_client, _as, std::move(query_string),
-                    {std::move(ks_name), std::move(view_name)},
-                    "view builder: delete view build status");
+            co_await announce_with_raft(_qp, _group0_client, _as, [this, ks_name = std::move(ks_name), view_name = std::move(view_name)] (auto ts) {
+                        return _sys_ks.make_remove_view_build_status_mutation(ts, {ks_name, view_name});
+                    }, "view builder: delete view build status");
         },
         [this, ks_name, view_name] () -> future<> {
             co_await _sys_dist_ks.remove_view(std::move(ks_name), std::move(view_name));
@@ -2675,24 +2759,24 @@ future<> view_builder::add_new_view(view_ptr view, build_step& step) {
     if (this_shard_id() == 0) {
         co_await mark_view_build_started(view->ks_name(), view->cf_name());
     }
-    co_await _sys_ks.register_view_for_building(view->ks_name(), view->cf_name(), step.current_token());
+
+    if (this_shard_id() == smp::count - 1) {
+        co_await utils::get_local_injector().inject("add_new_view_pause_last_shard", utils::wait_for_message(5min));
+    }
+
+    co_await _sys_ks.register_view_for_building_for_all_shards(view->ks_name(), view->cf_name(), step.current_token());
     step.build_status.emplace(step.build_status.begin(), view_build_status{view, step.current_token(), std::nullopt});
 }
 
-static future<> flush_base(lw_shared_ptr<replica::column_family> base, abort_source& as) {
-    struct empty_state { };
-    return exponential_backoff_retry::do_until_value(1s, 1min, as, [base = std::move(base)] {
-        return base->flush().then_wrapped([base] (future<> f) -> std::optional<empty_state> {
-            if (f.failed()) {
-                vlogger.error("Error flushing base table {}.{}: {}; retrying", base->schema()->ks_name(), base->schema()->cf_name(), f.get_exception());
-                return { };
-            }
-            return { empty_state{} };
-        });
-    }).discard_result();
+static bool should_ignore_tablet_keyspace(const replica::database& db, const sstring& ks_name) {
+    return db.features().view_building_coordinator && db.has_keyspace(ks_name) && db.find_keyspace(ks_name).uses_tablets();
 }
 
 void view_builder::on_create_view(const sstring& ks_name, const sstring& view_name) {
+    if (should_ignore_tablet_keyspace(_db, ks_name)) {
+        return;
+    }
+
     // Do it in the background, serialized.
     (void)with_semaphore(_sem, 1, [ks_name, view_name, this] {
         auto view = view_ptr(_db.find_schema(ks_name, view_name));
@@ -2706,9 +2790,16 @@ void view_builder::on_create_view(const sstring& ks_name, const sstring& view_na
             // threshold.
           return initialize_reader_at_current_token(step).then([this, view, &step] () mutable {
             return add_new_view(view, step).then_wrapped([this, view] (future<>&& f) {
-                if (f.failed()) {
-                    vlogger.error("Error setting up view for building {}.{}: {}", view->ks_name(), view->cf_name(), f.get_exception());
+                try {
+                    f.get();
+                } catch (abort_requested_exception&) {
+                    vlogger.debug("Aborted while setting up view for building {}.{}", view->ks_name(), view->cf_name());
+                } catch (raft::request_aborted&) {
+                    vlogger.debug("Aborted while setting up view for building {}.{}", view->ks_name(), view->cf_name());
+                } catch (...) {
+                    vlogger.error("Error setting up view for building {}.{}: {}", view->ks_name(), view->cf_name(), std::current_exception());
                 }
+
                 // Waited on indirectly in stop().
                 (void)_build_step.trigger();
             });
@@ -2718,6 +2809,10 @@ void view_builder::on_create_view(const sstring& ks_name, const sstring& view_na
 }
 
 void view_builder::on_update_view(const sstring& ks_name, const sstring& view_name, bool) {
+    if (should_ignore_tablet_keyspace(_db, ks_name)) {
+        return;
+    }
+
     // Do it in the background, serialized.
     (void)with_semaphore(_sem, 1, [ks_name, view_name, this] {
         auto view = view_ptr(_db.find_schema(ks_name, view_name));
@@ -2735,6 +2830,10 @@ void view_builder::on_update_view(const sstring& ks_name, const sstring& view_na
 }
 
 void view_builder::on_drop_view(const sstring& ks_name, const sstring& view_name) {
+    if (should_ignore_tablet_keyspace(_db, ks_name)) {
+        return;
+    }
+
     vlogger.info0("Stopping to build view {}.{}", ks_name, view_name);
     // Do it in the background, serialized.
     (void)with_semaphore(_sem, 1, [ks_name, view_name, this] {
@@ -2768,7 +2867,7 @@ void view_builder::on_drop_view(const sstring& ks_name, const sstring& view_name
                         .handle_exception([ks_name, view_name] (std::exception_ptr ep) {
             vlogger.warn("Failed to cleanup view {}.{}: {}", ks_name, view_name, ep);
         });
-    });
+    }).handle_exception_type([] (replica::no_such_keyspace&) {});
 }
 
 future<> view_builder::do_build_step() {
@@ -2811,7 +2910,7 @@ future<> view_builder::do_build_step() {
     });
 }
 
-future<> view_builder::generate_mutations_on_node_left(replica::database& db, db::system_keyspace& sys_ks, api::timestamp_type timestamp, locator::host_id host_id, std::vector<canonical_mutation>& muts) {
+future<> view_builder::generate_mutations_on_node_left(replica::database& db, db::system_keyspace& sys_ks, api::timestamp_type timestamp, locator::host_id host_id, utils::chunked_vector<canonical_mutation>& muts) {
     // When a node is removed, we delete all its rows from the view_build_status table together with
     // the topology update operation.
 
@@ -2822,21 +2921,14 @@ future<> view_builder::generate_mutations_on_node_left(replica::database& db, db
     }
 
     auto& qp = sys_ks.query_processor();
-
-    const sstring query_string = format("DELETE FROM {}.{} WHERE keyspace_name = ? AND view_name = ? AND host_id = ?",
-            db::system_keyspace::NAME, db::system_keyspace::VIEW_BUILD_STATUS_V2);
-
     muts.reserve(muts.size() + db.get_views().size());
-
     // We expect the table to have a row for each existing view, so generate delete mutations for all views.
     for (auto& view : db.get_views()) {
-        auto vb_muts = co_await qp.get_mutations_internal(
-                query_string,
-                view_builder_query_state(),
-                timestamp,
-                {view->ks_name(), view->cf_name(), host_id.uuid()});
-        SCYLLA_ASSERT(vb_muts.size() == 1);
-        muts.push_back(canonical_mutation(std::move(vb_muts[0])));
+        if (should_ignore_tablet_keyspace(db, view->ks_name())) {
+            continue;
+        }
+        auto mut = co_await sys_ks.make_remove_view_build_status_on_host_mutation(timestamp, {view->ks_name(), view->cf_name()}, host_id);
+        muts.emplace_back(std::move(mut));
     }
 }
 
@@ -2885,7 +2977,7 @@ future<> view_builder::migrate_to_v2(locator::token_metadata_ptr tmptr, db::syst
         val_binders_str += ", ?";
     }
 
-    std::vector<mutation> migration_muts;
+    utils::chunked_vector<mutation> migration_muts;
     migration_muts.reserve(rows->size() + 1);
 
     // Insert all valid rows into the new table.
@@ -2911,7 +3003,7 @@ future<> view_builder::migrate_to_v2(locator::token_metadata_ptr tmptr, db::syst
         std::vector<data_value_or_unset> values;
         for (const auto& col: schema->all_columns()) {
             if (row.has(col.name_as_text())) {
-                values.push_back(col.type->deserialize(row.get_blob(col.name_as_text())));
+                values.push_back(col.type->deserialize(row.get_blob_unfragmented(col.name_as_text())));
             } else {
                 values.push_back(unset_value{});
             }
@@ -3001,7 +3093,7 @@ void view_builder::init_virtual_table() {
 
         auto& table_v2 = _db.find_column_family(db::system_keyspace::view_build_status_v2());
 
-        mutation_reader ms_reader = make_multishard_combining_reader_v2(
+        mutation_reader ms_reader = make_multishard_combining_reader(
                 seastar::make_shared<streaming_reader_lifecycle_policy>(_db.container(), table_v2.schema()->id(), gc_clock::now()),
                 table_v2.schema(),
                 table_v2.get_effective_replication_map(),
@@ -3026,7 +3118,7 @@ void view_builder::init_virtual_table() {
 }
 
 // Called in the context of a seastar::thread.
-class view_builder::consumer {
+class view_builder::consumer : public view_consumer {
 public:
     struct built_views {
         build_step& step;
@@ -3055,51 +3147,11 @@ public:
 
 private:
     view_builder& _builder;
-    shared_ptr<view_update_generator> _gen;
     build_step& _step;
     built_views _built_views;
-    gc_clock::time_point _now;
-    std::vector<view_ptr> _views_to_build;
-    std::deque<mutation_fragment_v2> _fragments;
-    // The compact_for_query<> that feeds this consumer is already configured
-    // to feed us up to view_builder::batchsize (128) rows and not an entire
-    // partition. Still, if rows contain large blobs, saving 128 of them in
-    // _fragments may be too much. So we want to track _fragment's memory
-    // usage, and flush the _fragments if it has grown too large.
-    // Additionally, limiting _fragment's size also solves issue #4213:
-    // A single view mutation can be as large as the size of the base rows
-    // used to build it, and we cannot allow its serialized size to grow
-    // beyond our limit on mutation size (by default 32 MB).
-    size_t _fragments_memory_usage = 0;
-public:
-    consumer(view_builder& builder, shared_ptr<view_update_generator> gen, build_step& step, gc_clock::time_point now)
-            : _builder(builder)
-            , _gen(std::move(gen))
-            , _step(step)
-            , _built_views{step}
-            , _now(now) {
-        if (!step.current_key.key().is_empty(*_step.reader.schema())) {
-            load_views_to_build();
-        }
-    }
 
-    void load_views_to_build() {
-        inject_failure("view_builder_load_views");
-        for (auto&& vs : _step.build_status) {
-            if (_step.current_token() >= vs.next_token) {
-                if (partition_key_matches(_builder.get_db().as_data_dictionary(), *_step.reader.schema(), *vs.view->view_info(), _step.current_key)) {
-                    _views_to_build.push_back(vs.view);
-                }
-                if (vs.next_token || _step.current_token() != vs.first_token) {
-                    vs.next_token = _step.current_key.token();
-                }
-            } else {
-                break;
-            }
-        }
-    }
-
-    void check_for_built_views() {
+protected:
+    virtual void check_for_built_views() override {
         inject_failure("view_builder_check_for_built_views");
         for (auto it = _step.build_status.begin(); it != _step.build_status.end();) {
             // A view starts being built at token t1. Due to resharding, that may not necessarily be a
@@ -3115,13 +3167,60 @@ public:
             }
         }
     }
+    virtual void load_views_to_build() override {
+        inject_failure("view_builder_load_views");
+        for (auto&& vs : _step.build_status) {
+            if (_step.current_token() >= vs.next_token) {
+                if (partition_key_matches(_builder.get_db().as_data_dictionary(), *_step.reader.schema(), *vs.view->view_info(), _step.current_key)) {
+                    _views_to_build.push_back(vs.view);
+                }
+                if (vs.next_token || _step.current_token() != vs.first_token) {
+                    vs.next_token = _step.current_key.token();
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    virtual bool should_stop_consuming_end_of_partition() override {
+        return _step.build_status.empty();
+    }
+
+    virtual dht::decorated_key& get_current_key() override {
+        return _step.current_key;
+    }
+    virtual void set_current_key(dht::decorated_key key) override {
+        _step.current_key = std::move(key);
+    }
+
+    virtual lw_shared_ptr<replica::table> base() override {
+        return _step.base;
+    }
+    virtual mutation_reader& reader() override {
+        return _step.reader;
+    }
+    virtual reader_permit& permit() override {
+        return _builder._permit;
+    }
+
+public:
+    consumer(view_builder& builder, shared_ptr<view_update_generator> gen, build_step& step, gc_clock::time_point now)
+            : view_consumer(std::move(gen), now, builder._as)
+            , _builder(builder)
+            , _step(step)
+            , _built_views{step} {
+        if (!step.current_key.key().is_empty(*_step.reader.schema())) {
+            load_views_to_build();
+        }
+    }
 
     stop_iteration consume_new_partition(const dht::decorated_key& dk) {
         inject_failure("view_builder_consume_new_partition");
         if (dk.key().is_empty()) {
             on_internal_error(vlogger, format("Trying to consume empty partition key {}", dk));
         }
-        _step.current_key = std::move(dk);
+        set_current_key(std::move(dk));
         check_for_built_views();
         _views_to_build.clear();
         load_views_to_build();
@@ -3157,8 +3256,8 @@ public:
     }
 
     void add_fragment(auto&& fragment) {
-        _fragments_memory_usage += fragment.memory_usage(*_step.reader.schema());
-        _fragments.emplace_back(*_step.reader.schema(), _builder._permit, std::move(fragment));
+        _fragments_memory_usage += fragment.memory_usage(*reader().schema());
+        _fragments.emplace_back(*reader().schema(), permit(), std::move(fragment));
         if (_fragments_memory_usage > batch_memory_max) {
             // Although we have not yet completed the batch of base rows that
             // compact_for_query<> planned for us (view_builder::batchsize),
@@ -3177,17 +3276,16 @@ public:
         inject_failure("view_builder_flush_fragments");
         _builder._as.check();
         if (!_fragments.empty()) {
-            _fragments.emplace_front(*_step.reader.schema(), _builder._permit, partition_start(_step.current_key, tombstone()));
-            auto base_schema = _step.base->schema();
-            auto views = with_base_info_snapshot(_views_to_build);
-            auto reader = make_mutation_reader_from_fragments(_step.reader.schema(), _builder._permit, std::move(_fragments));
-            auto close_reader = defer([&reader] { reader.close().get(); });
-            reader.upgrade_schema(base_schema);
+            _fragments.emplace_front(*reader().schema(), permit(), partition_start(get_current_key(), tombstone()));
+            auto base_schema = base()->schema();
+            auto fragments_reader = make_mutation_reader_from_fragments(reader().schema(), permit(), std::move(_fragments));
+            auto close_reader = defer([&fragments_reader] { fragments_reader.close().get(); });
+            fragments_reader.upgrade_schema(base_schema);
             _gen->populate_views(
-                    *_step.base,
-                    std::move(views),
-                    _step.current_token(),
-                    std::move(reader),
+                    *base(),
+                    _views_to_build,
+                    get_current_key().token(),
+                    std::move(fragments_reader),
                     _now).get();
             close_reader.cancel();
             _fragments.clear();
@@ -3197,8 +3295,9 @@ public:
 
     stop_iteration consume_end_of_partition() {
         inject_failure("view_builder_consume_end_of_partition");
+        utils::get_local_injector().inject("view_builder_consume_end_of_partition_delay", utils::wait_for_message(std::chrono::seconds(60))).get();
         flush_fragments();
-        return stop_iteration(_step.build_status.empty());
+        return stop_iteration(should_stop_consuming_end_of_partition());
     }
 
     // Must be called in a seastar thread.
@@ -3212,18 +3311,9 @@ public:
                           _step.base->schema()->cf_name(), _step.current_token(), view_names);
         }
         if (_step.reader.is_end_of_stream() && _step.reader.is_buffer_empty()) {
-            if (_step.current_key.key().is_empty()) {
-                // consumer got end-of-stream without consuming a single partition
-                vlogger.debug("Reader didn't produce anything, marking views as built");
-                while (!_step.build_status.empty()) {
-                    _built_views.views.push_back(std::move(_step.build_status.back()));
-                    _step.build_status.pop_back();
-                }
-            }
-
             // before going back to the minimum token, advance current_key to the end
             // and check for built views in that range.
-            _step.current_key = {_step.prange.end().value_or(dht::ring_position::max()).value().token(), partition_key::make_empty()};
+            _step.current_key = { _step.prange.end().value_or(dht::ring_position::max()).value().token(), partition_key::make_empty()};
             check_for_built_views();
 
             _step.current_key = {dht::minimum_token(), partition_key::make_empty()};
@@ -3239,14 +3329,16 @@ public:
 
 // Called in the context of a seastar::thread.
 void view_builder::execute(build_step& step, exponential_backoff_retry r) {
+    inject_failure("dont_start_build_step");
     gc_clock::time_point now = gc_clock::now();
-    auto compaction_state = make_lw_shared<compact_for_query_state_v2>(
+    auto compaction_state = make_lw_shared<compact_for_query_state>(
             *step.reader.schema(),
             now,
             step.pslice,
             batch_size,
-            query::max_partitions);
-    auto consumer = compact_for_query_v2<view_builder::consumer>(compaction_state, view_builder::consumer{*this, _vug.shared_from_this(), step, now});
+            query::max_partitions,
+            tombstone_gc_state(nullptr));
+    auto consumer = compact_for_query<view_builder::consumer>(compaction_state, view_builder::consumer{*this, _vug.shared_from_this(), step, now});
     auto built = step.reader.consume_in_thread(std::move(consumer));
     if (auto ds = std::move(*compaction_state).detach_state()) {
         if (ds->current_tombstone) {
@@ -3272,6 +3364,7 @@ void view_builder::execute(build_step& step, exponential_backoff_retry r) {
     seastar::when_all_succeed(bookkeeping_ops.begin(), bookkeeping_ops.end()).handle_exception([] (std::exception_ptr ep) {
         vlogger.warn("Failed to update materialized view bookkeeping ({}), continuing anyway.", ep);
     }).get();
+    utils::get_local_injector().inject("delay_finishing_build_step", utils::wait_for_message(60s)).get();
 }
 
 future<> view_builder::mark_as_built(view_ptr view) {
@@ -3283,7 +3376,9 @@ future<> view_builder::mark_as_built(view_ptr view) {
 future<> view_builder::mark_existing_views_as_built() {
     SCYLLA_ASSERT(this_shard_id() == 0);
     auto views = _db.get_views();
-    co_await coroutine::parallel_for_each(views, [this] (view_ptr& view) {
+    co_await coroutine::parallel_for_each(views | std::views::filter([this] (view_ptr& v) {
+        return !should_ignore_tablet_keyspace(_db, v->ks_name());
+    }), [this] (view_ptr& view) {
         return mark_as_built(view);
     });
 }
@@ -3390,19 +3485,67 @@ future<> view_builder::register_staging_sstable(sstables::shared_sstable sst, lw
     return _vug.register_staging_sstable(std::move(sst), std::move(table));
 }
 
-future<bool> check_needs_view_update_path(view_builder& vb, locator::token_metadata_ptr tmptr, const replica::table& t, streaming::stream_reason reason) {
+future<sstable_destination_decision> check_needs_view_update_path(view_builder& vb, locator::token_metadata_ptr tmptr, const replica::table& t, streaming::stream_reason reason) {
     if (is_internal_keyspace(t.schema()->ks_name())) {
-        return make_ready_future<bool>(false);
+        co_return sstable_destination_decision::normal_directory;
     }
-    if (reason == streaming::stream_reason::repair && !t.views().empty()) {
-        return make_ready_future<bool>(true);
-    }
-    return do_with(std::move(tmptr), t.views(), [&vb] (locator::token_metadata_ptr& tmptr, auto& views) {
-        return map_reduce(views,
+
+    if (vb.get_db().find_keyspace(t.schema()->ks_name()).uses_tablets()) {
+        // views are managed by view building coordinator
+        if (t.views().empty()) {
+            co_return sstable_destination_decision::normal_directory;
+        }
+
+        auto build_status_map = co_await vb.get_sys_ks().get_view_build_status_map();
+        auto views_names = t.views() 
+                | std::views::transform([] (const view_ptr& v) { return std::make_pair(v->ks_name(), v->cf_name()); })
+                | std::ranges::to<std::set>();
+
+        bool any_started_building = false;
+        bool any_started = false;
+        bool all_success = true;
+        for (auto& [view_name, statuses]: build_status_map) {
+            if (!views_names.contains(view_name)) {
+                continue;
+            }
+
+            any_started_building = true;
+            any_started = any_started || std::ranges::any_of(statuses | std::views::values, [] (const build_status& status) {
+                return status == build_status::STARTED;
+            });
+            all_success = all_success && std::ranges::all_of(statuses | std::views::values, [] (const build_status& status) {
+                return status == build_status::SUCCESS;
+            });
+        }
+
+        if (!any_started_building) {
+            // If all of the views didn't start building yet (and none of them is finished building)
+            // the sstable can go to normal directory and no view update will be lost
+            co_return sstable_destination_decision::normal_directory;
+        } else if (any_started) {
+            // If any of the views started building and didn't finished yet, we need to use view building
+            // coordinator to schedule staging sstables processing to control if replica is not in a pending state.
+            co_return sstable_destination_decision::staging_managed_by_vbc;
+        } else if (all_success) {
+            // If all of the views were built, the sstable can be registered to view update generator directly (in case of `stream_reason::repair`).
+            co_return reason == streaming::stream_reason::repair ? sstable_destination_decision::staging_directly_to_generator : sstable_destination_decision::normal_directory;
+        }
+        // This should be unreachable, reaching this point would mean that,
+        // any of the views started building, none of the status is `STARTED` and not all statuses are `SUCCESS`.
+        // Since there are only 2 statuses: STARTED and SUCCESS, this is unreachable.
+        on_internal_error(vlogger, fmt::format("check_needs_view_update_path() reached unreachable branch. any_started_building: {} | any_started: {} | all_success: {}", any_started_building, any_started, all_success));
+    } else {
+        // views are managed by view builder
+        if (reason == streaming::stream_reason::repair && !t.views().empty()) {
+            co_return sstable_destination_decision::staging_directly_to_generator;
+        } 
+
+        auto any_view_build_ongoing = co_await map_reduce(t.views(),
                 [&] (const view_ptr& view) { return vb.check_view_build_ongoing(*tmptr, view->ks_name(), view->cf_name()); },
                 false,
                 std::logical_or<bool>());
-    });
+        co_return any_view_build_ongoing ? sstable_destination_decision::staging_directly_to_generator : sstable_destination_decision::normal_directory;
+    }
 }
 
 void view_updating_consumer::do_flush_buffer() {
@@ -3446,19 +3589,13 @@ void view_updating_consumer::maybe_flush_buffer_mid_partition() {
 }
 
 view_updating_consumer::view_updating_consumer(view_update_generator& gen, schema_ptr schema, reader_permit permit, replica::table& table, std::vector<sstables::shared_sstable> excluded_sstables, const seastar::abort_source& as,
-        evictable_reader_handle_v2& staging_reader_handle)
+        evictable_reader_handle& staging_reader_handle)
     : view_updating_consumer(std::move(schema), std::move(permit), as, staging_reader_handle,
             [table = table.shared_from_this(), excluded_sstables = std::move(excluded_sstables), gen = gen.shared_from_this()] (mutation m) mutable {
         auto s = m.schema();
         return table->stream_view_replica_updates(gen, std::move(s), std::move(m), db::no_timeout, excluded_sstables);
     })
 { }
-
-std::vector<db::view::view_and_base> with_base_info_snapshot(std::vector<view_ptr> vs) {
-    return vs | std::views::transform([] (const view_ptr& v) {
-        return db::view::view_and_base{v, v->view_info()->base_info()};
-    }) | std::ranges::to<std::vector>();
-}
 
 delete_ghost_rows_visitor::delete_ghost_rows_visitor(service::storage_proxy& proxy, service::query_state& state, view_ptr view, db::timeout_clock::duration timeout_duration)
         : _proxy(proxy)
@@ -3481,6 +3618,7 @@ void delete_ghost_rows_visitor::accept_new_row(const clustering_key& ck, const q
     auto view_exploded_ck = ck.explode();
     std::vector<bytes> base_exploded_pk(_base_schema->partition_key_size());
     std::vector<bytes> base_exploded_ck(_base_schema->clustering_key_size());
+    std::flat_map<const column_definition*, bytes> view_key_cols_not_in_base_key;
     for (const column_definition& view_cdef : _view->all_columns()) {
         const column_definition* base_cdef = _base_schema->get_column_definition(view_cdef.name());
         if (base_cdef) {
@@ -3489,6 +3627,8 @@ void delete_ghost_rows_visitor::accept_new_row(const clustering_key& ck, const q
                 base_exploded_pk[base_cdef->id] = view_exploded_key[view_cdef.id];
             } else if (base_cdef->is_clustering_key()) {
                 base_exploded_ck[base_cdef->id] = view_exploded_key[view_cdef.id];
+            } else if (!base_cdef->is_computed() && view_cdef.is_primary_key()) {
+                view_key_cols_not_in_base_key[base_cdef] = view_exploded_key[view_cdef.id];
             }
         }
     }
@@ -3496,22 +3636,43 @@ void delete_ghost_rows_visitor::accept_new_row(const clustering_key& ck, const q
     clustering_key base_ck = clustering_key::from_exploded(base_exploded_ck);
 
     dht::partition_range_vector partition_ranges({dht::partition_range::make_singular(dht::decorate_key(*_base_schema, base_pk))});
-    auto selection = cql3::selection::selection::for_columns(_base_schema, std::vector<const column_definition*>({&_base_schema->partition_key_columns().front()}));
+    auto selection = cql3::selection::selection::for_columns(_base_schema,
+        view_key_cols_not_in_base_key.empty() ? std::vector<const column_definition*>({&_base_schema->partition_key_columns().front()}) : view_key_cols_not_in_base_key.keys());
 
     std::vector<query::clustering_range> bounds{query::clustering_range::make_singular(base_ck)};
-    query::partition_slice partition_slice(std::move(bounds), {},  {}, selection->get_query_options());
+    utils::small_vector<column_id, 8> view_key_col_ids;
+    for (const column_definition* col_def : view_key_cols_not_in_base_key.keys()) {
+        view_key_col_ids.push_back(col_def->id);
+    }
+    query::partition_slice partition_slice(std::move(bounds), {}, std::move(view_key_col_ids), selection->get_query_options());
     auto command = ::make_lw_shared<query::read_command>(_base_schema->id(), _base_schema->version(), partition_slice,
             _proxy.get_max_result_size(partition_slice), query::tombstone_limit(_proxy.get_tombstone_limit()));
     auto timeout = db::timeout_clock::now() + _timeout_duration;
     service::storage_proxy::coordinator_query_options opts{timeout, _state.get_permit(), _state.get_client_state(), _state.get_trace_state()};
     auto base_qr = _proxy.query(_base_schema, command, std::move(partition_ranges), db::consistency_level::ALL, opts).get();
     query::result& result = *base_qr.query_result;
-    if (result.row_count().value_or(0) == 0) {
+    auto delete_ghost_row = [&]() {
         mutation m(_view, *_view_pk);
         auto& row = m.partition().clustered_row(*_view, ck);
         row.apply(tombstone(api::new_timestamp(), gc_clock::now()));
         timeout = db::timeout_clock::now() + _timeout_duration;
         _proxy.mutate({m}, db::consistency_level::ALL, timeout, _state.get_trace_state(), empty_service_permit(), db::allow_per_partition_rate_limit::no).get();
+    };
+    if (result.row_count().value_or(0) == 0) {
+        delete_ghost_row();
+    } else if (!view_key_cols_not_in_base_key.empty()) {
+        if (result.row_count().value_or(0) != 1) {
+            on_internal_error(vlogger, format("Got multiple base rows corresponding to a single view row when pruning {}.{}", _view->ks_name(), _view->cf_name()));
+        }
+        auto results = query::result_set::from_raw_result(_base_schema, partition_slice, result);
+        auto& base_row = results.row(0);
+        for (const auto& [col_def, col_val] : view_key_cols_not_in_base_key) {
+            const data_value* base_val = base_row.get_data_value(col_def->name_as_text());
+            if (!base_val || base_val->is_null() || col_val != base_val->serialize_nonnull()) {
+                delete_ghost_row();
+                break;
+            }
+        }
     }
 }
 
@@ -3533,5 +3694,43 @@ std::chrono::microseconds calculate_view_update_throttling_delay(db::view::updat
         return std::chrono::duration_cast<std::chrono::microseconds>(budget);
     }
 }
+
+build_status build_status_from_string(std::string_view str) {
+    if (str == "STARTED") {
+        return build_status::STARTED;
+    }
+    if (str == "SUCCESS") {
+        return build_status::SUCCESS;
+    }
+    on_internal_error(vlogger, fmt::format("Unknown view build status: {}", str));
+}
+
+sstring build_status_to_sstring(build_status status) {
+    switch (status) {
+    case build_status::STARTED:
+        return "STARTED";
+    case build_status::SUCCESS:
+        return "SUCCESS";
+    }
+    on_internal_error(vlogger, fmt::format("Unknown view build status: {}", (int)status));
+}
+
+void validate_view_keyspace(const data_dictionary::database& db, std::string_view keyspace_name) {
+    const bool tablet_views_enabled = db.features().views_with_tablets;
+    // Note: if the configuration option `rf_rack_valid_keyspaces` is enabled, we can be
+    //       sure that all tablet-based keyspaces are RF-rack-valid. We check that
+    //       at start-up and then we don't allow for creating RF-rack-invalid keyspaces.
+    const bool rf_rack_valid_keyspaces = db.get_config().rf_rack_valid_keyspaces();
+    const bool required_config = tablet_views_enabled && rf_rack_valid_keyspaces;
+
+    const bool uses_tablets = db.find_keyspace(keyspace_name).get_replication_strategy().uses_tablets();
+
+    if (!required_config && uses_tablets) {
+        throw std::logic_error("Materialized views and secondary indexes are not supported on base tables with tablets. "
+                "To be able to use them, enable the configuration option `rf_rack_valid_keyspaces` and make sure "
+                "that the cluster feature `VIEWS_WITH_TABLETS` is enabled.");
+    }
+}
+
 } // namespace view
 } // namespace db

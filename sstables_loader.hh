@@ -26,7 +26,14 @@ namespace netw { class messaging_service; }
 namespace db {
 namespace view {
 class view_builder;
+class view_building_worker;
 }
+}
+namespace service {
+class storage_service;
+}
+namespace locator {
+class effective_replication_map;
 }
 
 struct stream_progress {
@@ -65,8 +72,10 @@ public:
 
 private:
     sharded<replica::database>& _db;
+    sharded<service::storage_service>& _ss;
     netw::messaging_service& _messaging;
     sharded<db::view::view_builder>& _view_builder;
+    sharded<db::view::view_building_worker>& _view_building_worker;
     shared_ptr<task_manager_module> _task_manager_module;
     sstables::storage_manager& _storage_manager;
     seastar::scheduling_group _sched_group;
@@ -84,10 +93,13 @@ private:
             bool primary_replica_only, bool unlink_sstables, stream_scope scope,
             shared_ptr<stream_progress> progress);
 
+    future<seastar::shared_ptr<const locator::effective_replication_map>> await_topology_quiesced_and_get_erm(table_id table_id);
 public:
     sstables_loader(sharded<replica::database>& db,
+            sharded<service::storage_service>& ss,
             netw::messaging_service& messaging,
             sharded<db::view::view_builder>& vb,
+            sharded<db::view::view_building_worker>& vbw,
             tasks::task_manager& tm,
             sstables::storage_manager& sstm,
             seastar::scheduling_group sg);
@@ -104,10 +116,14 @@ public:
      *
      * @param ks_name the keyspace in which to search for new SSTables.
      * @param cf_name the column family in which to search for new SSTables.
+     * @param load_and_stream load SSTables that do not belong to this node and stream them to the appropriate nodes.
+     * @param primary_replica_only whether to stream only to the primary replica that owns the data.
+     * @param skip_cleanup whether to skip the cleanup step when loading SSTables.
+     * @param skip_reshape whether to skip the reshape step when loading SSTables.
      * @return a future<> when the operation finishes.
      */
     future<> load_new_sstables(sstring ks_name, sstring cf_name,
-            bool load_and_stream, bool primary_replica_only, stream_scope scope);
+            bool load_and_stream, bool primary_replica_only, bool skip_cleanup, bool skip_reshape, stream_scope scope);
 
     /**
      * Download new SSTables not currently tracked by the system from object store

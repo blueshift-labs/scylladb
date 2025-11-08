@@ -8,12 +8,16 @@ import logging
 import pytest
 import time
 import asyncio
+import json
+import random
 
 from cassandra.cluster import ConsistencyLevel
 from cassandra.query import SimpleStatement
 
+from test.pylib.manager_client import ManagerClient
 from test.pylib.util import wait_for_cql_and_get_hosts
 from test.cluster.conftest import skip_mode
+from test.cluster.util import new_test_keyspace
 
 
 logger = logging.getLogger(__name__)
@@ -40,8 +44,7 @@ async def test_enable_compacting_data_for_streaming_and_repair_live_update(manag
     silently broken in the past.
     """
     cmdline = ["--enable-compacting-data-for-streaming-and-repair", "0", "--smp", "1", "--logger-log-level", "api=trace"]
-    node1 = await manager.server_add(cmdline=cmdline)
-    node2 = await manager.server_add(cmdline=cmdline)
+    node1, node2 = await manager.servers_add(2, cmdline=cmdline, auto_rack_dc="dc1")
 
     cql = manager.get_cql()
 
@@ -89,8 +92,7 @@ async def test_tombstone_gc_for_streaming_and_repair(manager):
             "--hinted-handoff-enabled", "0",
             "--smp", "1",
             "--logger-log-level", "api=trace:database=trace"]
-    node1 = await manager.server_add(cmdline=cmdline)
-    node2 = await manager.server_add(cmdline=cmdline)
+    node1, node2 = await manager.servers_add(2, cmdline=cmdline, auto_rack_dc="dc1")
 
     cql = manager.get_cql()
 
@@ -119,6 +121,10 @@ async def test_tombstone_gc_for_streaming_and_repair(manager):
                 assert len(res) == 3
             else:
                 assert len(res) < 3
+
+    # Disable incremental repair so that the second repair can still work on the repaired data set
+    for node in [node1, node2]:
+        await manager.api.enable_injection(node.ip_addr, "repair_tablet_no_update_sstables_repair_at", False, {})
 
     # Initial start-condition check
     check_nodes_have_data(True, False)
@@ -149,10 +155,7 @@ async def test_tombstone_gc_for_streaming_and_repair(manager):
 @pytest.mark.asyncio
 @skip_mode('release', 'error injections are not supported in release mode')
 async def test_repair_succeeds_with_unitialized_bm(manager):
-    await manager.server_add()
-    await manager.server_add()
-    servers = await manager.running_servers()
-
+    servers = await manager.servers_add(2, auto_rack_dc="dc1")
     cql = manager.get_cql()
 
     cql.execute("CREATE KEYSPACE ks WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2}")
@@ -170,9 +173,9 @@ async def do_batchlog_flush_in_repair(manager, cache_time_in_ms):
     nr_repairs = 2 * nr_repairs_per_node
     total_repair_duration = 0
 
+    cfg = { 'tablets_mode_for_new_keyspaces': 'disabled' }
     cmdline = ["--repair-hints-batchlog-flush-cache-time-in-ms", str(cache_time_in_ms), "--smp", "1", "--logger-log-level", "api=trace"]
-    node1 = await manager.server_add(cmdline=cmdline)
-    node2 = await manager.server_add(cmdline=cmdline)
+    node1, node2 = await manager.servers_add(2, config=cfg, cmdline=cmdline, auto_rack_dc="dc1")
 
     cql = manager.get_cql()
     cql.execute("CREATE KEYSPACE ks WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2}")
@@ -224,47 +227,9 @@ async def test_batchlog_flush_in_repair_without_cache(manager):
 
 @pytest.mark.asyncio
 @skip_mode('release', 'error injections are not supported in release mode')
-async def test_repair_abort(manager):
-    cfg = {'enable_tablets': True}
-    await manager.server_add(config=cfg)
-    await manager.server_add(config=cfg)
-    servers = await manager.running_servers()
-
-    cql = manager.get_cql()
-
-    cql.execute("CREATE KEYSPACE ks WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2}")
-    cql.execute("CREATE TABLE ks.tbl (pk int, ck int, PRIMARY KEY (pk, ck)) WITH tombstone_gc = {'mode': 'repair'}")
-
-    await manager.api.client.post(f"/task_manager/ttl", params={ "ttl": "100000" },
-                                                    host=servers[0].ip_addr)
-
-    await manager.api.enable_injection(servers[0].ip_addr, "repair_tablet_repair_task_impl_run", False, {})
-
-    # Start repair.
-    sequence_number = await manager.api.client.post_json(f"/storage_service/repair_async/ks", host=servers[0].ip_addr)
-
-    # Get repair id.
-    stats_list = await manager.api.client.get_json("/task_manager/list_module_tasks/repair", host=servers[0].ip_addr)
-    ids = [stats["task_id"] for stats in stats_list if stats["sequence_number"] == sequence_number]
-    assert len(ids) == 1
-    id = ids[0]
-
-    # Abort repair.
-    await manager.api.client.post("/storage_service/force_terminate_repair", host=servers[0].ip_addr)
-
-    await manager.api.message_injection(servers[0].ip_addr, "repair_tablet_repair_task_impl_run")
-    await manager.api.disable_injection(servers[0].ip_addr, "repair_tablet_repair_task_impl_run")
-
-    # Check if repair was aborted.
-    await manager.api.client.get_json(f"/task_manager/wait_task/{id}", host=servers[0].ip_addr)
-    statuses = await manager.api.client.get_json(f"/task_manager/task_status_recursive/{id}", host=servers[0].ip_addr)
-    assert all([status["state"] == "failed" for status in statuses])
-
-@pytest.mark.asyncio
-@skip_mode('release', 'error injections are not supported in release mode')
 async def test_keyspace_drop_during_data_sync_repair(manager):
     cfg = {
-        'enable_tablets': False,
+        'tablets_mode_for_new_keyspaces': 'disabled',
         'error_injections_at_startup': ['get_keyspace_erms_throw_no_such_keyspace']
     }
     await manager.server_add(config=cfg)
@@ -275,3 +240,47 @@ async def test_keyspace_drop_during_data_sync_repair(manager):
     cql.execute("CREATE TABLE ks.tbl (pk int, ck int, PRIMARY KEY (pk, ck)) WITH tombstone_gc = {'mode': 'repair'}")
 
     await manager.server_add(config=cfg)
+
+@pytest.mark.asyncio
+async def test_vnode_keyspace_describe_ring(manager: ManagerClient):
+    cfg = {
+        'tablets_mode_for_new_keyspaces': 'disabled',
+    }
+    servers = await manager.servers_add(2, config=cfg)
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1}") as ks:
+        keys = dict()
+        cql = manager.get_cql()
+        await cql.run_async(f"CREATE TABLE {ks}.tbl (pk int PRIMARY KEY)")
+        for i in range(100):
+            key = random.randint(-1000000000, 1000000000)
+            await cql.run_async(f"INSERT into {ks}.tbl (pk) VALUES({key})")
+            token = (await cql.run_async(f"SELECT token(pk) from {ks}.tbl WHERE pk = {key}"))[0].system_token_pk
+            keys[key] = token
+
+        res = await manager.api.describe_ring(servers[0].ip_addr, ks)
+        end_tokens = dict()
+        for item in res:
+            end_tokens[int(item['start_token'])] = int(item['end_token'])
+            logger.debug(f"{item=}")
+        logger.debug("Verifying that the describe_ring result covering the full token ring")
+        sorted_tokens = sorted(end_tokens.keys())
+        logger.debug(f"{sorted_tokens=}")
+        for i in range(1, len(sorted_tokens)):
+            assert end_tokens[sorted_tokens[i-1]] == sorted_tokens[i]
+        assert end_tokens[sorted_tokens[-1]] == sorted_tokens[0]
+
+        def get_ring_endpoints(token):
+            for item in res:
+                if int(item['start_token']) < int(item['end_token']):
+                    if int(item['start_token']) < token <= int(item['end_token']):
+                        return item['endpoints']
+                elif token > int(item['start_token']) or token <= int(item['end_token']):
+                    return item['endpoints']
+            pytest.fail(f"Token {token} not found in describe_ring result")
+
+        cql = manager.get_cql()
+        for key, token in keys.items():
+            natural_endpoints = await manager.api.natural_endpoints(servers[0].ip_addr, ks, "tbl", key)
+            ring_endpoints = get_ring_endpoints(token)
+            assert natural_endpoints == ring_endpoints, f"natural_endpoint mismatch describe_ring for {key=} {token=} {natural_endpoints=} {ring_endpoints=}"

@@ -220,13 +220,6 @@ def test_storage_service_keyspace_bad_param(cql, this_dc, rest_api):
         resp = rest_api.send("GET", f"storage_service/keyspace_scrub", { "keyspace": "{keyspace}" })
         assert resp.status_code == requests.codes.not_found
 
-        # Optional param cannot use the same name as a mandatory (positional, in url) param.
-        resp = rest_api.send("GET", f"storage_service/keyspace_scrub/{keyspace}", { "keyspace": "{keyspace}" })
-        assert resp.status_code == requests.codes.bad_request
-
-        # Unknown parameter (See https://github.com/scylladb/scylla/pull/10090)
-        resp = rest_api.send("GET", f"storage_service/keyspace_scrub/{keyspace}", { "foo": "bar" })
-        assert resp.status_code == requests.codes.bad_request
 
 # Reproduce issue #9061, where if we have a partition key with characters
 # that need escaping in JSON, the toppartitions response failed to escape
@@ -636,6 +629,34 @@ def test_storage_service_get_natural_endpoints(cql, rest_api, tablets_enabled, s
 
             assert resp.json() == [rest_api.host]
 
+@pytest.mark.parametrize("tablets_enabled", ["true", "false"])
+def test_storage_service_get_natural_endpoints_compound_key(cql, rest_api, tablets_enabled, skip_without_tablets):
+    with new_test_keyspace(cql, f"WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1 }} AND TABLETS = {{ 'enabled': {tablets_enabled} }}") as keyspace:
+        with new_test_table(cql, keyspace, 'p1 int, p2 text, c int, PRIMARY KEY ((p1, p2), c)') as t0:
+            table = t0.split(".")[1]
+            resp = rest_api.send("GET", f"storage_service/natural_endpoints/{keyspace}", params={"cf": table, "key": "1:value"})
+            resp.raise_for_status()
+            assert resp.json() == [rest_api.host]
+
+# Verify that a single-column partition key containing ':' is not split. Reproduces #16596
+@pytest.mark.parametrize("tablets_enabled", ["true", "false"])
+def test_storage_service_get_natural_endpoints_text_key_with_colon(cql, rest_api, tablets_enabled, skip_without_tablets):
+    with new_test_keyspace(cql, f"WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1 }} AND TABLETS = {{ 'enabled': {tablets_enabled} }}") as keyspace:
+        with new_test_table(cql, keyspace, 'p text PRIMARY KEY') as t0:
+            table = t0.split(".")[1]
+            resp = rest_api.send("GET", f"storage_service/natural_endpoints/{keyspace}", params={"cf": table, "key": "value:123"})
+            resp.raise_for_status()
+            assert resp.json() == [rest_api.host]
+
+@pytest.mark.parametrize("tablets_enabled", ["true", "false"])
+def test_storage_service_get_natural_endpoints_v2_compound_key(cql, rest_api, tablets_enabled, skip_without_tablets):
+    with new_test_keyspace(cql, f"WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1 }} AND TABLETS = {{ 'enabled': {tablets_enabled} }}") as keyspace:
+        with new_test_table(cql, keyspace, 'p1 int, p2 text, c int, PRIMARY KEY ((p1, p2), c)') as t0:
+            table = t0.split(".")[1]
+            resp = rest_api.send("GET", f"storage_service/natural_endpoints/v2/{keyspace}", params={"cf": table, "key_component": [1, "value"]})
+            resp.raise_for_status()
+            assert resp.json() == [rest_api.host]
+
 def test_range_to_endpoint_map_tablets_enabled_keyspace_param_only(cql,  rest_api, skip_without_tablets):
     with new_test_keyspace(cql, "WITH REPLICATION = { 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1 } AND TABLETS = { 'enabled': true }") as keyspace:
         with new_test_table(cql, keyspace, 'p int PRIMARY KEY') as table:
@@ -718,3 +739,57 @@ def test_move_tablets_invalid_table(rest_api, skip_without_tablets):
                          })
     assert resp.status_code == requests.codes.bad_request
     assert "Can't find a column family" in resp.json()["message"]
+
+
+def test_drop_quarantined_sstables(cql, this_dc, rest_api):
+    with new_test_keyspace(cql, f"WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', '{this_dc}' : 1 }}") as keyspace:
+        schema = 'p int, v text, primary key (p)'
+        with new_test_table(cql, keyspace, schema) as t0:
+            stmt = cql.prepare(f"INSERT INTO {t0} (p, v) VALUES (?, ?)")
+            cql.execute(stmt, [0, 'hello'])
+
+            with new_test_table(cql, keyspace, schema) as t1:
+                stmt = cql.prepare(f"INSERT INTO {t1} (p, v) VALUES (?, ?)")
+                cql.execute(stmt, [1, 'world'])
+
+                test_tables = [t0.split('.')[1], t1.split('.')[1]]
+
+                resp = rest_api.send("POST", f"storage_service/keyspace_flush/{keyspace}")
+                resp.raise_for_status()
+
+                # Drop quarantined sstables from all keyspaces (no parameters)
+                resp = rest_api.send("POST", "storage_service/drop_quarantined_sstables")
+                resp.raise_for_status()
+
+                # Drop quarantined sstables from specific keyspace
+                resp = rest_api.send("POST", "storage_service/drop_quarantined_sstables",
+                                   params={"keyspace": keyspace})
+                resp.raise_for_status()
+
+                # Drop quarantined sstables from specific table
+                resp = rest_api.send("POST", "storage_service/drop_quarantined_sstables",
+                                   params={"keyspace": keyspace, "tables": test_tables[0]})
+                resp.raise_for_status()
+
+                # Drop quarantined sstables from multiple tables
+                resp = rest_api.send("POST", "storage_service/drop_quarantined_sstables",
+                                   params={"keyspace": keyspace, "tables": f"{test_tables[0]},{test_tables[1]}"})
+                resp.raise_for_status()
+
+                # # Non-existing keyspace
+                resp = rest_api.send("POST", "storage_service/drop_quarantined_sstables",
+                                   params={"keyspace": "non_existent_keyspace"})
+                assert resp.status_code == requests.codes.bad_request
+                assert resp.json()["message"] == "Can't find a keyspace non_existent_keyspace"
+
+                # Non-existing table
+                resp = rest_api.send("POST", "storage_service/drop_quarantined_sstables",
+                                   params={"keyspace": keyspace, "tables": "non_existent_table"})
+                assert resp.status_code == requests.codes.bad_request
+                assert "Can't find a column family non_existent_table in keyspace" in resp.json()["message"]
+
+                # Mix of existing and non-existing tables
+                resp = rest_api.send("POST", "storage_service/drop_quarantined_sstables",
+                                   params={"keyspace": keyspace, "tables": f"{test_tables[0]},non_existent_table"})
+                assert resp.status_code == requests.codes.bad_request
+                assert "Can't find a column family non_existent_table in keyspace" in resp.json()["message"]

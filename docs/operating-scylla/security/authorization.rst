@@ -369,6 +369,12 @@ granting ``SELECT`` on a ``KEYSPACE`` automatically grants it on all ``TABLES`` 
 
 .. Likewise, granting a permission on ``ALL FUNCTIONS`` grants it on every defined function, regardless of which keyspace it is scoped in. It is also possible to grant permissions on all functions scoped to a particular keyspace.
 
+Materialized views and CDC logs cannot be granted separate permissions -
+they inherit the permissions from the base table. Specifically,
+granting ``SELECT`` on a table allows to read also from all its
+materialized views and CDC log. It is not possible to make only
+one materialized view of several materialized views readable.
+
 Modifications to permissions are visible to existing client sessions; that is, connections need not be re-established
 following permissions changes.
 
@@ -381,6 +387,7 @@ The full set of available permissions is:
 - ``MODIFY``
 - ``AUTHORIZE``
 - ``DESCRIBE``
+- ``VECTOR_SEARCH_INDEXING``
 
 .. 
    - ``EXECUTE``
@@ -452,6 +459,9 @@ permissions can be granted on which types of resources, and which statements are
    * - ``DESCRIBE``
      - ``ALL ROLES``
      - ``LIST ROLES`` on all roles or only roles granted to another specified role
+   * - ``VECTOR_SEARCH_INDEXING``
+     - ``ALL KEYSPACES``
+     - ``SELECT`` on all tables with vector search indexes
   
 .. _grant-permission-statement:
 

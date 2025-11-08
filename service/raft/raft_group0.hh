@@ -12,6 +12,7 @@
 #include "service/raft/discovery.hh"
 #include "service/raft/group0_fwd.hh"
 #include "gms/feature.hh"
+#include "raft/raft.hh"
 #include "utils/updateable_value.hh"
 #include <seastar/core/gate.hh>
 
@@ -29,14 +30,11 @@ class migration_manager;
 class raft_group0_client;
 class storage_service;
 
-struct can_vote_tag {};
-using can_vote = bool_class<can_vote_tag>;
-
 // Wrapper for `discovery` which persists the learned peers on disk.
 class persistent_discovery {
     discovery _discovery;
     cql3::query_processor& _qp;
-    seastar::gate _gate;
+    seastar::named_gate _gate;
 
 public:
     using peer_list = discovery::peer_list;
@@ -99,7 +97,7 @@ public:
 };
 
 class raft_group0 {
-    seastar::gate _shutdown_gate;
+    seastar::named_gate _shutdown_gate;
     seastar::abort_source& _abort_source;
     raft_group_registry& _raft_gr;
     sharded<netw::messaging_service>& _ms;
@@ -133,6 +131,7 @@ class raft_group0 {
     future<> _leadership_monitor = make_ready_future<>();
     abort_source _leadership_monitor_as;
     utils::updateable_value_source<bool> _leadership_observable;
+    std::optional<shared_future<>> _aborted;
 
 public:
     // Passed to `setup_group0` when replacing a node.
@@ -154,8 +153,16 @@ public:
     // Call after construction but before using the object.
     future<> start();
 
-    // Call before destroying the object.
-    future<> abort();
+    // Deinitializes the group0 Raft server and stops all background activity.
+    // The server object remains valid, but new requests will get raft::stopped_error.
+    // This function is idempotent: it can be called multiple times; subsequent calls
+    // will wait for the abort initiated by the first call to complete.
+    future<> abort_and_drain();
+
+    // Destroys the Raft server instance registered in raft_group_registry.
+    // It must be ensured that no one accesses it from this point on, including via raft_group0_client.
+    // Must be called before destroying the raft_group0 object.
+    void destroy();
 
     // Run the discovery algorithm.
     //
@@ -281,7 +288,7 @@ public:
     // It is meant to be used as a fallback when a proper handshake procedure
     // cannot be used (e.g. when completing the upgrade or group0 procedures
     // or when joining an old cluster which does not support JOIN_NODE RPC).
-    shared_ptr<group0_handshaker> make_legacy_handshaker(can_vote can_vote);
+    shared_ptr<group0_handshaker> make_legacy_handshaker(raft::is_voter can_vote);
 
     // Waits until all upgrade to raft group 0 finishes and all nodes switched
     // to use_post_raft_procedures.
@@ -320,10 +327,9 @@ private:
     static void init_rpc_verbs(raft_group0& shard0_this);
     static future<> uninit_rpc_verbs(netw::messaging_service& ms);
 
-    // Stop the group 0 server and remove it from the raft_group_registry.
-    future<> stop_group0();
-
     future<bool> raft_upgrade_complete() const;
+
+    future<> do_abort_and_drain();
 
     // Handle peer_exchange RPC
     future<group0_peer_exchange> peer_exchange(discovery::peer_list peers);

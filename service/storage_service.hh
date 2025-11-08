@@ -13,6 +13,7 @@
 
 #include <variant>
 #include <seastar/core/shared_future.hh>
+#include "absl-flat_hash_map.hh"
 #include "gms/endpoint_state.hh"
 #include "gms/i_endpoint_state_change_subscriber.hh"
 #include "schema/schema_fwd.hh"
@@ -24,7 +25,7 @@
 #include "locator/tablets.hh"
 #include "locator/tablet_metadata_guard.hh"
 #include "inet_address_vectors.hh"
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/condition-variable.hh>
 #include "dht/token_range_endpoints.hh"
 #include "gms/application_state.hh"
@@ -33,7 +34,7 @@
 #include <seastar/core/gate.hh>
 #include "replica/database_fwd.hh"
 #include "streaming/stream_reason.hh"
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include "service/migration_listener.hh"
 #include <seastar/core/metrics_registration.hh>
 #include <seastar/core/shared_ptr.hh>
@@ -43,11 +44,13 @@
 #include "node_ops/id.hh"
 #include "raft/server.hh"
 #include "service/topology_state_machine.hh"
+#include "db/view/view_building_state.hh"
 #include "service/tablet_allocator.hh"
 #include "service/tablet_operation.hh"
-#include "timestamp.hh"
+#include "mutation/timestamp.hh"
 #include "utils/user_provided_param.hh"
 #include "utils/sequenced_set.hh"
+#include "service/topology_coordinator.hh"
 
 class node_ops_cmd_request;
 class node_ops_cmd_response;
@@ -63,6 +66,7 @@ namespace cql_transport { class controller; }
 
 namespace cdc {
 class generation_service;
+class metadata;
 }
 
 namespace streaming {
@@ -75,6 +79,10 @@ class system_keyspace;
 class batchlog_manager;
 namespace view {
 class view_builder;
+class view_building_worker;
+}
+namespace schema_tables {
+class schema_applier;
 }
 }
 
@@ -100,6 +108,10 @@ class task_manager_module;
 
 namespace tasks {
 class task_manager;
+}
+
+namespace replica {
+class tablet_mutation_builder;
 }
 
 namespace utils {
@@ -129,6 +141,23 @@ class node_ops_meta_data;
 
 using start_hint_manager = seastar::bool_class<class start_hint_manager_tag>;
 using loosen_constraints = seastar::bool_class<class loosen_constraints_tag>;
+
+struct token_metadata_change {
+    std::vector<locator::mutable_token_metadata_ptr> pending_token_metadata_ptr{smp::count};
+    std::vector<std::unordered_map<sstring, locator::static_effective_replication_map_ptr>> pending_effective_replication_maps{smp::count};
+    std::vector<std::unordered_map<table_id, locator::effective_replication_map_ptr>> pending_table_erms{smp::count};
+    std::vector<std::unordered_map<table_id, locator::effective_replication_map_ptr>> pending_view_erms{smp::count};
+    std::unordered_set<session_id> open_sessions;
+
+    future<> destroy();
+};
+
+class schema_getter {
+public:
+    virtual flat_hash_map<sstring, locator::replication_strategy_ptr> get_keyspaces_replication() const = 0;
+    virtual future<> for_each_table_schema_gently(std::function<future<>(table_id, schema_ptr)> f) const = 0;
+    virtual ~schema_getter() {};
+};
 
 /**
  * This abstraction contains the token/identifier of this node
@@ -161,7 +190,7 @@ private:
 
     abort_source& _abort_source;
     gms::feature_service& _feature_service;
-    distributed<replica::database>& _db;
+    sharded<replica::database>& _db;
     gms::gossiper& _gossiper;
     sharded<netw::messaging_service>& _messaging;
     sharded<service::migration_manager>& _migration_manager;
@@ -180,7 +209,7 @@ private:
     std::vector<protocol_server*> _protocol_servers;
     std::vector<std::any> _listeners;
     gms::feature::listener_registration _workload_prioritization_registration;
-    gate _async_gate;
+    named_gate _async_gate;
 
     condition_variable _tablet_split_monitor_event;
     utils::sequenced_set<table_id> _tablet_split_candidates;
@@ -204,20 +233,20 @@ private:
     future<service::tablet_operation_result> do_tablet_operation(locator::global_tablet_id tablet,
                                  sstring op_name,
                                  std::function<future<service::tablet_operation_result>(locator::tablet_metadata_guard&)> op);
-    future<service::tablet_operation_repair_result> repair_tablet(locator::global_tablet_id);
+    future<service::tablet_operation_repair_result> repair_tablet(locator::global_tablet_id, service::session_id);
+    future<service::tablet_operation_repair_result> repair_colocated_tablets(locator::global_tablet_id, std::vector<locator::global_tablet_id>, service::session_id);
     future<> stream_tablet(locator::global_tablet_id);
     // Clones storage of leaving tablet into pending one. Done in the context of intra-node migration,
     // when both of which sit on the same node. So all the movement is local.
     future<> clone_locally_tablet_storage(locator::global_tablet_id, locator::tablet_replica leaving, locator::tablet_replica pending);
     future<> cleanup_tablet(locator::global_tablet_id);
-    inet_address host2ip(locator::host_id) const;
     // Handler for table load stats RPC.
     future<locator::load_stats> load_stats_for_tablet_based_tables();
     future<> process_tablet_split_candidate(table_id) noexcept;
     void register_tablet_split_candidate(table_id) noexcept;
     future<> run_tablet_split_monitor();
 public:
-    storage_service(abort_source& as, distributed<replica::database>& db,
+    storage_service(abort_source& as, sharded<replica::database>& db,
         gms::gossiper& gossiper,
         sharded<db::system_keyspace>&,
         sharded<db::system_distributed_keyspace>&,
@@ -234,23 +263,28 @@ public:
         sharded<service::tablet_allocator>& tablet_allocator,
         sharded<cdc::generation_service>& cdc_gs,
         sharded<db::view::view_builder>& view_builder,
+        sharded<db::view::view_building_worker>& view_building_worker,
         cql3::query_processor& qp,
         sharded<qos::service_level_controller>& sl_controller,
         topology_state_machine& topology_state_machine,
+        db::view::view_building_state_machine& view_building_state_machine,
         tasks::task_manager& tm,
         gms::gossip_address_map& address_map,
-        std::function<future<void>()> compression_dictionary_updated_callback,
+        std::function<future<void>(std::string_view)> compression_dictionary_updated_callback,
         utils::disk_space_monitor* disk_space_minitor);
     ~storage_service();
 
     node_ops::task_manager_module& get_node_ops_module() noexcept;
-    // Needed by distributed<>
+    // Needed by sharded<>
     future<> stop();
     void init_messaging_service();
     future<> uninit_messaging_service();
 
     // If a hint is provided, only the changed parts of the tablet metadata will be (re)loaded.
-    future<> load_tablet_metadata(const locator::tablet_metadata_change_hint& hint);
+    future<locator::mutable_token_metadata_ptr> prepare_tablet_metadata(const locator::tablet_metadata_change_hint& hint, mutable_token_metadata_ptr pending_token_metadata);
+    void wake_up_topology_state_machine() noexcept;
+    future<> update_tablet_metadata(const locator::tablet_metadata_change_hint& hint);
+
     void start_tablet_split_monitor();
 private:
     using acquire_merge_lock = bool_class<class acquire_merge_lock_tag>;
@@ -273,6 +307,16 @@ private:
     // Note: must be called on shard 0.
     future<> mutate_token_metadata(std::function<future<> (mutable_token_metadata_ptr)> func, acquire_merge_lock aml = acquire_merge_lock::yes) noexcept;
 
+    // Prepares token metadata change without making it visible. Combined with commit function
+    // and appropriate lock it does exactly the same as mutate_token_metadata.
+    // Note: prepare_token_metadata_change must be called on shard 0.
+    future<token_metadata_change> prepare_token_metadata_change(mutable_token_metadata_ptr tmptr,
+            const schema_getter& loader);
+
+    // Commits prepared token metadata changes. Must be called under token_metadata_lock
+    // and on all shards.
+    void commit_token_metadata_change(token_metadata_change& change) noexcept;
+
     // Update pending ranges locally and then replicate to all cores.
     // Should be serialized under token_metadata_lock.
     // Must be called on shard 0.
@@ -283,12 +327,12 @@ private:
     future<> snitch_reconfigured();
 
     future<mutable_token_metadata_ptr> get_mutable_token_metadata_ptr() noexcept {
-        return _shared_token_metadata.get()->clone_async().then([] (token_metadata tm) {
+        return _shared_token_metadata.get()->clone_async().then([this] (token_metadata tm) {
             // bump the token_metadata ring_version
             // to invalidate cached token/replication mappings
             // when the modified token_metadata is committed.
             tm.invalidate_cached_rings();
-            return make_ready_future<mutable_token_metadata_ptr>(make_token_metadata_ptr(std::move(tm)));
+            return _shared_token_metadata.make_token_metadata_ptr(std::move(tm));
         });
     }
 
@@ -297,6 +341,8 @@ private:
     }
 
     friend struct ::node_ops_ctl;
+    friend void check_raft_rpc_scheduling_group(storage_service&, std::string_view);
+    friend class db::schema_tables::schema_applier;
 public:
 
     const gms::gossiper& gossiper() const noexcept {
@@ -323,6 +369,29 @@ public:
         return *_shared_token_metadata.get();
     }
 
+    abort_source& get_abort_source() noexcept {
+        return _abort_source;
+    }
+
+    gms::feature_service& get_feature_service() noexcept {
+        return _feature_service;
+    }
+
+    replica::database& get_database() noexcept {
+        return _db.local();
+    }
+
+    db::system_keyspace& get_system_keyspace() noexcept {
+        return _sys_ks.local();
+    }
+
+    bool is_raft_leader() const noexcept;
+
+    std::vector<table_id> get_tables_with_cdc_tablet_streams() const;
+
+    future<> query_cdc_timestamps(table_id table, bool ascending, noncopyable_function<future<>(db_clock::time_point)> f);
+    future<> query_cdc_streams(table_id table, noncopyable_function<future<>(db_clock::time_point, const utils::chunked_vector<cdc::stream_id>& current, cdc::cdc_stream_diff)> f);
+
 private:
     inet_address get_broadcast_address() const noexcept {
         return get_token_metadata_ptr()->get_topology().my_address();
@@ -336,6 +405,14 @@ private:
     bool is_me(locator::host_id id) const noexcept {
         return get_token_metadata_ptr()->get_topology().is_me(id);
     }
+
+    // When we create a tablet mutation, usually we want to write it to the base table.
+    // In a group of co-located tables, the tablet info is stored on the base table partition only.
+    // Other tables which are co-located with the base table have only a static row that points to the base table.
+    // So if for example a tablet migration is requested for a co-located table, we need to write the
+    // tablet mutation with the transition stage to the base table, and then the entire co-location group
+    // will be migrated.
+    replica::tablet_mutation_builder tablet_mutation_builder_for_base_table(api::timestamp_type ts, table_id table);
 
     /* This abstraction maintains the token/endpoint metadata information */
     shared_token_metadata& _shared_token_metadata;
@@ -378,7 +455,7 @@ private:
         std::unordered_map<locator::host_id, gms::loaded_endpoint_state> ignore_nodes;
     };
     future<replacement_info> prepare_replacement_info(std::unordered_set<gms::inet_address> initial_contact_nodes,
-            const std::unordered_map<gms::inet_address, sstring>& loaded_peer_features);
+            const std::unordered_map<locator::host_id, sstring>& loaded_peer_features);
 
     void run_replace_ops(std::unordered_set<token>& bootstrap_tokens, replacement_info replace_info);
     void run_bootstrap_ops(std::unordered_set<token>& bootstrap_tokens);
@@ -388,7 +465,7 @@ private:
 public:
 
     future<> check_for_endpoint_collision(std::unordered_set<gms::inet_address> initial_contact_nodes,
-            const std::unordered_map<gms::inet_address, sstring>& loaded_peer_features);
+            const std::unordered_map<locator::host_id, sstring>& loaded_peer_features);
 
     future<> join_cluster(sharded<service::storage_proxy>& proxy,
             start_hint_manager start_hm, gms::generation_type new_generation);
@@ -415,7 +492,7 @@ private:
     future<> join_topology(sharded<service::storage_proxy>& proxy,
             std::unordered_set<gms::inet_address> initial_contact_nodes,
             std::unordered_map<locator::host_id, gms::loaded_endpoint_state> loaded_endpoints,
-            std::unordered_map<gms::inet_address, sstring> loaded_peer_features,
+            std::unordered_map<locator::host_id, sstring> loaded_peer_features,
             std::chrono::milliseconds,
             start_hint_manager start_hm,
             gms::generation_type new_generation);
@@ -432,7 +509,7 @@ private:
     future<> bootstrap(std::unordered_set<token>& bootstrap_tokens, std::optional<cdc::generation_id>& cdc_gen_id, const std::optional<replacement_info>& replacement_info);
 
 public:
-    future<std::unordered_map<dht::token_range, inet_address_vector_replica_set>> get_range_to_address_map(locator::effective_replication_map_ptr erm) const;
+    future<std::unordered_map<dht::token_range, inet_address_vector_replica_set>> get_range_to_address_map(sstring keyspace, std::optional<table_id> tid) const;
 
     /**
      * The same as {@code describeRing(String)} but converts TokenRange to the String for JMX compatibility
@@ -449,9 +526,9 @@ public:
      */
     //std::vector<sstring> describeRingJMX(const sstring& keyspace) const {
 
-    future<std::vector<token_range_endpoints>> describe_ring(const sstring& keyspace, bool include_only_local_dc = false) const;
+    future<utils::chunked_vector<token_range_endpoints>> describe_ring(const sstring& keyspace, bool include_only_local_dc = false) const;
 
-    future<std::vector<dht::token_range_endpoints>> describe_ring_for_table(const sstring& keyspace_name, const sstring& table_name) const;
+    future<utils::chunked_vector<dht::token_range_endpoints>> describe_ring_for_table(const sstring& keyspace_name, const sstring& table_name) const;
 
     /**
      * Retrieve a map of tokens to endpoints, including the bootstrapping ones.
@@ -520,7 +597,6 @@ public:
     virtual void on_update_function(const sstring& ks_name, const sstring& function_name) override {}
     virtual void on_update_aggregate(const sstring& ks_name, const sstring& aggregate_name) override {}
     virtual void on_update_view(const sstring& ks_name, const sstring& view_name, bool columns_changed) override {}
-    virtual void on_update_tablet_metadata(const locator::tablet_metadata_change_hint&) override;
 
     virtual void on_drop_keyspace(const sstring& ks_name) override { keyspace_changed(ks_name).get(); }
     virtual void on_drop_column_family(const sstring& ks_name, const sstring& cf_name) override {}
@@ -529,11 +605,11 @@ public:
     virtual void on_drop_aggregate(const sstring& ks_name, const sstring& aggregate_name) override {}
     virtual void on_drop_view(const sstring& ks_name, const sstring& view_name) override {}
 private:
-    std::optional<db::system_keyspace::peer_info> get_peer_info_for_update(inet_address endpoint);
+    std::optional<db::system_keyspace::peer_info> get_peer_info_for_update(locator::host_id endpoint);
     // return an engaged value iff app_state_map has changes to the peer info
-    std::optional<db::system_keyspace::peer_info> get_peer_info_for_update(inet_address endpoint, const gms::application_state_map& app_state_map);
+    std::optional<db::system_keyspace::peer_info> get_peer_info_for_update(locator::host_id endpoint, const gms::application_state_map& app_state_map);
 
-    std::unordered_set<token> get_tokens_for(inet_address endpoint);
+    std::unordered_set<token> get_tokens_for(locator::host_id endpoint);
     std::optional<locator::endpoint_dc_rack> get_dc_rack_for(const gms::endpoint_state& ep_state);
     std::optional<locator::endpoint_dc_rack> get_dc_rack_for(locator::host_id endpoint);
 private:
@@ -545,6 +621,7 @@ private:
     sharded<service::tablet_allocator>& _tablet_allocator;
     sharded<cdc::generation_service>& _cdc_gens;
     sharded<db::view::view_builder>& _view_builder;
+    sharded<db::view::view_building_worker>& _view_building_worker;
     bool _isolated = false;
 private:
     /**
@@ -600,18 +677,16 @@ private:
      * @param ranges the ranges to find sources for
      * @return multimap of addresses to ranges the address is responsible for
      */
-    future<std::unordered_multimap<locator::host_id, dht::token_range>> get_new_source_ranges(locator::vnode_effective_replication_map_ptr erm, const dht::token_range_vector& ranges) const;
+    future<std::unordered_multimap<locator::host_id, dht::token_range>> get_new_source_ranges(const locator::vnode_effective_replication_map* erm, const dht::token_range_vector& ranges) const;
 
     future<> removenode_with_stream(locator::host_id leaving_node, frozen_topology_guard, shared_ptr<abort_source> as_ptr);
     future<> removenode_add_ranges(lw_shared_ptr<dht::range_streamer> streamer, locator::host_id leaving_node);
 
     // needs to be modified to accept either a keyspace or ARS.
-    future<std::unordered_multimap<dht::token_range, locator::host_id>> get_changed_ranges_for_leaving(locator::vnode_effective_replication_map_ptr erm, locator::host_id endpoint);
+    future<std::unordered_multimap<dht::token_range, locator::host_id>> get_changed_ranges_for_leaving(const locator::vnode_effective_replication_map* erm, locator::host_id endpoint);
 
-    future<> maybe_reconnect_to_preferred_ip(inet_address ep, inet_address local_ip);
+    future<> maybe_reconnect_to_preferred_ip(inet_address ep, inet_address local_ip, locator::host_id host_id);
 
-    // Return ip of the peers table entry with given host id
-    future<std::optional<gms::inet_address>> get_ip_from_peers_table(locator::host_id id);
 public:
 
     sstring get_release_version();
@@ -627,7 +702,7 @@ public:
      * @param ep endpoint we are interested in.
      * @return ranges for the specified endpoint.
      */
-    future<dht::token_range_vector> get_ranges_for_endpoint(const locator::effective_replication_map_ptr& erm, const locator::host_id& ep) const;
+    future<dht::token_range_vector> get_ranges_for_endpoint(const locator::effective_replication_map& erm, const locator::host_id& ep) const;
 
     /**
      * Get all ranges that span the ring given a set
@@ -642,20 +717,24 @@ public:
      *
      * @param keyspaceName keyspace name also known as keyspace
      * @param cf Column family name
-     * @param key key for which we need to find the endpoint
+     * @param key Nodetool style key for which we need to find the endpoint
      * @return the endpoint responsible for this key
      */
-    inet_address_vector_replica_set get_natural_endpoints(const sstring& keyspace,
-            const sstring& cf, const sstring& key) const;
-
+    inet_address_vector_replica_set get_natural_endpoints(const sstring& keyspace, const sstring& cf, const sstring& key) const;
     /**
-     * @return Vector of Token ranges (_not_ keys!) together with estimated key count,
-     *      breaking up the data this node is responsible for into pieces of roughly keys_per_split
+     * This method returns the N endpoints that are responsible for storing the
+     * specified key i.e for replication.
+     *
+     * @param keyspaceName keyspace name also known as keyspace
+     * @param cf Column family name
+     * @param key_components the components of the partition key for which we need to find the endpoint
+     * @return the endpoint responsible for this key
      */
-    std::vector<std::pair<dht::token_range, uint64_t>> get_splits(const sstring& ks_name,
-            const sstring& cf_name,
-            wrapping_interval<dht::token> range,
-            uint32_t keys_per_split);
+    inet_address_vector_replica_set get_natural_endpoints(const sstring& keyspace, const sstring& cf, const std::vector<sstring>& key_components) const;
+
+private:
+    inet_address_vector_replica_set get_natural_endpoints(const sstring& keyspace, const schema_ptr& schema, const replica::column_family& cf, const partition_key& pk) const;
+
 public:
     future<> decommission();
 
@@ -706,6 +785,7 @@ public:
      * @param hostIdString token for the node
      */
     future<> removenode(locator::host_id host_id, locator::host_id_or_endpoint_list ignore_nodes);
+    future<> mark_excluded(const std::vector<locator::host_id>&);
     future<node_ops_cmd_response> node_ops_cmd_handler(gms::inet_address coordinator, std::optional<locator::host_id> coordinator_host_id, node_ops_cmd_request req);
     void node_ops_cmd_check(gms::inet_address coordinator, const node_ops_cmd_request& req);
     future<> node_ops_cmd_heartbeat_updater(node_ops_cmd cmd, node_ops_id uuid, std::list<gms::inet_address> nodes, lw_shared_ptr<bool> heartbeat_updater_done);
@@ -747,6 +827,17 @@ private:
      */
     future<> stream_ranges(std::unordered_map<sstring, std::unordered_multimap<dht::token_range, locator::host_id>> ranges_to_stream_by_keyspace);
 
+    template <typename Func>
+    auto run_with_api_lock_internal(storage_service& ss, Func&& func, sstring& operation) {
+        if (!ss._operation_in_progress.empty()) {
+            throw std::runtime_error(format("Operation {} is in progress, try again", ss._operation_in_progress));
+        }
+        ss._operation_in_progress = std::move(operation);
+        return func(ss).finally([&ss] {
+            ss._operation_in_progress = sstring();
+        });
+    }
+
 public:
     int32_t get_exception_count();
 
@@ -754,13 +845,7 @@ public:
     auto run_with_api_lock(sstring operation, Func&& func) {
         return container().invoke_on(0, [operation = std::move(operation),
                 func = std::forward<Func>(func)] (storage_service& ss) mutable {
-            if (!ss._operation_in_progress.empty()) {
-                throw std::runtime_error(format("Operation {} is in progress, try again", ss._operation_in_progress));
-            }
-            ss._operation_in_progress = std::move(operation);
-            return func(ss).finally([&ss] {
-                ss._operation_in_progress = sstring();
-            });
+            return ss.run_with_api_lock_internal(ss, std::forward<Func>(func), operation);
         });
     }
 
@@ -772,8 +857,14 @@ public:
     }
 
     template <typename Func>
-    auto run_with_api_lock_conditionally(sstring operation, bool lock, Func&& func) {
-        return lock ? run_with_api_lock(std::move(operation), std::forward<Func>(func)) : run_with_no_api_lock(std::forward<Func>(func));
+    auto run_with_api_lock_in_gossiper_mode_only(sstring operation, Func&& func) {
+        return container().invoke_on(0, [operation = std::move(operation),
+                func = std::forward<Func>(func)] (storage_service& ss) mutable {
+            if (ss.raft_topology_change_enabled()) {
+                return func(ss);
+            }
+            return ss.run_with_api_lock_internal(ss, std::forward<Func>(func), operation);
+       });
     }
 
 private:
@@ -782,18 +873,19 @@ private:
 
     future<> notify_down(inet_address endpoint, locator::host_id hid);
     future<> notify_left(inet_address endpoint, locator::host_id hid);
+    future<> notify_released(locator::host_id hid);
     future<> notify_up(inet_address endpoint, locator::host_id hid);
     future<> notify_joined(inet_address endpoint, locator::host_id hid);
     future<> notify_cql_change(inet_address endpoint, locator::host_id hid,bool ready);
     future<> remove_rpc_client_with_ignored_topology(inet_address endpoint, locator::host_id id);
 public:
-    future<bool> is_cleanup_allowed(sstring keyspace);
+    future<bool> is_vnodes_cleanup_allowed(sstring keyspace);
     bool is_repair_based_node_ops_enabled(streaming::stream_reason reason);
     future<> update_fence_version(token_metadata::version_t version);
 
 private:
-    std::unordered_set<gms::inet_address> _normal_state_handled_on_boot;
-    bool is_normal_state_handled_on_boot(gms::inet_address);
+    std::unordered_set<locator::host_id> _normal_state_handled_on_boot;
+    bool is_normal_state_handled_on_boot(locator::host_id);
     future<> wait_for_normal_state_handled_on_boot();
 
     friend class group0_state_machine;
@@ -823,12 +915,8 @@ private:
     topology_change_kind upgrade_state_to_topology_op_kind(topology::upgrade_state_type upgrade_state) const;
 
 public:
-    bool raft_topology_change_enabled() const {
-        return _topology_change_kind_enabled == topology_change_kind::raft;
-    }
-    bool legacy_topology_change_enabled() const {
-        return _topology_change_kind_enabled == topology_change_kind::legacy;
-    }
+    bool raft_topology_change_enabled() const;
+    bool legacy_topology_change_enabled() const;
 
 private:
     future<> _raft_state_monitor = make_ready_future<>();
@@ -845,6 +933,7 @@ public:
 private:
      // State machine that is responsible for topology change
     topology_state_machine& _topology_state_machine;
+    db::view::view_building_state_machine& _view_building_state_machine;
 
     future<> _topology_change_coordinator = make_ready_future<>();
     future<> topology_change_coordinator_fiber(raft::server&, raft::term_t, cdc::generation_service&, sharded<db::system_distributed_keyspace>&, abort_source&);
@@ -855,6 +944,11 @@ private:
     std::optional<shared_future<>> _rebuild_result;
     std::unordered_map<raft::server_id, std::optional<shared_future<>>> _remove_result;
     tablet_op_registry _tablet_ops;
+    // This tracks active topology cmd rpc. There can be only one active
+    // cmd running and by inspecting this structure it can be checked which
+    // cmd is current executing and which nodes are still did not reply.
+    // Needed for debugging.
+    topology_coordinator_cmd_rpc_tracker _topology_cmd_rpc_tracker;
     struct {
         raft::term_t term{0};
         uint64_t last_index{0};
@@ -885,7 +979,11 @@ private:
     // raft_group0_client::_read_apply_mutex must be held
     // Precondition: the topology mutations were already written to disk; the function only transitions the in-memory state machine.
     future<> topology_transition(state_change_hint hint = {});
-
+    
+    // This is called on all nodes for each new command related to tablet-view-building, received through raft
+    // raft_group0_client::_read_apply_mutex must be held
+    // Precondition: the mutations were already written to disk; the function only transitions the in-memory state machine.
+    future<> view_building_transition();
 public:
     // Reloads in-memory topology state safely under group 0 read_apply mutex.
     // Does not modify on-disk state.
@@ -906,9 +1004,12 @@ public:
     // but its intended usage is to set up the RPC connections to use the new dictionaries.
     //
     // Must be called on shard 0.
-    future<> compression_dictionary_updated_callback();
+    future<> compression_dictionary_updated_callback(std::string_view name);
+    future<> compression_dictionary_updated_callback_all();
 
-    future<> do_cluster_cleanup();
+    future<> load_cdc_streams(std::optional<std::unordered_set<table_id>> changed_tables = std::nullopt);
+
+    future<> do_clusterwide_vnodes_cleanup();
 
     // Starts the upgrade procedure to topology on raft.
     // Must be called on shard 0.
@@ -922,23 +1023,31 @@ public:
     // Waits for topology state in which none of tablets has replaced_id as a replica.
     // Must be called on shard 0.
     future<> await_tablets_rebuilt(raft::server_id replaced_id);
+
+    topology_coordinator_cmd_rpc_tracker get_topology_cmd_status() {
+        return _topology_cmd_rpc_tracker;
+    }
 private:
     // Tracks progress of the upgrade to topology coordinator.
     future<> _upgrade_to_topology_coordinator_fiber = make_ready_future<>();
     future<> track_upgrade_progress_to_topology_coordinator(sharded<service::storage_proxy>& proxy);
 
-    future<> transit_tablet(table_id, dht::token, noncopyable_function<std::tuple<std::vector<canonical_mutation>, sstring>(const locator::tablet_map& tmap, api::timestamp_type)> prepare_mutations);
+    future<> transit_tablet(table_id, dht::token, noncopyable_function<std::tuple<utils::chunked_vector<canonical_mutation>, sstring>(const locator::tablet_map& tmap, api::timestamp_type)> prepare_mutations);
     future<service::group0_guard> get_guard_for_tablet_update();
-    future<bool> exec_tablet_update(service::group0_guard guard, std::vector<canonical_mutation> updates, sstring reason);
+    future<bool> exec_tablet_update(service::group0_guard guard, utils::chunked_vector<canonical_mutation> updates, sstring reason);
 public:
     struct all_tokens_tag {};
-    future<std::unordered_map<sstring, sstring>> add_repair_tablet_request(table_id table, std::variant<utils::chunked_vector<dht::token>, all_tokens_tag> tokens_variant, std::unordered_set<locator::host_id> hosts_filter, std::unordered_set<sstring> dcs_filter, bool await_completion);
+    future<std::unordered_map<sstring, sstring>> add_repair_tablet_request(table_id table, std::variant<utils::chunked_vector<dht::token>, all_tokens_tag> tokens_variant, std::unordered_set<locator::host_id> hosts_filter, std::unordered_set<sstring> dcs_filter, bool await_completion, locator::tablet_repair_incremental_mode incremental_mode);
     future<> del_repair_tablet_request(table_id table, locator::tablet_task_id);
     future<> move_tablet(table_id, dht::token, locator::tablet_replica src, locator::tablet_replica dst, loosen_constraints force = loosen_constraints::no);
     future<> add_tablet_replica(table_id, dht::token, locator::tablet_replica dst, loosen_constraints force = loosen_constraints::no);
     future<> del_tablet_replica(table_id, dht::token, locator::tablet_replica dst, loosen_constraints force = loosen_constraints::no);
     future<> set_tablet_balancing_enabled(bool);
+
     future<> await_topology_quiesced();
+    // Verifies topology is not busy, and also that topology version hasn't changed since the one provided
+    // by the caller.
+    future<bool> verify_topology_quiesced(token_metadata::version_t expected_version);
 
     // In the maintenance mode, other nodes won't be available thus we disabled joining
     // the token ring and the token metadata won't be populated with the local node's endpoint.
@@ -954,16 +1063,29 @@ public:
     future<> wait_for_topology_not_busy();
 
 private:
-    future<std::vector<canonical_mutation>> get_system_mutations(schema_ptr schema);
-    future<std::vector<canonical_mutation>> get_system_mutations(const sstring& ks_name, const sstring& cf_name);
+    semaphore _do_sample_sstables_concurrency_limiter{1};
+    // To avoid overly-large RPC messages, `do_sample_sstables` is broken up into several rounds.
+    // This implements a single round.
+    future<utils::chunked_vector<temporary_buffer<char>>> do_sample_sstables_oneshot(table_id, uint64_t chunk_size, uint64_t n_chunks);
+public:
+    // SSTable sampling results can occupy a considerable amount of memory.
+    // Callers of `do_sample_sstables` should hold this semaphore until they are done with the sample,
+    // to ensure that there's only one sample around.
+    semaphore& get_do_sample_sstables_concurrency_limiter();
+    // Gathers a randomly-selected sample of chunks of (decompressed) Data files for the given table,
+    // from across the entire cluster.
+    future<utils::chunked_vector<temporary_buffer<char>>> do_sample_sstables(table_id, uint64_t chunk_size, uint64_t n_chunks);
+private:
+    future<utils::chunked_vector<canonical_mutation>> get_system_mutations(schema_ptr schema);
+    future<utils::chunked_vector<canonical_mutation>> get_system_mutations(const sstring& ks_name, const sstring& cf_name);
 
     struct nodes_to_notify_after_sync {
         std::vector<std::pair<gms::inet_address, locator::host_id>> left;
         std::vector<std::pair<gms::inet_address, locator::host_id>> joined;
+        std::vector<locator::host_id> released;
     };
 
-    using host_id_to_ip_map_t = std::unordered_map<locator::host_id, gms::inet_address>;
-    future<host_id_to_ip_map_t> get_host_id_to_ip_map();
+    using host_id_to_ip_map_t = db::system_keyspace::host_id_to_ip_map_t;
     future<> raft_topology_update_ip(locator::host_id id, gms::inet_address ip, const host_id_to_ip_map_t& map, nodes_to_notify_after_sync* nodes_to_notify);
     // Synchronizes the local node state (token_metadata, system.peers/system.local tables,
     // gossiper) to align it with the other raft topology nodes.
@@ -979,8 +1101,11 @@ private:
     // Applies received raft snapshot to local state machine persistent storage
     // raft_group0_client::_read_apply_mutex must be held
     future<> merge_topology_snapshot(raft_snapshot snp);
+    // load view building state machine snapshot into memory
+    // raft_group0_client::_read_apply_mutex must be held
+    future<> view_building_state_load();
 
-    std::vector<canonical_mutation> build_mutation_from_join_params(const join_node_request_params& params, api::timestamp_type write_timestamp);
+    utils::chunked_vector<canonical_mutation> build_mutation_from_join_params(const join_node_request_params& params, api::timestamp_type write_timestamp);
     std::unordered_set<raft::server_id> ignored_nodes_from_join_params(const join_node_request_params& params);
 
     future<join_node_request_result> join_node_request_handler(join_node_request_params params);
@@ -990,15 +1115,23 @@ private:
     shared_promise<> _join_node_response_done;
     semaphore _join_node_response_handler_mutex{1};
 
-    future<> _sstable_cleanup_fiber = make_ready_future<>();
-    future<> sstable_cleanup_fiber(raft::server& raft, gate::holder, sharded<service::storage_proxy>& proxy) noexcept;
+    future<> _sstable_vnodes_cleanup_fiber = make_ready_future<>();
+    future<> sstable_vnodes_cleanup_fiber(raft::server& raft, gate::holder, sharded<service::storage_proxy>& proxy) noexcept;
 
     // We need to be able to abort all group0 operation during shutdown, so we need special abort source for that
     abort_source _group0_as;
 
-    std::function<future<void>()> _compression_dictionary_updated_callback;
+    std::function<future<void>(std::string_view)> _compression_dictionary_updated_callback;
+    using byte_vector = std::vector<std::byte>;
+    std::function<future<byte_vector>(std::vector<byte_vector>)> _train_dict;
 
     utils::disk_space_monitor* _disk_space_monitor; // != nullptr only on shard0.
+
+public:
+    future<uint64_t> estimate_total_sstable_volume(table_id);
+    future<std::vector<std::byte>> train_dict(utils::chunked_vector<temporary_buffer<char>> sample);
+    future<> publish_new_sstable_dict(table_id, std::span<const std::byte>, service::raft_group0_client&);
+    void set_train_dict_callback(decltype(_train_dict));
 
     friend class join_node_rpc_handshaker;
     friend class node_ops::node_ops_virtual_task;

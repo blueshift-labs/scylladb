@@ -8,6 +8,7 @@
 
 #include "sstables/mx/writer.hh"
 #include "sstables/writer.hh"
+#include "sstables/trie/bti_index.hh"
 #include "encoding_stats.hh"
 #include "schema/schema.hh"
 #include "mutation/mutation_fragment.hh"
@@ -18,6 +19,7 @@
 #include "utils/assert.hh"
 #include "utils/exceptions.hh"
 #include "db/large_data_handler.hh"
+#include "db/corrupt_data_handler.hh"
 
 #include <functional>
 #include <boost/iterator/iterator_facade.hpp>
@@ -531,6 +533,29 @@ private:
     bool _compression_enabled = false;
     std::unique_ptr<file_writer> _data_writer;
     std::unique_ptr<file_writer> _index_writer;
+    std::unique_ptr<file_writer> _rows_writer;
+    std::unique_ptr<file_writer> _partitions_writer;
+    optimized_optional<trie::bti_row_index_writer> _bti_row_index_writer;
+    optimized_optional<trie::bti_partition_index_writer> _bti_partition_index_writer;
+    // The key of the last `consume_new_partition` call.
+    // A partition key can only be inserted into Partitions.db
+    // after its intra-partition index is written to Rows.db.
+    // So we need to hold onto the key until `consume_end_of_partition`.
+    std::optional<dht::decorated_key> _current_dk_for_bti;
+    // Position of the Data writer at the moment of the last
+    // `consume_new_partition` call.
+    uint64_t _current_partition_position = 0;
+    // If true, we don't build the bloom filter during the main pass
+    // (when Data.db is written), but we instead write the murmur hashes
+    // of keys to a temporary file, and later (after Data.db is written,
+    // but before the sstable is sealed) we build the bloom filter from that.
+    //
+    // (Ideally this mechanism should only be used if the optimal size of the
+    // filter can't be well estimated in advance. As of this writing we use
+    // this mechanism every time the Index component isn't being written).
+    bool _delayed_filter = true;
+    // The writer of the temporary file used when `_delayed_filter` is true.
+    std::unique_ptr<file_writer> _hashes_writer;
     bool _tombstone_written = false;
     bool _static_row_written = false;
     // The length of partition header (partition key, partition deletion and static row, if present)
@@ -539,6 +564,7 @@ private:
     uint64_t _partition_header_length = 0;
     uint64_t _prev_row_start = 0;
     std::optional<key> _partition_key;
+    utils::hashed_key _current_murmur_hash{{0, 0}};
     std::optional<key> _first_key, _last_key;
     index_sampling_state _index_sampling_state;
     bytes_ostream _tmp_bufs;
@@ -556,16 +582,16 @@ private:
 
     tombstone _current_tombstone;
 
-    struct clustering_info {
-        clustering_key_prefix clustering;
-        bound_kind_m kind;
-    };
     struct pi_block {
         clustering_info first;
         clustering_info last;
         uint64_t offset;
         uint64_t width;
         std::optional<tombstone> open_marker;
+        // The range tombstone active between this block
+        // and its predecessor.
+        // (If there's no predecessor, this is a "live" tombstone).
+        tombstone preceding_range_tombstone;
     };
     // _pi_write_m is used temporarily for building the promoted
     // index (column sample) of one partition when writing a new sstable.
@@ -577,7 +603,8 @@ private:
         bytes_ostream blocks; // Serialized pi_blocks.
         bytes_ostream offsets; // Serialized block offsets (uint32_t) relative to the start of "blocks".
         uint64_t promoted_index_size = 0; // Number of pi_blocks inside blocks and first_entry;
-        tombstone tomb;
+        sstables::deletion_time partition_tombstone;
+        tombstone range_tombstone_preceding_current_block;
         uint64_t block_start_offset;
         uint64_t block_next_start_offset;
         std::optional<clustering_info> first_clustering;
@@ -620,12 +647,14 @@ private:
     void drain_tombstones(std::optional<position_in_partition_view> pos = {});
 
     void maybe_add_summary_entry(const dht::token& token, bytes_view key) {
+      if (_index_writer) {
         return sstables::maybe_add_summary_entry(
             _sst._components->summary, token, key, get_data_offset(),
             _index_writer->offset(), _index_sampling_state);
+      }
     }
 
-    void maybe_set_pi_first_clustering(const clustering_info& info);
+    void maybe_set_pi_first_clustering(const clustering_info& info, tombstone range_tombstone);
     void maybe_add_pi_block();
     void add_pi_block();
     void write_pi_block(const pi_block&);
@@ -693,6 +722,8 @@ private:
     void maybe_record_large_cells(const sstables::sstable& sst, const sstables::key& partition_key,
             const clustering_key_prefix* clustering_key, const column_definition& cdef, uint64_t cell_size, uint64_t collection_elements);
 
+    void record_corrupt_row(clustering_row&& clustered_row);
+
     // Writes single atomic cell
     void write_cell(bytes_ostream& writer, const clustering_key_prefix* clustering_key, atomic_cell_view cell, const column_definition& cdef,
         const row_time_properties& properties, std::optional<bytes_view> cell_path = {});
@@ -728,9 +759,9 @@ private:
 
     template <typename T>
     requires Clustered<T>
-    void write_clustered(const T& clustered) {
+    void write_clustered(const T& clustered, tombstone preceding_range_tombstone) {
         clustering_info info {clustered.key(), get_kind(clustered)};
-        maybe_set_pi_first_clustering(info);
+        maybe_set_pi_first_clustering(info, preceding_range_tombstone);
         uint64_t pos = _data_writer->offset();
         write_clustered(clustered, pos - _prev_row_start);
         _pi_write_m.last_clustering = info;
@@ -738,7 +769,7 @@ private:
         maybe_add_pi_block();
     }
     void write_promoted_index();
-    void consume(rt_marker&& marker);
+    void consume(rt_marker&& marker, tombstone preceding_range_tombstone);
 
     // Must be called in a seastar thread.
     void flush_tmp_bufs(file_writer& writer) {
@@ -798,15 +829,20 @@ public:
         _sst.open_sstable(cfg.origin);
         _sst.create_data().get();
         _compression_enabled = !_sst.has_component(component_type::CRC);
+        _delayed_filter = _sst.has_component(component_type::Filter) && !_sst.has_component(component_type::Index);
         init_file_writers();
         _sst._shards = { shard };
 
         _cfg.monitor->on_write_started(_data_writer->offset_tracker());
-        _sst._components->filter = utils::i_filter::get_filter(estimated_partitions, _sst._schema->bloom_filter_fp_chance(), utils::filter_format::m_format);
+        if (!_delayed_filter) {
+            _sst._components->filter = utils::i_filter::get_filter(estimated_partitions, _sst._schema->bloom_filter_fp_chance(), utils::filter_format::m_format);
+        }
         _pi_write_m.promoted_index_block_size = cfg.promoted_index_block_size;
         _pi_write_m.promoted_index_auto_scale_threshold = cfg.promoted_index_auto_scale_threshold;
         _index_sampling_state.summary_byte_cost = _cfg.summary_byte_cost;
+      if (_index_writer) {
         prepare_summary(_sst._components->summary, estimated_partitions, _schema.min_index_interval());
+      }
     }
 
     ~writer();
@@ -817,6 +853,7 @@ public:
     stop_iteration consume(range_tombstone_change&& rtc) override;
     stop_iteration consume_end_of_partition() override;
     void consume_end_of_stream() override;
+    uint64_t data_file_position_for_tests() const override;
 };
 
 writer::~writer() {
@@ -831,12 +868,16 @@ writer::~writer() {
     };
     close_writer(_index_writer);
     close_writer(_data_writer);
+    close_writer(_partitions_writer);
+    close_writer(_rows_writer);
+    close_writer(_hashes_writer);
 }
 
-void writer::maybe_set_pi_first_clustering(const writer::clustering_info& info) {
+void writer::maybe_set_pi_first_clustering(const clustering_info& info, tombstone preceding_range_tombstone) {
     uint64_t pos = _data_writer->offset();
     if (!_pi_write_m.first_clustering) {
         _pi_write_m.first_clustering = info;
+        _pi_write_m.range_tombstone_preceding_current_block = preceding_range_tombstone;
         _pi_write_m.block_start_offset = pos;
         _pi_write_m.block_next_start_offset = pos + _pi_write_m.desired_block_size;
     }
@@ -848,16 +889,24 @@ void writer::add_pi_block() {
         *_pi_write_m.last_clustering,
         _pi_write_m.block_start_offset - _c_stats.start_offset,
         _data_writer->offset() - _pi_write_m.block_start_offset,
-        (_current_tombstone ? std::make_optional(_current_tombstone) : std::optional<tombstone>{})};
+        (_current_tombstone ? std::make_optional(_current_tombstone) : std::optional<tombstone>{}),
+        _pi_write_m.range_tombstone_preceding_current_block,
+    };
 
-    if (_pi_write_m.blocks.empty()) {
-        if (!_pi_write_m.first_entry) {
-            _pi_write_m.first_entry.emplace(std::move(block));
-            ++_pi_write_m.promoted_index_size;
-            return;
-        } else {
-            write_pi_block(*_pi_write_m.first_entry);
-        }
+    // An index with only one block (that spans the entire partition)
+    // would be relatively useless, and wouldn't carry its weight.
+    // So if we are adding the first block, we don't write it out yet --
+    // we only remember it in `first_entry`, and we wait until another
+    // entry appears. (If it doesn't, then there will be no row index
+    // for this partition).
+    // If this is a second block, we write out the deferred `first_entry`
+    // first, and then we proceed normally.
+    if (_pi_write_m.promoted_index_size == 0) {
+        _pi_write_m.first_entry.emplace(std::move(block));
+        ++_pi_write_m.promoted_index_size;
+        return;
+    } else if (_pi_write_m.promoted_index_size == 1) {
+        write_pi_block(*_pi_write_m.first_entry);
     }
 
     write_pi_block(block);
@@ -876,6 +925,7 @@ void writer::maybe_add_pi_block() {
     if (pos >= _pi_write_m.block_next_start_offset) {
         add_pi_block();
         _pi_write_m.first_clustering.reset();
+        _pi_write_m.range_tombstone_preceding_current_block = tombstone();
         _pi_write_m.block_next_start_offset = pos + _pi_write_m.desired_block_size;
     }
 }
@@ -886,15 +936,33 @@ void writer::init_file_writers() {
     if (!_compression_enabled) {
         _data_writer = std::make_unique<crc32_checksummed_file_writer>(std::move(out), _sst.sstable_buffer_size, _sst.get_filename());
     } else {
+        auto compressor = _sst.manager().get_compressor_factory().make_compressor_for_writing(_sst._schema).get();
         _data_writer = std::make_unique<file_writer>(
             make_compressed_file_m_format_output_stream(
                 output_stream<char>(std::move(out)),
                 &_sst._components->compression,
-                _sst._schema->get_compressor_params()), _sst.get_filename());
+                _sst._schema->get_compressor_params(),
+                std::move(compressor)), _sst.get_filename());
     }
 
-    out = _sst._storage->make_data_or_index_sink(_sst, component_type::Index).get();
-    _index_writer = std::make_unique<file_writer>(output_stream<char>(std::move(out)), _sst.index_filename());
+    if (_sst.has_component(component_type::Index)) {
+        out = _sst._storage->make_data_or_index_sink(_sst, component_type::Index).get();
+        _index_writer = std::make_unique<file_writer>(output_stream<char>(std::move(out)), _sst.index_filename());
+    }
+    if (_sst.has_component(component_type::Partitions) && _sst.has_component(component_type::Rows)) {
+        out = _sst._storage->make_data_or_index_sink(_sst, component_type::Rows).get();
+        _rows_writer = std::make_unique<file_writer>(output_stream<char>(std::move(out)), component_name(_sst, component_type::Rows));
+        _bti_row_index_writer = trie::bti_row_index_writer(*_rows_writer);
+        out = _sst._storage->make_data_or_index_sink(_sst, component_type::Partitions).get();
+        _partitions_writer = std::make_unique<file_writer>(output_stream<char>(std::move(out)), component_name(_sst, component_type::Partitions));
+        _bti_partition_index_writer = trie::bti_partition_index_writer(*_partitions_writer);
+    }
+    if (_delayed_filter) {
+        file_output_stream_options options;
+        options.buffer_size = 32 * 1024;
+        _hashes_writer = std::make_unique<file_writer>(_sst.make_component_file_writer(component_type::TemporaryHashes, std::move(options),
+            open_flags::wo | open_flags::create | open_flags::exclusive).get());
+    }
 }
 
 std::unique_ptr<file_writer> writer::close_writer(std::unique_ptr<file_writer>& w) {
@@ -921,25 +989,38 @@ void writer::consume_new_partition(const dht::decorated_key& dk) {
     _partition_key = key::from_partition_key(_schema, dk.key());
     maybe_add_summary_entry(dk.token(), bytes_view(*_partition_key));
 
-    _sst._components->filter->add(bytes_view(*_partition_key));
+    _current_murmur_hash = utils::make_hashed_key(bytes_view(*_partition_key));
+    if (_hashes_writer) {
+        std::array<uint64_t, 2> hash = {
+            seastar::cpu_to_le(_current_murmur_hash.hash()[0]),
+            seastar::cpu_to_le(_current_murmur_hash.hash()[1])
+        };
+        _hashes_writer->write(reinterpret_cast<const char*>(hash.data()), sizeof(hash));
+    } else {
+        _sst._components->filter->add(_current_murmur_hash);
+    }
     _collector.add_key(bytes_view(*_partition_key));
     _num_partitions_consumed++;
 
     auto p_key = disk_string_view<uint16_t>();
     p_key.value = bytes_view(*_partition_key);
 
+  if (_index_writer) {
     // Write index file entry from partition key into index file.
     // Write an index entry minus the "promoted index" (sample of columns)
     // part. We can only write that after processing the entire partition
     // and collecting the sample of columns.
     write(_sst.get_version(), *_index_writer, p_key);
     write_vint(*_index_writer, _data_writer->offset());
+  }
+    _current_dk_for_bti = dk;
+    _current_partition_position = _data_writer->offset();
 
     _pi_write_m.first_entry.reset();
     _pi_write_m.blocks.clear();
     _pi_write_m.offsets.clear();
     _pi_write_m.promoted_index_size = 0;
-    _pi_write_m.tomb = {};
+    _pi_write_m.partition_tombstone = {};
     _pi_write_m.first_clustering.reset();
     _pi_write_m.last_clustering.reset();
     _pi_write_m.desired_block_size = _pi_write_m.promoted_index_block_size;
@@ -954,12 +1035,13 @@ void writer::consume_new_partition(const dht::decorated_key& dk) {
 
 void writer::consume(tombstone t) {
     uint64_t current_pos = _data_writer->offset();
-    auto dt = to_deletion_time(t);
-    write(_sst.get_version(), *_data_writer, dt);
+
+    _pi_write_m.partition_tombstone = to_deletion_time(t);
+
+    write(_sst.get_version(), *_data_writer, _pi_write_m.partition_tombstone);
     _partition_header_length += (_data_writer->offset() - current_pos);
     _c_stats.update(t);
 
-    _pi_write_m.tomb = t;
     _tombstone_written = true;
 
     if (t) {
@@ -1303,15 +1385,44 @@ void writer::write_clustered(const clustering_row& clustered_row, uint64_t prev_
     collect_row_stats(_data_writer->offset() - current_pos, &clustered_row.key(), is_dead);
 }
 
+void writer::record_corrupt_row(clustering_row&& clustered_row) {
+    auto& handler = _sst.get_corrupt_data_handler();
+
+    const auto pk = _partition_key->to_partition_key(_schema);
+    const auto ck = clustered_row.key();
+
+    db::corrupt_data_handler::entry_id corrupt_row_id;
+    sstring result;
+    try {
+        corrupt_row_id = handler.record_corrupt_clustering_row(_schema, pk, std::move(clustered_row), "sstable-write", fmt::to_string(_sst.get_filename())).get();
+        result = format("written corrupt row to {} with id {}", handler.storage_name(), corrupt_row_id);
+    } catch (...) {
+        result = format("failed to write corrupt row to {}: {}", handler.storage_name(), std::current_exception());
+    }
+
+    slogger.error("found non-full clustering key {} in partition {} while writing sstable {} for non-compact table {}.{}; {}",
+            ck,
+            pk,
+            _sst.get_filename(),
+            _schema.ks_name(),
+            _schema.cf_name(),
+            result);
+}
+
 stop_iteration writer::consume(clustering_row&& cr) {
     if (_write_regular_as_static) {
         ensure_tombstone_is_written();
         write_static_row(cr.cells(), column_kind::regular_column);
         return stop_iteration::no;
     }
+    if (!_schema.is_compact_table() && !cr.key().is_full(_schema)) {
+        record_corrupt_row(std::move(cr));
+        return stop_iteration::no;
+    }
+
     ensure_tombstone_is_written();
     ensure_static_row_is_written_if_needed();
-    write_clustered(cr);
+    write_clustered(cr, _current_tombstone);
 
     auto can_split_partition_at_clustering_boundary = [this] {
         // will allow size limit to be exceeded for 10%, so we won't perform unnecessary split
@@ -1352,21 +1463,24 @@ static void write_clustering_prefix(sstable_version_types v, W& writer, bound_ki
 }
 
 void writer::write_promoted_index() {
+  if (_index_writer) {
     if (_pi_write_m.promoted_index_size < 2) {
         write_vint(*_index_writer, uint64_t(0));
         return;
     }
     write_vint(_tmp_bufs, _partition_header_length);
-    write(_sst.get_version(), _tmp_bufs, to_deletion_time(_pi_write_m.tomb));
+    write(_sst.get_version(), _tmp_bufs, _pi_write_m.partition_tombstone);
     write_vint(_tmp_bufs, _pi_write_m.promoted_index_size);
     uint64_t pi_size = _tmp_bufs.size() + _pi_write_m.blocks.size() + _pi_write_m.offsets.size();
     write_vint(*_index_writer, pi_size);
     flush_tmp_bufs(*_index_writer);
     write(_sst.get_version(), *_index_writer, _pi_write_m.blocks);
     write(_sst.get_version(), *_index_writer, _pi_write_m.offsets);
+  }
 }
 
 void writer::write_pi_block(const pi_block& block) {
+  if (_index_writer) {
     static constexpr size_t width_base = 65536;
     bytes_ostream& blocks = _pi_write_m.blocks;
     uint32_t offset = blocks.size();
@@ -1378,6 +1492,16 @@ void writer::write_pi_block(const pi_block& block) {
     write(_sst.get_version(), blocks, static_cast<std::byte>(block.open_marker ? 1 : 0));
     if (block.open_marker) {
         write(_sst.get_version(), blocks, to_deletion_time(*block.open_marker));
+    }
+  }
+    if (_bti_row_index_writer) {
+        _bti_row_index_writer->add(
+            _schema,
+            block.first,
+            block.last,
+            block.offset,
+            to_deletion_time(block.preceding_range_tombstone)
+        );
     }
 }
 
@@ -1402,8 +1526,8 @@ void writer::write_clustered(const rt_marker& marker, uint64_t prev_row_size) {
     collect_range_tombstone_stats();
 }
 
-void writer::consume(rt_marker&& marker) {
-    write_clustered(marker);
+void writer::consume(rt_marker&& marker, tombstone preceding_range_tombstone) {
+    write_clustered(marker, preceding_range_tombstone);
 }
 
 stop_iteration writer::consume(range_tombstone_change&& rtc) {
@@ -1416,15 +1540,21 @@ stop_iteration writer::consume(range_tombstone_change&& rtc) {
     tombstone prev_tombstone = std::exchange(_current_tombstone, rtc.tombstone());
     if (!prev_tombstone) { // start bound
         auto bv = pos.as_start_bound_view();
-        consume(rt_marker{pos.key(), to_bound_kind_m(bv.kind()), rtc.tombstone(), {}});
+        consume(
+            rt_marker{pos.key(), to_bound_kind_m(bv.kind()), rtc.tombstone(), {}},
+            prev_tombstone);
     } else if (!rtc.tombstone()) { // end bound
         auto bv = pos.as_end_bound_view();
-        consume(rt_marker{pos.key(), to_bound_kind_m(bv.kind()), prev_tombstone, {}});
+        consume(
+            rt_marker{pos.key(), to_bound_kind_m(bv.kind()), prev_tombstone, {}},
+        prev_tombstone);
     } else { // boundary
         auto bk = pos.get_bound_weight() == bound_weight::before_all_prefixed
             ? bound_kind_m::excl_end_incl_start
             : bound_kind_m::incl_end_excl_start;
-        consume(rt_marker{pos.key(), bk, prev_tombstone, rtc.tombstone()});
+        consume(
+            rt_marker{pos.key(), bk, prev_tombstone, rtc.tombstone()},
+            prev_tombstone);
     }
     return stop_iteration::no;
 }
@@ -1432,6 +1562,8 @@ stop_iteration writer::consume(range_tombstone_change&& rtc) {
 stop_iteration writer::consume_end_of_partition() {
     ensure_tombstone_is_written();
     ensure_static_row_is_written_if_needed();
+
+    uint64_t end_of_partition_position = _data_writer->offset();
 
     auto write_end_of_partition = [&] {
         write(_sst.get_version(), *_data_writer, row_flags::end_of_partition);
@@ -1453,6 +1585,23 @@ stop_iteration writer::consume_end_of_partition() {
 
     write_promoted_index();
 
+    if (_bti_partition_index_writer) {
+        auto partitions_db_payload = _bti_row_index_writer->finish(
+            _sst.get_version(),
+            _schema,
+            _current_partition_position,
+            end_of_partition_position,
+            *_partition_key,
+            _pi_write_m.partition_tombstone
+        );
+        _bti_partition_index_writer->add(
+            _schema,
+            *std::exchange(_current_dk_for_bti, std::nullopt),
+            _current_murmur_hash,
+            partitions_db_payload
+        );
+    }
+
     // compute size of the current row.
     _c_stats.partition_size = _data_writer->offset() - _c_stats.start_offset;
 
@@ -1473,13 +1622,40 @@ stop_iteration writer::consume_end_of_partition() {
 void writer::consume_end_of_stream() {
     _cfg.monitor->on_data_write_completed();
 
-    seal_summary(_sst._components->summary, std::move(_first_key), std::move(_last_key), _index_sampling_state).get();
+  if (_sst._components->summary) {
+    seal_summary(_sst._components->summary, std::optional<key>(_first_key), std::optional<key>(_last_key), _index_sampling_state).get();
+  }
 
     if (_sst.has_component(component_type::CompressionInfo)) {
         _collector.add_compression_ratio(_sst._components->compression.compressed_file_length(), _sst._components->compression.uncompressed_file_length());
     }
 
+  if (_index_writer) {
     close_writer(_index_writer);
+  }
+
+    if (_partitions_writer) {
+        _sst._partitions_db_footer = std::move(*_bti_partition_index_writer).finish(
+            _sst.get_version(),
+            _first_key.value(),
+            _last_key.value());
+        close_writer(_partitions_writer);
+    }
+    if (_rows_writer) {
+        // Append some garbage padding to the file just to ensure that it's never empty.
+        // (Otherwise it would be empty if the sstable contains only small partitions).
+        // This is a hack to work around some bad interactions between zero-sized files
+        // and object storage. (It seems that e.g. minio considers a zero-sized file
+        // upload to be a no-op, which breaks some assumptions).
+        uint32_t garbage = seastar::cpu_to_be(0x13371337);
+        _rows_writer->write(reinterpret_cast<const char*>(&garbage), sizeof(garbage));
+        close_writer(_rows_writer);
+    }
+
+    if (_hashes_writer) {
+        close_writer(_hashes_writer);
+    }
+
     _sst.set_first_and_last_keys();
 
     _sst._components->statistics.contents[metadata_type::Serialization] = std::make_unique<serialization_header>(std::move(_sst_schema.header));
@@ -1487,11 +1663,25 @@ void writer::consume_end_of_stream() {
         _sst._schema->get_partitioner().name(), _sst._schema->bloom_filter_fp_chance(),
         _sst._schema, _sst.get_first_decorated_key(), _sst.get_last_decorated_key(), _enc_stats);
     close_data_writer();
+
+  if (_sst._components->summary) {
     _sst.write_summary();
-    _sst.maybe_rebuild_filter_from_index(_num_partitions_consumed);
+  }
+
+    if (_delayed_filter) {
+        _sst.build_delayed_filter(_num_partitions_consumed);
+    } else {
+        _sst.maybe_rebuild_filter_from_index(_num_partitions_consumed);
+    }
     _sst.write_filter();
     _sst.write_statistics();
     _sst.write_compression();
+    // Note: during the SSTable write, the `compressor` object in `_sst._components->compression`
+    // can only compress, not decompress. We have to create a decompressing `compressor` here.
+    // (The reason we split the two is that we don't want to keep the compressor-specific compression
+    // context after the write is over, because it hogs memory).
+    auto decompressor = _sst.manager().get_compressor_factory().make_compressor_for_reading(_sst._components->compression).get();
+    _sst._components->compression.set_compressor(std::move(decompressor));
     run_identifier identifier{_run_identifier};
     std::optional<scylla_metadata::large_data_stats> ld_stats(scylla_metadata::large_data_stats{
         .map = {
@@ -1505,8 +1695,12 @@ void writer::consume_end_of_stream() {
     std::optional<scylla_metadata::ext_timestamp_stats> ts_stats(scylla_metadata::ext_timestamp_stats{
         .map = _collector.get_ext_timestamp_stats()
     });
-    _sst.write_scylla_metadata(_shard, _features, std::move(identifier), std::move(ld_stats), std::move(ts_stats));
+    _sst.write_scylla_metadata(_shard, std::move(identifier), std::move(ld_stats), std::move(ts_stats));
     _sst.seal_sstable(_cfg.backup).get();
+}
+
+uint64_t writer::data_file_position_for_tests() const {
+    return _data_writer->offset();
 }
 
 std::unique_ptr<sstable_writer::writer_impl> make_writer(sstable& sst,

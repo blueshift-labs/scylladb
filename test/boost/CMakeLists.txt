@@ -5,7 +5,7 @@ add_scylla_test(advanced_rpc_compressor_test
 add_scylla_test(allocation_strategy_test
   KIND BOOST)
 add_scylla_test(alternator_unit_test
-  KIND BOOST
+  KIND SEASTAR
   LIBRARIES alternator)
 add_scylla_test(anchorless_list_test
   KIND BOOST)
@@ -54,6 +54,9 @@ add_scylla_test(clustering_ranges_walker_test
   KIND SEASTAR)
 add_scylla_test(compaction_group_test
   KIND SEASTAR)
+add_scylla_test(comparable_bytes_test
+  KIND SEASTAR
+  LIBRARIES types)
 add_scylla_test(compound_test
   KIND SEASTAR)
 add_scylla_test(compress_test
@@ -155,6 +158,8 @@ add_scylla_test(logalloc_standard_allocator_segment_pool_backend_test
   KIND SEASTAR)
 add_scylla_test(logalloc_test
   KIND SEASTAR)
+add_scylla_test(lru_string_map_test
+  KIND BOOST)
 add_scylla_test(managed_bytes_test
   KIND BOOST
   LIBRARIES Seastar::seastar_testing)
@@ -196,11 +201,17 @@ add_scylla_test(reusable_buffer_test
   KIND SEASTAR)
 add_scylla_test(reservoir_sampling_test
   KIND BOOST)
+add_scylla_test(rest_client_test
+  KIND SEASTAR)
 add_scylla_test(rust_test
   KIND BOOST
   LIBRARIES inc)
 add_scylla_test(s3_test
-  KIND SEASTAR)
+  KIND SEASTAR
+  LIBRARIES scylla_encryption)
+add_scylla_test(gcp_object_storage_test
+  KIND SEASTAR
+  LIBRARIES scylla_encryption)
 add_scylla_test(aws_errors_test
   KIND BOOST)
 add_scylla_test(aws_error_injection_test
@@ -230,6 +241,8 @@ add_scylla_test(sstable_datafile_test
   KIND SEASTAR)
 add_scylla_test(sstable_generation_test
   KIND BOOST)
+add_scylla_test(sstable_inexact_index_test
+  KIND SEASTAR)
 add_scylla_test(sstable_move_test
   KIND SEASTAR)
 add_scylla_test(sstable_mutation_test
@@ -261,10 +274,22 @@ add_scylla_test(top_k_test
   KIND BOOST)
 add_scylla_test(transport_test
   KIND SEASTAR)
+add_scylla_test(bti_index_test
+  KIND SEASTAR)
+add_scylla_test(bti_node_sink_test
+  KIND BOOST)
+add_scylla_test(bti_key_translation_test
+  KIND BOOST)
+add_scylla_test(trie_traversal_test
+  KIND SEASTAR)
+add_scylla_test(trie_writer_test
+  KIND BOOST)
 add_scylla_test(types_test
   KIND SEASTAR)
 add_scylla_test(unique_view_test
   KIND BOOST)
+add_scylla_test(scoped_item_list_test
+  KIND SEASTAR)
 add_scylla_test(utf8_test
   KIND BOOST
   LIBRARIES utils)
@@ -282,6 +307,8 @@ add_scylla_test(wasm_test
 add_scylla_test(wrapping_interval_test
   KIND BOOST)
 add_scylla_test(address_map_test
+  KIND SEASTAR)
+add_scylla_test(object_storage_upload_test
   KIND SEASTAR)
 
 add_scylla_test(combined_tests
@@ -305,18 +332,20 @@ add_scylla_test(combined_tests
     cql_query_test.cc
     database_test.cc
     data_listeners_test.cc
+    disk_space_monitor_test.cc
     error_injection_test.cc
     extensions_test.cc
     filtering_test.cc
     group0_cmd_merge_test.cc
     group0_test.cc
+    group0_voter_calculator_test.cc
     index_with_paging_test.cc
     json_cql_query_test.cc
     large_paging_state_test.cc
     loading_cache_test.cc
     memtable_test.cc
     multishard_combining_reader_as_mutation_source_test.cc
-    multishard_mutation_query_test.cc
+    multishard_query_test.cc
     mutation_reader_test.cc
     mutation_writer_test.cc
     network_topology_strategy_test.cc
@@ -334,6 +363,8 @@ add_scylla_test(combined_tests
     secondary_index_test.cc
     sessions_test.cc
     sstable_compaction_test.cc
+    sstable_compressor_factory_test.cc
+    sstable_compression_config_test.cc
     sstable_directory_test.cc
     sstable_set_test.cc
     statement_restrictions_test.cc
@@ -354,6 +385,3 @@ add_scylla_test(combined_tests
     idl
     tools
     utils)
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/suite.yaml")
-  set(scylla_tests "${scylla_tests}" PARENT_SCOPE)
-endif()

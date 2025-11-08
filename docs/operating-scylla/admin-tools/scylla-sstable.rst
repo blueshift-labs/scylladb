@@ -5,7 +5,7 @@ Introduction
 -------------
 
 This tool allows you to examine the content of SStables by performing operations such as dumping the content of SStables,
-generating a histogram, validating the content of SStables, and more. See `Supported Operations`_ for the list of available operations.
+validating the content of SStables, and more. See `Supported Operations`_ for the list of available operations.
 
 Run ``scylla sstable --help`` for additional information about the tool and the operations.
 
@@ -31,6 +31,7 @@ The command syntax is as follows:
 
 You can specify more than one SSTable. Additionally, the path to SSTable can point to an S3 fully qualified path in the form of s3://bucket-name/prefix/of/your/sstable/sstable-TOC.txt. To use this feature, you need to have AWS credentials set up in your environment. For more information, see :ref:`Configuring AWS S3 access <aws-s3-configuration>`. Additionally, you must ensure the tool is able to load the correct Scylla YAML file, which can be done using the --scylla-yaml-file parameter or by placing the YAML file in one of the default locations the tool checks.
 
+.. _scylla-sstable-schema:
 
 Schema
 ------
@@ -644,7 +645,33 @@ the output will be:
 write
 ^^^^^
 
-Writes an SStable based on a JSON representation of the content.
+Writes an SStable based on a description of the content.
+The description can be provided in two formats: ``CQL`` and ``JSON``.
+The input format can be selected with the ``--input-format`` flag. Default is ``cql``.
+In both cases the input is expected to be provided via the file whoose path is passed to ``--input-file``.
+
+CQL input format
+~~~~~~~~~~~~~~~~
+
+The input file is expected to contain ``;`` separated CQL statements, providing the content of the output SSTable(s).
+The following CQL statements are allowed: ``INSERT``, ``UPDATE`` and ``DELETE``.
+The statements can be in any order, the data will be sorted internally.
+Writes are internally applied to a memtable, which is flushed to disk once its size exceeds the memory limit, specified via the ``--memory-limit`` command line argument (defaults to ``1MiB``).
+
+Reading the statements from the input file happens via a streaming parser, it is
+safe to provide input files of any size.
+
+Can produce multiple output SSTables, depending on the size of the input.
+
+This operation needs a temporary directory to write files to -- as it sets up a
+``cql_test_env``. This temporary directory will have a size of a couple of megabytes.
+By default it will create this in ``/tmp``, this can be changed with the ``TEMPDIR``
+environment variable. This temporary directory is removed on exit.
+
+JSON input format
+~~~~~~~~~~~~~~~~~
+
+The input file is expected to contain a JSON description of the content of the SStable to write.
 The JSON representation has to have the same schema as that of a single SStable from the output of the `dump-data operation <dump-data_>`_ (corresponding to the ``$SSTABLE`` symbol).
 The easiest way to get started with writing your own SStable is to dump an existing SStable, modify the JSON then invoke this operation with the result.
 You can feed the output of dump-data to write by filtering the output of the former with ``jq .sstables[]``:
@@ -652,21 +679,26 @@ You can feed the output of dump-data to write by filtering the output of the for
 .. code-block:: console
 
     scylla sstable dump-data --system-schema system_schema.columns /path/to/me-14-big-Data.db | jq .sstables[] > input.json
-    scylla sstable write --system-schema system_schema.columns --input-file ./input.json --generation 0
+    scylla sstable write --system-schema system_schema.columns --input-file ./input.json
     scylla sstable dump-data --system-schema system_schema.columns ./me-0-big-Data.db | jq .sstables[] > dump.json
 
 At the end of the above, ``input.json`` and ``dump.json`` will have the same content.
 
-Note that `write` doesn't yet support all the features of the ScyllaDB storage engine. The following are not supported:
+Note that ``write`` with ``--input-format=json`` doesn't yet support all the features of the ScyllaDB storage engine. The following are not supported:
 
 * Counters.
 * Non-strictly atomic cells, including frozen multi-cell types like collections, tuples, and UDTs.
 
 Parsing uses a streaming JSON parser, it is safe to pass in input files of any size.
 
-The output SStable will use the BIG format, the highest supported SStable format, and the specified generation (``--generation``).
-By default, it is placed in the local directory, which can be changed with ``--output-dir``.
-If the output SStable clashes with an existing SStable, the write will fail.
+Produces a single output SSTable.
+
+Output SSTables
+~~~~~~~~~~~~~~~
+
+The output SStable will use the BIG format, the highest supported SStable format and a random UUID generation, which is printed to stdout.
+By default, they are placed in the local directory, which can be changed with ``--output-dir``.
+If any output SStable clashes with an existing SStable, the write will fail.
 
 The output is validated before being written to the disk.
 The validation done here is similar to that done by the `validate operation <validate_>`_.
@@ -1333,6 +1365,29 @@ Examples
 ~~~~~~~~
 
 You can find example scripts at https://github.com/scylladb/scylladb/tree/master/tools/scylla-sstable-scripts.
+
+upgrade
+^^^^^^^
+
+Offline, scylla-sstable variant of `nodetool upgradesstables </operating-scylla/nodetool-commands/upgradesstables/>`_.
+Rewrites the input SSTable(s) to the latest supported version and latest schema version.
+The SSTable version to be used can be overridden with the ``--version`` flag, allowing for switching sstables between all versions supported for writing (some SSTable versions are supported for reading only).
+
+SSTables which are already on the designated version are skipped. To force rewriting *all* SSTables, use the ``--all`` flag. 
+
+Output SSTables are written to the path provided by the ``--output-dir`` flag, or to the current directory if not specified.
+This directory is expected to exist and be empty. If not empty the tool will refuse to run. This can be overridden with the ``--unsafe-accept-nonempty-output-dir`` flag.
+
+It is strongly recommended to use the system schema tables as the schema source for this command, see the `schema options <scylla-sstable-schema_>`_ for more details.
+A schema which is good enough to read the SSTable and dump its content, may not be good enough to write its content back verbatim.
+An incomplete or incorrect schema can lead to the tool crashing or even data loss.
+
+Altering the schema deliberately to alter the SSTable content or options is possible, by using the ``--schema-file`` schema source and providing the schema with the desired alterations.
+This is dangerous and can lead to data loss, use with caution. In general, altering the table options (the part after the ``WITH``) is safe.
+But even an altered schema which changed only the table options can lead to data loss, since not all schema column options are expressible via CQL.
+
+The mapping of input SSTables to output SSTables is printed to ``stdout``.
+
 
 Examples
 --------

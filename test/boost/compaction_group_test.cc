@@ -40,7 +40,7 @@ static sstables::shared_sstable generate_sstable(schema_ptr s, std::function<sha
     };
 
     auto keys = tests::generate_partition_keys(100, s);
-    std::vector<mutation> muts;
+    utils::chunked_vector<mutation> muts;
 
     muts.reserve(keys.size());
     for (auto& k : keys) {
@@ -55,17 +55,17 @@ static sstables::shared_sstable sstable_that_needs_split(schema_ptr s, std::func
     return generate_sstable(std::move(s), std::move(sst_gen), [] (dht::token) { return true; });
 }
 
-class single_compaction_group : public compaction::table_state {
+class single_compaction_group : public compaction::compaction_group_view {
 private:
     schema_ptr _schema;
     sstables::sstables_manager& _sst_man;
     sstables::sstable_set _main_set;
     sstables::sstable_set _maintenance_set;
     std::vector<sstables::shared_sstable> _compacted_undeleted_sstables;
-    mutable sstables::compaction_strategy _compaction_strategy;
-    compaction_strategy_state _compaction_strategy_state;
+    mutable compaction::compaction_strategy _compaction_strategy;
+    compaction::compaction_strategy_state _compaction_strategy_state;
     tombstone_gc_state _tombstone_gc_state;
-    compaction_backlog_tracker _backlog_tracker;
+    compaction::compaction_backlog_tracker _backlog_tracker;
     condition_variable _staging_done_condition;
     std::function<shared_sstable()> _sstable_factory;
     mutable tests::reader_concurrency_semaphore_wrapper _semaphore;
@@ -73,9 +73,9 @@ public:
     single_compaction_group(table_for_tests& t, sstables::sstables_manager& sst_man, std::function<shared_sstable()> sstable_factory)
             : _schema(t.schema())
             , _sst_man(sst_man)
-            , _main_set(sstables::make_partitioned_sstable_set(_schema, false))
-            , _maintenance_set(sstables::make_partitioned_sstable_set(_schema, false))
-            , _compaction_strategy(sstables::make_compaction_strategy(_schema->compaction_strategy(), _schema->compaction_strategy_options()))
+            , _main_set(sstables::make_partitioned_sstable_set(_schema, token_range()))
+            , _maintenance_set(sstables::make_partitioned_sstable_set(_schema, token_range()))
+            , _compaction_strategy(compaction::make_compaction_strategy(_schema->compaction_strategy(), _schema->compaction_strategy_options()))
             , _compaction_strategy_state(compaction::compaction_strategy_state::make(_compaction_strategy))
             , _tombstone_gc_state(nullptr)
             , _backlog_tracker(_compaction_strategy.make_backlog_tracker())
@@ -97,16 +97,17 @@ public:
         }
     }
 
+    virtual dht::token_range token_range() const noexcept override { return dht::token_range::make(dht::first_token(), dht::last_token()); }
     virtual const schema_ptr& schema() const noexcept override { return _schema; }
     virtual unsigned min_compaction_threshold() const noexcept override { return _schema->min_compaction_threshold(); }
     virtual bool compaction_enforce_min_threshold() const noexcept override { return false; }
-    virtual const sstables::sstable_set& main_sstable_set() const override { return _main_set; }
-    virtual const sstables::sstable_set& maintenance_sstable_set() const override { return _maintenance_set; }
-    virtual lw_shared_ptr<const sstables::sstable_set> sstable_set_for_tombstone_gc() const override { return make_lw_shared<const sstables::sstable_set>(main_sstable_set()); }
+    virtual future<lw_shared_ptr<const sstables::sstable_set>> main_sstable_set() const override { co_return make_lw_shared<const sstables::sstable_set>(_main_set); }
+    virtual future<lw_shared_ptr<const sstables::sstable_set>> maintenance_sstable_set() const override { co_return make_lw_shared<const sstables::sstable_set>(_maintenance_set); }
+    virtual lw_shared_ptr<const sstables::sstable_set> sstable_set_for_tombstone_gc() const override { return make_lw_shared<const sstables::sstable_set>(_main_set); }
     virtual std::unordered_set<sstables::shared_sstable> fully_expired_sstables(const std::vector<sstables::shared_sstable>& sstables, gc_clock::time_point compaction_time) const override { return {}; }
     virtual const std::vector<sstables::shared_sstable>& compacted_undeleted_sstables() const noexcept override { return _compacted_undeleted_sstables; }
-    virtual sstables::compaction_strategy& get_compaction_strategy() const noexcept override { return _compaction_strategy; }
-    virtual compaction_strategy_state& get_compaction_strategy_state() noexcept override { return _compaction_strategy_state; }
+    virtual compaction::compaction_strategy& get_compaction_strategy() const noexcept override { return _compaction_strategy; }
+    virtual compaction::compaction_strategy_state& get_compaction_strategy_state() noexcept override { return _compaction_strategy_state; }
     virtual reader_permit make_compaction_reader_permit() const override { return _semaphore.make_permit(); }
     virtual sstables::sstables_manager& get_sstables_manager() noexcept override { return _sst_man; }
     virtual sstables::shared_sstable make_sstable() const override { return _sstable_factory(); }
@@ -115,7 +116,7 @@ public:
     virtual api::timestamp_type min_memtable_live_timestamp() const override { return api::min_timestamp; }
     virtual api::timestamp_type min_memtable_live_row_marker_timestamp() const override { return api::min_timestamp; }
     virtual bool memtable_has_key(const dht::decorated_key& key) const override { return false; }
-    virtual future<> on_compaction_completion(sstables::compaction_completion_desc desc, sstables::offstrategy offstrategy) override {
+    virtual future<> on_compaction_completion(compaction::compaction_completion_desc desc, sstables::offstrategy offstrategy) override {
         testlog.info("Adding {} sstable(s), removing {} sstables", desc.new_sstables.size(), desc.old_sstables.size());
         rebuild_main_set(desc.new_sstables, desc.old_sstables);
         return make_ready_future<>();
@@ -123,10 +124,11 @@ public:
     virtual bool is_auto_compaction_disabled_by_user() const noexcept override { return false; }
     virtual bool tombstone_gc_enabled() const noexcept override { return false; }
     virtual const tombstone_gc_state& get_tombstone_gc_state() const noexcept override { return _tombstone_gc_state; }
-    virtual compaction_backlog_tracker& get_backlog_tracker() override { return _backlog_tracker; }
+    virtual compaction::compaction_backlog_tracker& get_backlog_tracker() override { return _backlog_tracker; }
     virtual const std::string get_group_id() const noexcept override { return "0"; }
     virtual seastar::condition_variable& get_staging_done_condition() noexcept override { return _staging_done_condition; }
     dht::token_range get_token_range_after_split(const dht::token& t) const noexcept override { return dht::token_range(); }
+    int64_t get_sstables_repaired_at() const noexcept override { return 0; }
 };
 
 SEASTAR_TEST_CASE(basic_compaction_group_splitting_test) {
@@ -160,11 +162,11 @@ SEASTAR_TEST_CASE(basic_compaction_group_splitting_test) {
                 return sstable_needs_split(sst) ? sst->bytes_on_disk() : size_t(0);
             }), int64_t(0), std::plus{});
 
-            auto ret = cm.perform_split_compaction(*compaction_group, sstables::compaction_type_options::split{classifier}, tasks::task_info{}).get();
+            auto ret = cm.perform_split_compaction(*compaction_group, compaction::compaction_type_options::split{classifier}, tasks::task_info{}).get();
             BOOST_REQUIRE_EQUAL(ret->start_size, expected_compaction_size);
 
-            BOOST_REQUIRE(compaction_group->main_sstable_set().size() == expected_output);
-            compaction_group->main_sstable_set().for_each_sstable([&] (const sstables::shared_sstable& sst) {
+            BOOST_REQUIRE(compaction_group->main_sstable_set().get()->size() == expected_output);
+            compaction_group->main_sstable_set().get()->for_each_sstable([&] (const sstables::shared_sstable& sst) {
                 BOOST_REQUIRE(!sstable_needs_split(sst));
                 validate(sst);
             });
@@ -198,6 +200,73 @@ SEASTAR_TEST_CASE(basic_compaction_group_splitting_test) {
                 found_input2 |= sst->generation() == input2->generation();
             });
             BOOST_REQUIRE(found_input2);
+        }
+    });
+}
+
+static mutation_reader sstable_reader(shared_sstable sst, schema_ptr s, reader_permit permit) {
+    return sst->as_mutation_source().make_mutation_reader(s, std::move(permit), query::full_partition_range, s->full_slice());
+}
+
+SEASTAR_TEST_CASE(compactions_dont_cross_group_boundary_test) {
+    return test_env::do_with_async([] (test_env& env) {
+        auto builder = schema_builder("tests", "compactions_dont_cross_group_boundary")
+                .with_column("id", utf8_type, column_kind::partition_key)
+                .with_column("cl", int32_type, column_kind::clustering_key)
+                .with_column("value", int32_type);
+        auto s = builder.build();
+
+        auto t = env.make_table_for_tests(s);
+        auto close_table = deferred_stop(t);
+        t->start();
+
+        // Disable auto compaction to allow us to trigger compaction manually later.
+        t->disable_auto_compaction().get();
+
+        auto is_unrepaired = [] (dht::token t) { return t.raw() % 3 == 0; };
+        auto is_repairing = [] (dht::token t) { return t.raw() % 3 == 1; };
+        auto is_repaired = [] (dht::token t) { return t.raw() % 3 == 2; };
+
+        auto sst_factory = env.make_sst_factory(s);
+        auto generate_sstables = [&] (std::function<bool(dht::token)> filter) {
+            for (int i = 0; i < 4; i++) {
+                t->add_sstable_and_update_cache(generate_sstable(s, sst_factory, filter)).get();
+            }
+        };
+        generate_sstables(is_unrepaired);
+        generate_sstables(is_repairing);
+        generate_sstables(is_repaired);
+
+        auto repair_token_classifier = [&] (dht::token t) -> replica::repair_sstable_classification {
+            if (is_unrepaired(t)) {
+                return replica::repair_sstable_classification::unrepaired;
+            } else if (is_repairing(t)) {
+                return replica::repair_sstable_classification::repairing;
+            }
+            return replica::repair_sstable_classification::repaired;
+        };
+        auto repair_sstable_classifier = [&] (const sstables::shared_sstable& sst, int64_t sstables_repaired_at) -> replica::repair_sstable_classification {
+            return repair_token_classifier(sst->get_first_decorated_key().token());
+        };
+        t.set_repair_sstable_classifier(repair_sstable_classifier);
+
+        for (int i = 0; i < 4; i++) {
+            t->compact_all_sstables({}).get();
+        }
+
+        auto validate_sstable = [&] (const sstables::shared_sstable& sst) {
+            auto reader = sstable_reader(sst, s, env.make_reader_permit()); // reader holds sst and s alive.
+            auto close_reader = deferred_close(reader);
+
+            auto expected_classification = repair_sstable_classifier(sst, 0);
+
+            while (auto m = read_mutation_from_mutation_reader(reader).get()) {
+                BOOST_REQUIRE(repair_token_classifier(m->decorated_key().token()) == expected_classification);
+            }
+        };
+        auto all_sstables = t->get_sstables();
+        for (auto& sst : *all_sstables) {
+            validate_sstable(sst);
         }
     });
 }

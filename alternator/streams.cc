@@ -13,7 +13,6 @@
 
 #include <seastar/json/formatter.hh>
 
-#include "auth/permission.hh"
 #include "db/config.hh"
 
 #include "cdc/log.hh"
@@ -32,6 +31,7 @@
 
 #include "executor.hh"
 #include "data_dictionary/data_dictionary.hh"
+#include "utils/rjson.hh"
 
 /**
  * Base template type to implement  rapidjson::internal::TypeHelper<...>:s
@@ -126,7 +126,7 @@ public:
     }
 };
 
-}
+} // namespace alternator
 
 template<typename ValueType>
 struct rapidjson::internal::TypeHelper<ValueType, alternator::stream_arn>
@@ -217,7 +217,7 @@ future<alternator::executor::request_return_type> alternator::executor::list_str
         rjson::add(ret, "LastEvaluatedStreamArn", *last);
     }
 
-    return make_ready_future<executor::request_return_type>(make_jsonable(std::move(ret)));
+    return make_ready_future<executor::request_return_type>(rjson::print(std::move(ret)));
 }
 
 struct shard_id {
@@ -296,7 +296,7 @@ sequence_number::sequence_number(std::string_view v)
     }())
 {}
 
-}
+} // namespace alternator
 
 template<typename ValueType>
 struct rapidjson::internal::TypeHelper<ValueType, alternator::shard_id>
@@ -356,7 +356,7 @@ static stream_view_type cdc_options_to_steam_view_type(const cdc::options& opts)
     return type;
 }
 
-}
+} // namespace alternator
 
 template<typename ValueType>
 struct rapidjson::internal::TypeHelper<ValueType, alternator::stream_view_type>
@@ -475,10 +475,10 @@ future<executor::request_return_type> executor::describe_stream(client_state& cl
         } else {
             status = "ENABLED";
         }
-    } 
+    }
 
     auto ttl = std::chrono::seconds(opts.ttl());
-    
+
     rjson::add(stream_desc, "StreamStatus", rjson::from_string(status));
 
     stream_view_type type = cdc_options_to_steam_view_type(opts);
@@ -491,7 +491,7 @@ future<executor::request_return_type> executor::describe_stream(client_state& cl
 
     if (!opts.enabled()) {
         rjson::add(ret, "StreamDescription", std::move(stream_desc));
-        return make_ready_future<executor::request_return_type>(make_jsonable(std::move(ret)));
+        return make_ready_future<executor::request_return_type>(rjson::print(std::move(ret)));
     }
 
     // TODO: label
@@ -617,7 +617,7 @@ future<executor::request_return_type> executor::describe_stream(client_state& cl
         rjson::add(stream_desc, "Shards", std::move(shards));
         rjson::add(ret, "StreamDescription", std::move(stream_desc));
             
-        return make_ready_future<executor::request_return_type>(make_jsonable(std::move(ret)));
+        return make_ready_future<executor::request_return_type>(rjson::print(std::move(ret)));
     });
 }
 
@@ -714,7 +714,7 @@ future<executor::request_return_type> executor::get_shard_iterator(client_state&
 
     auto type = rjson::get<shard_iterator_type>(request, "ShardIteratorType");
     auto seq_num = rjson::get_opt<sequence_number>(request, "SequenceNumber");
-    
+
     if (type < shard_iterator_type::TRIM_HORIZON && !seq_num) {
         throw api_error::validation("Missing required parameter \"SequenceNumber\"");
     }
@@ -724,7 +724,7 @@ future<executor::request_return_type> executor::get_shard_iterator(client_state&
 
     auto stream_arn = rjson::get<alternator::stream_arn>(request, "StreamArn");
     auto db = _proxy.data_dictionary();
-    
+
     schema_ptr schema = nullptr;
     std::optional<shard_id> sid;
 
@@ -770,7 +770,7 @@ future<executor::request_return_type> executor::get_shard_iterator(client_state&
     auto ret = rjson::empty_object();
     rjson::add(ret, "ShardIterator", iter);
 
-    return make_ready_future<executor::request_return_type>(make_jsonable(std::move(ret)));
+    return make_ready_future<executor::request_return_type>(rjson::print(std::move(ret)));
 }
 
 struct event_id {
@@ -789,7 +789,7 @@ struct event_id {
         return os;
     }
 };
-}
+} // namespace alternator
 
 template<typename ValueType>
 struct rapidjson::internal::TypeHelper<ValueType, alternator::event_id>
@@ -808,6 +808,9 @@ future<executor::request_return_type> executor::get_records(client_state& client
     if (limit < 1) {
         throw api_error::validation("Limit must be 1 or more");
     }
+    if (limit > 1000) {
+        throw api_error::validation("Limit must be less than or equal to 1000");
+    }
 
     auto db = _proxy.data_dictionary();
     schema_ptr schema, base;
@@ -824,7 +827,7 @@ future<executor::request_return_type> executor::get_records(client_state& client
 
     tracing::add_table_name(trace_state, schema->ks_name(), schema->cf_name());
 
-    co_await verify_permission(_enforce_authorization, client_state, schema, auth::permission::SELECT);
+    co_await verify_permission(_enforce_authorization, _warn_authorization, client_state, schema, auth::permission::SELECT, _stats);
 
     db::consistency_level cl = db::consistency_level::LOCAL_QUORUM;
     partition_key pk = iter.shard.id.to_partition_key(*schema);
@@ -868,10 +871,12 @@ future<executor::request_return_type> executor::get_records(client_state& client
 
     std::transform(pks.begin(), pks.end(), std::back_inserter(columns), [](auto& c) { return &c; });
     std::transform(cks.begin(), cks.end(), std::back_inserter(columns), [](auto& c) { return &c; });
+    auto regular_column_start_idx = columns.size();
+    auto regular_column_filter = std::views::filter([](const column_definition& cdef) { return cdef.name() == op_column_name || cdef.name() == eor_column_name || !cdc::is_cdc_metacolumn_name(cdef.name_as_text()); });
+    std::ranges::transform(schema->regular_columns() | regular_column_filter, std::back_inserter(columns), [](auto& c) { return &c; });
 
-    auto regular_columns = schema->regular_columns()
-        | std::views::filter([](const column_definition& cdef) { return cdef.name() == op_column_name || cdef.name() == eor_column_name || !cdc::is_cdc_metacolumn_name(cdef.name_as_text()); })
-        | std::views::transform([&] (const column_definition& cdef) { columns.emplace_back(&cdef); return cdef.id; })
+    auto regular_columns = std::ranges::subrange(columns.begin() + regular_column_start_idx, columns.end())
+        | std::views::transform(&column_definition::id)
         | std::ranges::to<query::column_id_vector>()
     ;
 
@@ -922,6 +927,7 @@ future<executor::request_return_type> executor::get_records(client_state& client
         std::optional<utils::UUID> timestamp;
         auto dynamodb = rjson::empty_object();
         auto record = rjson::empty_object();
+        const auto dc_name = _proxy.get_token_metadata_ptr()->get_topology().get_datacenter();
 
         using op_utype = std::underlying_type_t<cdc::operation>;
 
@@ -931,9 +937,10 @@ future<executor::request_return_type> executor::get_records(client_state& client
                 dynamodb = rjson::empty_object();
             }
             if (!record.ObjectEmpty()) {
-                // TODO: awsRegion?
+                rjson::add(record, "awsRegion", rjson::from_string(dc_name));
                 rjson::add(record, "eventID", event_id(iter.shard.id, *timestamp));
                 rjson::add(record, "eventSource", "scylladb:alternator");
+                rjson::add(record, "eventVersion", "1.1");
                 rjson::push_back(records, std::move(record));
                 record = rjson::empty_object();
                 --limit;
@@ -952,7 +959,7 @@ future<executor::request_return_type> executor::get_records(client_state& client
                 rjson::add(dynamodb, "ApproximateCreationDateTime", utils::UUID_gen::unix_timestamp_in_sec(ts).count());
                 rjson::add(dynamodb, "SequenceNumber", sequence_number(ts));
                 rjson::add(dynamodb, "StreamViewType", type);
-                //TODO: SizeInBytes
+                // TODO: SizeBytes
             }
 
             /**
@@ -992,6 +999,16 @@ future<executor::request_return_type> executor::get_records(client_state& client
             case cdc::operation::insert:
                 rjson::add(record, "eventName", "INSERT");
                 break;
+            case cdc::operation::service_row_delete:
+            case cdc::operation::service_partition_delete:
+            {
+                auto user_identity = rjson::empty_object();
+                rjson::add(user_identity, "Type", "Service");
+                rjson::add(user_identity, "PrincipalId", "dynamodb.amazonaws.com");
+                rjson::add(record, "userIdentity", std::move(user_identity));
+                rjson::add(record, "eventName", "REMOVE");
+                break;
+            }
             default:
                 rjson::add(record, "eventName", "REMOVE");
                 break;
@@ -1018,7 +1035,7 @@ future<executor::request_return_type> executor::get_records(client_state& client
             // will notice end end of shard and not return NextShardIterator.
             rjson::add(ret, "NextShardIterator", next_iter);
             _stats.api_operations.get_records_latency.mark(std::chrono::steady_clock::now() - start_time);
-            return make_ready_future<executor::request_return_type>(make_jsonable(std::move(ret)));
+            return make_ready_future<executor::request_return_type>(rjson::print(std::move(ret)));
         }
 
         // ugh. figure out if we are and end-of-shard
@@ -1044,12 +1061,12 @@ future<executor::request_return_type> executor::get_records(client_state& client
             if (is_big(ret)) {
                 return make_ready_future<executor::request_return_type>(make_streamed(std::move(ret)));
             }
-            return make_ready_future<executor::request_return_type>(make_jsonable(std::move(ret)));
+            return make_ready_future<executor::request_return_type>(rjson::print(std::move(ret)));
         });
     });
 }
 
-void executor::add_stream_options(const rjson::value& stream_specification, schema_builder& builder, service::storage_proxy& sp) {
+bool executor::add_stream_options(const rjson::value& stream_specification, schema_builder& builder, service::storage_proxy& sp) {
     auto stream_enabled = rjson::find(stream_specification, "StreamEnabled");
     if (!stream_enabled || !stream_enabled->IsBool()) {
         throw api_error::validation("StreamSpecification needs boolean StreamEnabled");
@@ -1083,10 +1100,12 @@ void executor::add_stream_options(const rjson::value& stream_specification, sche
                 break;
         }
         builder.with_cdc_options(opts);
+        return true;
     } else {
         cdc::options opts;
         opts.enabled(false);
         builder.with_cdc_options(opts);
+        return false;
     }
 }
 
@@ -1115,4 +1134,4 @@ void executor::supplement_table_stream_info(rjson::value& descr, const schema& s
     }
 }
 
-}
+} // namespace alternator

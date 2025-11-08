@@ -18,6 +18,7 @@
 #include "gms/feature.hh"
 #include "gms/i_endpoint_state_change_subscriber.hh"
 #include "schema/schema_fwd.hh"
+#include "service/storage_service.hh"
 #include "utils/serialized_action.hh"
 #include "service/raft/raft_group_registry.hh"
 #include "service/raft/raft_group0_client.hh"
@@ -57,11 +58,12 @@ private:
     std::unordered_map<locator::host_id, serialized_action> _schema_pulls;
     serialized_action _group0_barrier;
     std::vector<gms::feature::listener_registration> _feature_listeners;
-    seastar::gate _background_tasks;
+    seastar::named_gate _background_tasks;
     static const std::chrono::milliseconds migration_delay;
     gms::feature_service& _feat;
     netw::messaging_service& _messaging;
     service::storage_proxy& _storage_proxy;
+    sharded<service::storage_service>& _ss;
     gms::gossiper& _gossiper;
     seastar::abort_source _as;
     service::raft_group0_client& _group0_client;
@@ -87,7 +89,7 @@ private:
     friend class group0_state_machine; // needed for access to _messaging
     size_t _concurrent_ddl_retries;
 public:
-    migration_manager(migration_notifier&, gms::feature_service&, netw::messaging_service& ms, service::storage_proxy&, gms::gossiper& gossiper, service::raft_group0_client& group0_client, sharded<db::system_keyspace>& sysks);
+    migration_manager(migration_notifier&, gms::feature_service&, netw::messaging_service& ms, service::storage_proxy&, sharded<service::storage_service>& ss, gms::gossiper& gossiper, service::raft_group0_client& group0_client, sharded<db::system_keyspace>& sysks);
 
     migration_notifier& get_notifier() { return _notifier; }
     const migration_notifier& get_notifier() const { return _notifier; }
@@ -117,7 +119,7 @@ public:
 
     // Merge mutations received from src.
     // Keep mutations alive around whole async operation.
-    future<> merge_schema_from(locator::host_id src, const std::vector<canonical_mutation>& mutations);
+    future<> merge_schema_from(locator::host_id src, const utils::chunked_vector<canonical_mutation>& mutations);
     // Incremented each time the function above is called. Needed by tests.
     size_t canonical_mutation_merge_count = 0;
 
@@ -132,12 +134,27 @@ public:
     //
     // Call ONLY on shard 0.
     // Requires a quorum of nodes to be available in order to finish.
-    future<group0_guard> start_group0_operation();
+    // Parameters:
+    //   timeout -- Optional. If set, this timeout is used for the group0.read_barrier operation.
+    //              If the timeout is reached and there is no Raft quorum, an exception is thrown.
+    //              The exception will include information about the current set of alive and
+    //              unavailable voters.
+    //              If not set, the default timeout is used (from the Scylla config parameter
+    //              `group0_raft_op_timeout_in_ms`, which defaults to one minute).
+    future<group0_guard> start_group0_operation(std::optional<raft_timeout> timeout = std::nullopt);
 
     // Apply a group 0 change.
     // The future resolves after the change is applied locally.
+    // Parameters:
+    //   timeout -- Optional. Applies only if raft is used (group0_guard.with_raft returns true).
+    //              If set, this timeout is used for the group0.add_entry operation.
+    //              If the timeout is reached and there is no Raft quorum, an exception is thrown.
+    //              The exception will include information about the current set of alive and
+    //              unavailable voters, which 
+    //              If not set, the default timeout is used (from the Scylla config parameter
+    //              `group0_raft_op_timeout_in_ms`, which defaults to one minute).
     template<typename mutation_type = schema_change>
-    future<> announce(std::vector<mutation> schema, group0_guard, std::string_view description);
+    future<> announce(utils::chunked_vector<mutation> schema, group0_guard, std::string_view description, std::optional<raft_timeout> timeout = std::nullopt);
 
     void passive_announce(table_schema_version version);
 
@@ -157,7 +174,7 @@ private:
     void init_messaging_service();
     future<> uninit_messaging_service();
 
-    future<> push_schema_mutation(locator::host_id endpoint, const std::vector<mutation>& schema);
+    future<> push_schema_mutation(locator::host_id endpoint, const utils::chunked_vector<mutation>& schema);
 
     future<> passive_announce();
 
@@ -166,10 +183,12 @@ private:
     future<> maybe_schedule_schema_pull(const table_schema_version& their_version, locator::host_id endpoint);
 
     template<typename mutation_type = schema_change>
-    future<> announce_with_raft(std::vector<mutation> schema, group0_guard, std::string_view description);
-    future<> announce_without_raft(std::vector<mutation> schema, group0_guard);
+    future<> announce_with_raft(utils::chunked_vector<mutation> schema, group0_guard, std::string_view description, std::optional<raft_timeout> timeout);
+    future<> announce_without_raft(utils::chunked_vector<mutation> schema, group0_guard);
 
 public:
+    void register_feature_listeners();
+
     future<> maybe_sync(const schema_ptr& s, locator::host_id endpoint);
 
     // Returns schema of given version, either from cache or from remote node identified by 'from'.
@@ -193,58 +212,61 @@ public:
 };
 
 extern template
-future<> migration_manager::announce_with_raft<schema_change>(std::vector<mutation> schema, group0_guard, std::string_view description);
+future<> migration_manager::announce_with_raft<schema_change>(utils::chunked_vector<mutation> schema, group0_guard, std::string_view description, std::optional<raft_timeout> timeout);
 extern template
-future<> migration_manager::announce_with_raft<topology_change>(std::vector<mutation> schema, group0_guard, std::string_view description);
+future<> migration_manager::announce_with_raft<topology_change>(utils::chunked_vector<mutation> schema, group0_guard, std::string_view description, std::optional<raft_timeout> timeout);
 
 extern template
-future<> migration_manager::announce<schema_change>(std::vector<mutation> schema, group0_guard, std::string_view description);
+future<> migration_manager::announce<schema_change>(utils::chunked_vector<mutation> schema, group0_guard, std::string_view description, std::optional<raft_timeout> timeout = std::nullopt);
 extern template
-future<> migration_manager::announce<topology_change>(std::vector<mutation> schema, group0_guard, std::string_view description);
+future<> migration_manager::announce<topology_change>(utils::chunked_vector<mutation> schema, group0_guard, std::string_view description, std::optional<raft_timeout> timeout = std::nullopt);
 
 
 future<column_mapping> get_column_mapping(db::system_keyspace& sys_ks, table_id, table_schema_version v);
 
-std::vector<mutation> prepare_keyspace_update_announcement(replica::database& db, lw_shared_ptr<keyspace_metadata> ksm, api::timestamp_type ts);
+utils::chunked_vector<mutation> prepare_keyspace_update_announcement(replica::database& db, lw_shared_ptr<keyspace_metadata> ksm, api::timestamp_type ts);
 
-std::vector<mutation> prepare_new_keyspace_announcement(replica::database& db, lw_shared_ptr<keyspace_metadata> ksm, api::timestamp_type timestamp);
+utils::chunked_vector<mutation> prepare_new_keyspace_announcement(replica::database& db, lw_shared_ptr<keyspace_metadata> ksm, api::timestamp_type timestamp);
 
 // The timestamp parameter can be used to ensure that all nodes update their internal tables' schemas
 // with identical timestamps, which can prevent an undeeded schema exchange
-future<std::vector<mutation>> prepare_column_family_update_announcement(storage_proxy& sp,
+future<utils::chunked_vector<mutation>> prepare_column_family_update_announcement(storage_proxy& sp,
         schema_ptr cfm, std::vector<view_ptr> view_updates, api::timestamp_type ts);
 
-future<std::vector<mutation>> prepare_new_column_family_announcement(storage_proxy& sp, schema_ptr cfm, api::timestamp_type timestamp);
+future<utils::chunked_vector<mutation>> prepare_new_column_family_announcement(storage_proxy& sp, schema_ptr cfm, api::timestamp_type timestamp);
 // The ksm parameter can describe a keyspace that hasn't been created yet.
 // This function allows announcing a new keyspace together with its tables at once.
-future<> prepare_new_column_family_announcement(std::vector<mutation>& mutations,
+future<> prepare_new_column_family_announcement(utils::chunked_vector<mutation>& mutations,
         storage_proxy& sp, const keyspace_metadata& ksm, schema_ptr cfm, api::timestamp_type timestamp);
+// Announce multiple tables in one operation
+future<> prepare_new_column_families_announcement(utils::chunked_vector<mutation>& mutations,
+        storage_proxy& sp, const keyspace_metadata& ksm, std::vector<schema_ptr> cfms, api::timestamp_type timestamp);
 
-future<std::vector<mutation>> prepare_new_type_announcement(storage_proxy& sp, user_type new_type, api::timestamp_type ts);
+future<utils::chunked_vector<mutation>> prepare_new_type_announcement(storage_proxy& sp, user_type new_type, api::timestamp_type ts);
 
-future<std::vector<mutation>> prepare_new_function_announcement(storage_proxy& sp, shared_ptr<cql3::functions::user_function> func, api::timestamp_type ts);
+future<utils::chunked_vector<mutation>> prepare_new_function_announcement(storage_proxy& sp, shared_ptr<cql3::functions::user_function> func, api::timestamp_type ts);
 
-future<std::vector<mutation>> prepare_new_aggregate_announcement(storage_proxy& sp, shared_ptr<cql3::functions::user_aggregate> aggregate, api::timestamp_type ts);
+future<utils::chunked_vector<mutation>> prepare_new_aggregate_announcement(storage_proxy& sp, shared_ptr<cql3::functions::user_aggregate> aggregate, api::timestamp_type ts);
 
-future<std::vector<mutation>> prepare_function_drop_announcement(storage_proxy& sp, shared_ptr<cql3::functions::user_function> func, api::timestamp_type ts);
+future<utils::chunked_vector<mutation>> prepare_function_drop_announcement(storage_proxy& sp, shared_ptr<cql3::functions::user_function> func, api::timestamp_type ts);
 
-future<std::vector<mutation>> prepare_aggregate_drop_announcement(storage_proxy& sp, shared_ptr<cql3::functions::user_aggregate> aggregate, api::timestamp_type ts);
+future<utils::chunked_vector<mutation>> prepare_aggregate_drop_announcement(storage_proxy& sp, shared_ptr<cql3::functions::user_aggregate> aggregate, api::timestamp_type ts);
 
-future<std::vector<mutation>> prepare_update_type_announcement(storage_proxy& sp, user_type updated_type, api::timestamp_type ts);
+future<utils::chunked_vector<mutation>> prepare_update_type_announcement(storage_proxy& sp, user_type updated_type, api::timestamp_type ts);
 
-future<std::vector<mutation>> prepare_keyspace_drop_announcement(replica::database& db, const sstring& ks_name, api::timestamp_type ts);
+future<utils::chunked_vector<mutation>> prepare_keyspace_drop_announcement(storage_proxy& sp, const sstring& ks_name, api::timestamp_type ts);
 
 class drop_views_tag;
 using drop_views = bool_class<drop_views_tag>;
-future<std::vector<mutation>> prepare_column_family_drop_announcement(storage_proxy& sp,
+future<utils::chunked_vector<mutation>> prepare_column_family_drop_announcement(storage_proxy& sp,
         const sstring& ks_name, const sstring& cf_name, api::timestamp_type ts, drop_views drop_views = drop_views::no);
 
-future<std::vector<mutation>> prepare_type_drop_announcement(storage_proxy& sp, user_type dropped_type, api::timestamp_type ts);
+future<utils::chunked_vector<mutation>> prepare_type_drop_announcement(storage_proxy& sp, user_type dropped_type, api::timestamp_type ts);
 
-future<std::vector<mutation>> prepare_new_view_announcement(storage_proxy& sp, view_ptr view, api::timestamp_type ts);
+future<utils::chunked_vector<mutation>> prepare_new_view_announcement(storage_proxy& sp, view_ptr view, api::timestamp_type ts);
 
-future<std::vector<mutation>> prepare_view_update_announcement(storage_proxy& sp, view_ptr view, api::timestamp_type ts);
+future<utils::chunked_vector<mutation>> prepare_view_update_announcement(storage_proxy& sp, view_ptr view, api::timestamp_type ts);
 
-future<std::vector<mutation>> prepare_view_drop_announcement(storage_proxy& sp, const sstring& ks_name, const sstring& cf_name, api::timestamp_type ts);
+future<utils::chunked_vector<mutation>> prepare_view_drop_announcement(storage_proxy& sp, const sstring& ks_name, const sstring& cf_name, api::timestamp_type ts);
 
 }

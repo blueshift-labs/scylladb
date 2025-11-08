@@ -42,7 +42,7 @@ protected:
 
 class user_requested_repair_task_impl : public repair_task_impl {
 private:
-    lw_shared_ptr<locator::global_vnode_effective_replication_map> _germs;
+    lw_shared_ptr<locator::global_static_effective_replication_map> _germs;
     std::vector<sstring> _cfs;
     dht::token_range_vector _ranges;
     std::vector<sstring> _hosts;
@@ -52,7 +52,7 @@ private:
     std::optional<int> _ranges_parallelism;
     gms::gossiper& _gossiper;
 public:
-    user_requested_repair_task_impl(tasks::task_manager::module_ptr module, repair_uniq_id id, std::string keyspace, std::string entity, lw_shared_ptr<locator::global_vnode_effective_replication_map> germs, std::vector<sstring> cfs, dht::token_range_vector ranges, std::vector<sstring> hosts, std::vector<sstring> data_centers, std::unordered_set<locator::host_id> ignore_nodes, bool small_table_optimization, std::optional<int> ranges_parallelism, gms::gossiper& gossiper) noexcept
+    user_requested_repair_task_impl(tasks::task_manager::module_ptr module, repair_uniq_id id, std::string keyspace, std::string entity, lw_shared_ptr<locator::global_static_effective_replication_map> germs, std::vector<sstring> cfs, dht::token_range_vector ranges, std::vector<sstring> hosts, std::vector<sstring> data_centers, std::unordered_set<locator::host_id> ignore_nodes, bool small_table_optimization, std::optional<int> ranges_parallelism, gms::gossiper& gossiper) noexcept
         : repair_task_impl(module, id.uuid(), id.id, "keyspace", std::move(keyspace), "", std::move(entity), tasks::task_id::create_null_id(), streaming::stream_reason::repair)
         , _germs(germs)
         , _cfs(std::move(cfs))
@@ -74,7 +74,6 @@ protected:
     future<> run() override;
 
     virtual future<std::optional<double>> expected_total_workload() const override;
-    virtual std::optional<double> expected_children_number() const override;
 };
 
 class data_sync_repair_task_impl : public repair_task_impl {
@@ -103,7 +102,6 @@ protected:
     future<> run() override;
 
     virtual future<std::optional<double>> expected_total_workload() const override;
-    virtual std::optional<double> expected_children_number() const override;
 };
 
 class tablet_repair_task_impl : public repair_task_impl {
@@ -114,18 +112,21 @@ private:
     optimized_optional<abort_source::subscription> _abort_subscription;
     std::optional<int> _ranges_parallelism;
     size_t _metas_size = 0;
-    gc_clock::time_point _flush_time;
+    std::optional<gc_clock::time_point> _flush_time = gc_clock::time_point();
     service::frozen_topology_guard _topo_guard;
+    bool _skip_flush;
 public:
-    bool sched_by_scheduler = false;
+    tablet_repair_sched_info sched_info;
 public:
-    tablet_repair_task_impl(tasks::task_manager::module_ptr module, repair_uniq_id id, sstring keyspace, tasks::task_id parent_id, std::vector<sstring> tables, streaming::stream_reason reason, std::vector<tablet_repair_task_meta> metas, std::optional<int> ranges_parallelism, service::frozen_topology_guard topo_guard)
+    tablet_repair_task_impl(tasks::task_manager::module_ptr module, repair_uniq_id id, sstring keyspace, tasks::task_id parent_id, std::vector<sstring> tables, streaming::stream_reason reason, std::vector<tablet_repair_task_meta> metas, std::optional<int> ranges_parallelism, service::frozen_topology_guard topo_guard, tablet_repair_sched_info sched_info, bool skip_flush = false)
         : repair_task_impl(module, id.uuid(), id.id, "keyspace", keyspace, "", "", parent_id, reason)
         , _keyspace(std::move(keyspace))
         , _tables(std::move(tables))
         , _metas(std::move(metas))
         , _ranges_parallelism(ranges_parallelism)
         , _topo_guard(topo_guard)
+        , _skip_flush(skip_flush)
+        , sched_info(std::move(sched_info))
     {
     }
 
@@ -133,7 +134,7 @@ public:
         return tasks::is_abortable(!_abort_subscription);
     }
 
-    gc_clock::time_point get_flush_time() const { return _flush_time; }
+    std::optional<gc_clock::time_point> get_flush_time() const { return _flush_time; }
 
     tasks::is_user_task is_user_task() const noexcept override;
     virtual future<> release_resources() noexcept override;
@@ -143,7 +144,6 @@ protected:
     future<> run() override;
 
     virtual future<std::optional<double>> expected_total_workload() const override;
-    virtual std::optional<double> expected_children_number() const override;
 };
 
 class shard_repair_task_impl : public repair_task_impl {
@@ -182,26 +182,28 @@ private:
     service::frozen_topology_guard _frozen_topology_guard;
     service::topology_guard _topology_guard = {service::null_topology_guard};
 public:
-    bool sched_by_scheduler = false;
+    tablet_repair_sched_info sched_info;
 public:
     shard_repair_task_impl(tasks::task_manager::module_ptr module,
             tasks::task_id id,
-            const sstring& keyspace,
+            sstring keyspace,
             repair_service& repair,
             locator::effective_replication_map_ptr erm_,
-            const dht::token_range_vector& ranges_,
+            dht::token_range_vector ranges_,
             std::vector<table_id> table_ids_,
             repair_uniq_id parent_id_,
-            const std::vector<sstring>& data_centers_,
-            const std::vector<sstring>& hosts_,
-            const std::unordered_set<locator::host_id>& ignore_nodes_,
+            std::vector<sstring> data_centers_,
+            std::vector<sstring> hosts_,
+            std::unordered_set<locator::host_id> ignore_nodes_,
+            std::unordered_map<dht::token_range, repair_neighbors> neighbors_,
             streaming::stream_reason reason_,
             bool hints_batchlog_flushed,
             bool small_table_optimization,
             std::optional<int> ranges_parallelism,
             gc_clock::time_point flush_time,
             service::frozen_topology_guard topo_guard,
-            bool sched_by_scheduler = false);
+            tablet_repair_sched_info sched_info = tablet_repair_sched_info(),
+            size_t small_table_optimization_ranges_reduced_factor_ = 1);
     void check_failed_ranges();
     void check_in_abort_or_shutdown();
     repair_neighbors get_repair_neighbors(const dht::token_range& range);

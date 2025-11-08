@@ -27,10 +27,10 @@
 
 #include "replica/database.hh"
 #include "utils/UUID_gen.hh"
-#include "clustering_interval_set.hh"
+#include "keys/clustering_interval_set.hh"
 #include "schema/schema_builder.hh"
-#include "query-result-set.hh"
-#include "query-result-reader.hh"
+#include "query/query-result-set.hh"
+#include "query/query-result-reader.hh"
 #include "partition_slice_builder.hh"
 #include "test/lib/tmpdir.hh"
 #include "compaction/compaction_manager.hh"
@@ -43,7 +43,7 @@
 #include "test/lib/sstable_test_env.hh"
 #include "test/lib/random_schema.hh"
 #include "test/lib/mutation_source_test.hh"
-#include "cell_locking.hh"
+#include "replica/cell_locking.hh"
 #include "test/lib/mutation_reader_assertions.hh"
 #include "test/lib/mutation_assertions.hh"
 #include "test/lib/random_utils.hh"
@@ -58,9 +58,9 @@
 #include "mutation/mutation_rebuilder.hh"
 #include "mutation/mutation_partition.hh"
 #include "mutation/async_utils.hh"
-#include "clustering_key_filter.hh"
-#include "readers/from_mutations_v2.hh"
-#include "readers/from_fragments_v2.hh"
+#include "keys/clustering_key_filter.hh"
+#include "readers/from_mutations.hh"
+#include "readers/from_fragments.hh"
 
 using namespace std::chrono_literals;
 
@@ -88,7 +88,7 @@ static atomic_cell make_collection_member(data_type dt, T value) {
 static mutation_partition get_partition(reader_permit permit, replica::memtable& mt, const partition_key& key) {
     auto dk = dht::decorate_key(*mt.schema(), key);
     auto range = dht::partition_range::make_singular(dk);
-    auto reader = mt.make_flat_reader(mt.schema(), std::move(permit), range);
+    auto reader = mt.make_mutation_reader(mt.schema(), std::move(permit), range);
     auto close_reader = deferred_close(reader);
     auto mo = read_mutation_from_mutation_reader(reader).get();
     BOOST_REQUIRE(bool(mo));
@@ -103,7 +103,7 @@ with_column_family(schema_ptr s, replica::column_family::config cfg, sstables::s
         auto dir = tmpdir();
         cfg.x_log2_compaction_groups = x_log2_compaction_groups;
         tasks::task_manager tm;
-        auto cm = make_lw_shared<compaction_manager>(tm, compaction_manager::for_testing_tag{});
+        auto cm = make_lw_shared<compaction::compaction_manager>(tm, compaction::compaction_manager::for_testing_tag{});
         auto cl_stats = make_lw_shared<cell_locker_stats>();
         auto s_opts = make_lw_shared<replica::storage_options>(data_dictionary::make_local_options(dir.path()));
         auto cf = make_lw_shared<replica::column_family>(s, cfg, s_opts, *cm, sm, *cl_stats, *tracker, nullptr);
@@ -474,7 +474,7 @@ SEASTAR_THREAD_TEST_CASE(test_large_collection_allocation) {
         mt->apply(make_mutation_with_collection(pk, std::move(cmd1)));
         mt->apply(make_mutation_with_collection(pk, std::move(cmd2))); // this should trigger a merge of the two collections
 
-        auto rd = mt->make_flat_reader(schema, semaphore.make_permit());
+        auto rd = mt->make_mutation_reader(schema, semaphore.make_permit());
         auto close_rd = deferred_close(rd);
         auto res_mut_opt = read_mutation_from_mutation_reader(rd).get();
         BOOST_REQUIRE(res_mut_opt);
@@ -566,7 +566,7 @@ SEASTAR_TEST_CASE(test_multiple_memtables_one_partition) {
 }
 
 SEASTAR_TEST_CASE(test_flush_in_the_middle_of_a_scan) {
-  return sstables::test_env::do_with([] (sstables::test_env& env) {
+  return sstables::test_env::do_with_async([] (sstables::test_env& env) {
     auto s = schema_builder("ks", "cf")
         .with_column("pk", bytes_type, column_kind::partition_key)
         .with_column("v", bytes_type)
@@ -581,7 +581,7 @@ SEASTAR_TEST_CASE(test_flush_in_the_middle_of_a_scan) {
     cfg.enable_incremental_backups = false;
     cfg.cf_stats = &*cf_stats;
 
-    return with_column_family(s, cfg, env.manager(), [&env, s](replica::column_family& cf) {
+    with_column_family(s, cfg, env.manager(), [&env, s](replica::column_family& cf) {
         return seastar::async([&env, s, &cf] {
             // populate
             auto new_key = [&] {
@@ -595,7 +595,7 @@ SEASTAR_TEST_CASE(test_flush_in_the_middle_of_a_scan) {
                 return m;
             };
 
-            std::vector<mutation> mutations;
+            utils::chunked_vector<mutation> mutations;
             for (int i = 0; i < 1000; ++i) {
                 auto m = make_mutation();
                 cf.apply(m);
@@ -605,15 +605,15 @@ SEASTAR_TEST_CASE(test_flush_in_the_middle_of_a_scan) {
             std::sort(mutations.begin(), mutations.end(), mutation_decorated_key_less_comparator());
 
             // Flush will happen in the middle of reading for this scanner
-            auto assert_that_scanner1 = assert_that(cf.make_reader_v2(s, env.make_reader_permit(),
+            auto assert_that_scanner1 = assert_that(cf.make_mutation_reader(s, env.make_reader_permit(),
                         query::full_partition_range));
 
             // Flush will happen before it is invoked
-            auto assert_that_scanner2 = assert_that(cf.make_reader_v2(s, env.make_reader_permit(),
+            auto assert_that_scanner2 = assert_that(cf.make_mutation_reader(s, env.make_reader_permit(),
                         query::full_partition_range));
 
             // Flush will happen after all data was read, but before EOS was consumed
-            auto assert_that_scanner3 = assert_that(cf.make_reader_v2(s, env.make_reader_permit(),
+            auto assert_that_scanner3 = assert_that(cf.make_mutation_reader(s, env.make_reader_permit(),
                         query::full_partition_range));
 
             assert_that_scanner1.produces(mutations[0]);
@@ -645,7 +645,7 @@ SEASTAR_TEST_CASE(test_flush_in_the_middle_of_a_scan) {
 
             flushed.get();
         });
-    }).then([cf_stats] {});
+    }).get();
   });
 }
 
@@ -665,7 +665,7 @@ SEASTAR_TEST_CASE(test_multiple_memtables_multiple_partitions) {
     cfg.enable_incremental_backups = false;
     cfg.cf_stats = &*cf_stats;
 
-    with_column_family(s, cfg, env.manager(), [s, &env] (auto& cf) mutable {
+    with_column_family(s, cfg, env.manager(), [s, &env] (auto& cf) mutable -> future<> {
         std::map<int32_t, std::map<int32_t, int32_t>> shadow, result;
 
         const column_definition& r1_col = *s->get_column_definition("r1");
@@ -691,21 +691,26 @@ SEASTAR_TEST_CASE(test_multiple_memtables_multiple_partitions) {
             (void)cf.flush();
         }
 
-        return do_with(std::move(result), [&cf, s, &env, &r1_col, shadow] (auto& result) {
-            return cf.for_all_partitions_slow(s, env.make_reader_permit(), [&, s] (const dht::decorated_key& pk, const mutation_partition& mp) {
-                auto p1 = value_cast<int32_t>(int32_type->deserialize(pk._key.explode(*s)[0]));
-                for (const rows_entry& re : mp.range(*s, interval<clustering_key_prefix>())) {
-                    auto c1 = value_cast<int32_t>(int32_type->deserialize(re.key().explode(*s)[0]));
-                    auto cell = re.row().cells().find_cell(r1_col.id);
-                    if (cell) {
-                        result[p1][c1] = value_cast<int32_t>(int32_type->deserialize(cell->as_atomic_cell(r1_col).value().linearize()));
-                    }
+        auto reader = cf.make_mutation_reader(s, env.make_reader_permit());
+        while (true) {
+            mutation_opt mo = co_await read_mutation_from_mutation_reader(reader);
+            if (!mo) {
+                break;
+            }
+
+            const dht::decorated_key& pk = mo->decorated_key();
+            const mutation_partition& mp = mo->partition();
+            auto p1 = value_cast<int32_t>(int32_type->deserialize(pk._key.explode(*s)[0]));
+            for (const rows_entry& re : mp.range(*s, interval<clustering_key_prefix>())) {
+                auto c1 = value_cast<int32_t>(int32_type->deserialize(re.key().explode(*s)[0]));
+                auto cell = re.row().cells().find_cell(r1_col.id);
+                if (cell) {
+                    result[p1][c1] = value_cast<int32_t>(int32_type->deserialize(cell->as_atomic_cell(r1_col).value().linearize()));
                 }
-                return true;
-            }).then([&result, shadow] (bool ok) {
-                BOOST_REQUIRE(shadow == result);
-            });
-        });
+            }
+        }
+        co_await reader.close();
+        BOOST_REQUIRE(shadow == result);
     }).then([cf_stats] {}).get();
     });
 }
@@ -1221,7 +1226,7 @@ SEASTAR_THREAD_TEST_CASE(test_split_mutations) {
             if (max_size == 0) {
                 continue;
             }
-            std::vector<mutation> splitted;
+            utils::chunked_vector<mutation> splitted;
             split_mutation(mut, splitted, max_size / 2).get();
             BOOST_REQUIRE(!splitted.empty());
             for (const auto& m: splitted) {
@@ -2681,8 +2686,8 @@ SEASTAR_THREAD_TEST_CASE(test_row_size_is_immune_to_application_order) {
 }
 
 SEASTAR_THREAD_TEST_CASE(test_schema_changes) {
-    for_each_schema_change([] (schema_ptr base, const std::vector<mutation>& base_mutations,
-                               schema_ptr changed, const std::vector<mutation>& changed_mutations) {
+    for_each_schema_change([] (schema_ptr base, const utils::chunked_vector<mutation>& base_mutations,
+                               schema_ptr changed, const utils::chunked_vector<mutation>& changed_mutations) {
         BOOST_REQUIRE_EQUAL(base_mutations.size(), changed_mutations.size());
         for (auto bc : boost::range::combine(base_mutations, changed_mutations)) {
             auto b = boost::get<0>(bc);
@@ -2738,9 +2743,9 @@ class basic_compacted_fragments_consumer_base {
     gc_clock::time_point _query_time;
     gc_clock::time_point _gc_before;
     max_purgeable_fn _get_max_purgeable;
-    api::timestamp_type _max_purgeable;
+    max_purgeable _max_purgeable;
 
-    std::vector<mutation> _mutations;
+    utils::chunked_vector<mutation> _mutations;
     mutation_rebuilder_v2 _mutation;
 
 private:
@@ -2748,7 +2753,7 @@ private:
         if (!t) {
             return true;
         }
-        return t.timestamp < _max_purgeable;
+        return t.timestamp < _max_purgeable.timestamp();
     }
     bool is_tombstone_purgeable(const tombstone& t) {
         return t.deletion_time < _gc_before && can_gc(t);
@@ -2858,7 +2863,7 @@ public:
 
         return stop_iteration::no;
     }
-    std::vector<mutation> consume_end_of_stream() {
+    utils::chunked_vector<mutation> consume_end_of_stream() {
         return _mutations;
     }
 };
@@ -2867,15 +2872,15 @@ using survived_compacted_fragments_consumer = basic_compacted_fragments_consumer
 using purged_compacted_fragments_consumer = basic_compacted_fragments_consumer_base<true>;
 
 void run_compaction_data_stream_split_test(const schema& schema, reader_permit permit, gc_clock::time_point query_time,
-        std::vector<mutation> mutations) {
+        utils::chunked_vector<mutation> mutations) {
     for (auto& mut : mutations) {
         mut.partition().compact_for_compaction(schema, never_gc, mut.decorated_key(), query_time, tombstone_gc_state(nullptr));
     }
 
-    auto reader = make_mutation_reader_from_mutations_v2(schema.shared_from_this(), std::move(permit), mutations);
+    auto reader = make_mutation_reader_from_mutations(schema.shared_from_this(), std::move(permit), mutations);
     auto close_reader = deferred_close(reader);
     auto get_max_purgeable = can_always_purge;
-    auto consumer = compact_for_compaction_v2<survived_compacted_fragments_consumer, purged_compacted_fragments_consumer>(
+    auto consumer = compact_for_compaction<survived_compacted_fragments_consumer, purged_compacted_fragments_consumer>(
             schema,
             query_time,
             get_max_purgeable,
@@ -3449,14 +3454,14 @@ SEASTAR_THREAD_TEST_CASE(test_compactor_range_tombstone_spanning_many_pages) {
         ref_mut.partition().compact_for_query(*s, pk, query_time, {query::clustering_range::make_open_ended_both_sides()}, true, max_rows);
     }
 
-    struct consumer_v2 {
+    struct consumer {
         reader_permit permit;
         mutation& mut;
         const uint64_t row_limit;
         uint64_t rows = 0;
         mutation_rebuilder_v2 builder;
 
-        consumer_v2(reader_permit permit, mutation& mut, uint64_t row_limit, uint64_t rows = 0)
+        consumer(reader_permit permit, mutation& mut, uint64_t row_limit, uint64_t rows = 0)
             : permit(std::move(permit)), mut(mut), row_limit(row_limit), rows(rows), builder(mut.schema())
         { }
 
@@ -3494,7 +3499,7 @@ SEASTAR_THREAD_TEST_CASE(test_compactor_range_tombstone_spanning_many_pages) {
     testlog.info("non-paged v2");
     {
         mutation res_mut(s, pk);
-        auto c = compact_for_query_v2<consumer_v2>(*s, query_time, s->full_slice(), max_rows, max_partitions, consumer_v2{permit, res_mut, max_rows});
+        auto c = compact_for_query<consumer>(*s, query_time, s->full_slice(), max_rows, max_partitions, tombstone_gc_state(nullptr), consumer{permit, res_mut, max_rows});
         auto reader = make_mutation_reader_from_fragments(s, permit, make_frags());
         auto close_reader = deferred_close(reader);
 
@@ -3506,14 +3511,14 @@ SEASTAR_THREAD_TEST_CASE(test_compactor_range_tombstone_spanning_many_pages) {
     testlog.info("limited pages v2");
     {
         mutation res_mut(s, pk);
-        auto compaction_state = make_lw_shared<compact_mutation_state<compact_for_sstables::no>>(*s, query_time, s->full_slice(), 1, max_partitions);
+        auto compaction_state = make_lw_shared<compact_mutation_state<compact_for_sstables::no>>(*s, query_time, s->full_slice(), 1, max_partitions, tombstone_gc_state(nullptr));
         auto reader = make_mutation_reader_from_fragments(s, permit, make_frags());
         auto close_reader = deferred_close(reader);
 
         while (!reader.is_buffer_empty() || !reader.is_end_of_stream()) {
-            auto c = consumer_v2{permit, res_mut, max_rows};
+            auto c = consumer{permit, res_mut, max_rows};
             compaction_state->start_new_page(1, max_partitions, query_time, reader.peek().get()->position().region(), c);
-            reader.consume(compact_for_query_v2<consumer_v2>(compaction_state, std::move(c))).get();
+            reader.consume(compact_for_query<consumer>(compaction_state, std::move(c))).get();
         }
 
         BOOST_REQUIRE_EQUAL(res_mut, ref_mut);
@@ -3522,14 +3527,14 @@ SEASTAR_THREAD_TEST_CASE(test_compactor_range_tombstone_spanning_many_pages) {
     testlog.info("short pages v2");
     {
         mutation res_mut(s, pk);
-        auto compaction_state = make_lw_shared<compact_mutation_state<compact_for_sstables::no>>(*s, query_time, s->full_slice(), max_rows, max_partitions);
+        auto compaction_state = make_lw_shared<compact_mutation_state<compact_for_sstables::no>>(*s, query_time, s->full_slice(), max_rows, max_partitions, tombstone_gc_state(nullptr));
         auto reader = make_mutation_reader_from_fragments(s, permit, make_frags());
         auto close_reader = deferred_close(reader);
 
         while (!reader.is_buffer_empty() || !reader.is_end_of_stream()) {
-            auto c = consumer_v2{permit, res_mut, 2};
+            auto c = consumer{permit, res_mut, 2};
             compaction_state->start_new_page(max_rows, max_partitions, query_time, reader.peek().get()->position().region(), c);
-            reader.consume(compact_for_query_v2<consumer_v2>(compaction_state, std::move(c))).get();
+            reader.consume(compact_for_query<consumer>(compaction_state, std::move(c))).get();
         }
 
         BOOST_REQUIRE_EQUAL(res_mut, ref_mut);
@@ -3547,9 +3552,9 @@ SEASTAR_THREAD_TEST_CASE(test_compactor_range_tombstone_spanning_many_pages) {
             if (detached_state) {
                 restore_state(reader, std::move(*detached_state));
             }
-            auto compaction_state = make_lw_shared<compact_mutation_state<compact_for_sstables::no>>(*s, query_time, s->full_slice(), 1, max_partitions);
-            auto c = consumer_v2{permit, res_mut, max_rows};
-            reader.consume(compact_for_query_v2<consumer_v2>(compaction_state, std::move(c))).get();
+            auto compaction_state = make_lw_shared<compact_mutation_state<compact_for_sstables::no>>(*s, query_time, s->full_slice(), 1, max_partitions, tombstone_gc_state(nullptr));
+            auto c = consumer{permit, res_mut, max_rows};
+            reader.consume(compact_for_query<consumer>(compaction_state, std::move(c))).get();
             detached_state = std::move(*compaction_state).detach_state();
         }
 
@@ -3568,9 +3573,9 @@ SEASTAR_THREAD_TEST_CASE(test_compactor_range_tombstone_spanning_many_pages) {
             if (detached_state) {
                 restore_state(reader, std::move(*detached_state));
             }
-            auto compaction_state = make_lw_shared<compact_mutation_state<compact_for_sstables::no>>(*s, query_time, s->full_slice(), max_rows, max_partitions);
-            auto c = consumer_v2{permit, res_mut, 2};
-            reader.consume(compact_for_query_v2<consumer_v2>(compaction_state, std::move(c))).get();
+            auto compaction_state = make_lw_shared<compact_mutation_state<compact_for_sstables::no>>(*s, query_time, s->full_slice(), max_rows, max_partitions, tombstone_gc_state(nullptr));
+            auto c = consumer{permit, res_mut, 2};
+            reader.consume(compact_for_query<consumer>(compaction_state, std::move(c))).get();
             detached_state = std::move(*compaction_state).detach_state();
         }
 
@@ -3622,12 +3627,12 @@ SEASTAR_THREAD_TEST_CASE(test_compactor_detach_state) {
         return frags;
     };
 
-    struct consumer_v2 {
+    struct consumer {
         uint64_t frags = 0;
         const uint64_t frag_limit;
         const bool final_stop;
 
-        consumer_v2(uint64_t stop_at, bool final_stop) : frag_limit(stop_at + 1), final_stop(final_stop) { }
+        consumer(uint64_t stop_at, bool final_stop) : frag_limit(stop_at + 1), final_stop(final_stop) { }
         void consume_new_partition(const dht::decorated_key& dk) { }
         void consume(const tombstone& t) { }
         stop_iteration consume(static_row&& sr, tombstone, bool) {
@@ -3657,10 +3662,10 @@ SEASTAR_THREAD_TEST_CASE(test_compactor_detach_state) {
 
     auto check = [&] (uint64_t stop_at, bool final_stop) {
         testlog.debug("stop_at={}, final_stop={}", stop_at, final_stop);
-        auto compaction_state = make_lw_shared<compact_mutation_state<compact_for_sstables::no>>(*s, query_time, s->full_slice(), max_rows, max_partitions);
+        auto compaction_state = make_lw_shared<compact_mutation_state<compact_for_sstables::no>>(*s, query_time, s->full_slice(), max_rows, max_partitions, tombstone_gc_state(nullptr));
         auto reader = make_mutation_reader_from_fragments(s, permit, make_frags());
         auto close_reader = deferred_close(reader);
-        reader.consume(compact_for_query_v2<consumer_v2>(compaction_state, consumer_v2(stop_at, final_stop))).get();
+        reader.consume(compact_for_query<consumer>(compaction_state, consumer(stop_at, final_stop))).get();
         const auto has_detached_state = bool(std::move(*compaction_state).detach_state());
         if (stop_at < inter_partition_frag_count) {
             BOOST_CHECK_EQUAL(has_detached_state, final_stop);
@@ -3718,7 +3723,7 @@ SEASTAR_THREAD_TEST_CASE(test_compactor_validator) {
     mutation_fragment_v2 rtc_end(*s, permit, range_tombstone_change(position_in_partition::after_key(*s, cks[2]), tombstone{}));
     mutation_fragment_v2 pe(*s, permit, partition_end());
 
-    struct consumer_v2 {
+    struct consumer {
         void consume_new_partition(const dht::decorated_key& dk) { }
         void consume(const tombstone& t) { }
         stop_iteration consume(static_row&& sr, tombstone, bool) {
@@ -3746,12 +3751,12 @@ SEASTAR_THREAD_TEST_CASE(test_compactor_validator) {
         }
 
         auto compaction_state = make_lw_shared<compact_mutation_state<compact_for_sstables::no>>(*s, gc_clock::now(), s->full_slice(),
-                std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max(), mutation_fragment_stream_validation_level::clustering_key);
+                std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max(), tombstone_gc_state(nullptr), mutation_fragment_stream_validation_level::clustering_key);
         auto reader = make_mutation_reader_from_fragments(s, permit, std::move(frags));
         auto close_reader = deferred_close(reader);
         bool is_valid = true;
         try {
-            reader.consume(compact_for_query_v2<consumer_v2>(compaction_state, consumer_v2{})).get();
+            reader.consume(compact_for_query<consumer>(compaction_state, consumer{})).get();
         } catch (invalid_mutation_fragment_stream& ex) {
             is_valid = false;
         }
@@ -3960,4 +3965,343 @@ SEASTAR_TEST_CASE(test_compact_and_expire_cell_stats) {
             }, row_tombstone(tombstone(tomb_ts, now)), {.live_cells = 1, .dead_cells = 2, .collection_tombstones = 1});
 
     return make_ready_future();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_to_data_query_results_with_distinct_and_per_partition_limit) {
+    simple_schema ss;
+    const auto& s = *ss.schema();
+
+    query::result_memory_limiter limiter(query::result_memory_limiter::maximum_result_size * 100);
+
+    const auto max_size = query::max_result_size(
+            query::result_memory_limiter::maximum_result_size,
+            query::result_memory_limiter::maximum_result_size,
+            query::result_memory_limiter::maximum_result_size);
+
+    reconcilable_result_builder builder(s, s.full_slice(),
+            limiter.new_mutation_read(max_size, query::short_read::yes).get());
+
+    const auto& v_def = *s.get_column_definition(to_bytes("v"));
+    const auto value = serialized("v");
+
+    auto pkeys = ss.make_pkeys(4);
+    for (const auto& pkey : pkeys) {
+        builder.consume_new_partition(pkey);
+        for (uint32_t ck = 0; ck < 10; ck++) {
+            auto row = clustering_row(ss.make_ckey(ck));
+            row.cells().apply(v_def, atomic_cell::make_live(*v_def.type, ss.new_timestamp(), value));
+            builder.consume(std::move(row), {}, true);
+        }
+        builder.consume_end_of_partition();
+    }
+    auto rr = builder.consume_end_of_stream();
+
+    BOOST_REQUIRE_EQUAL(rr.partitions().size(), pkeys.size());
+    BOOST_REQUIRE_EQUAL(rr.row_count(), pkeys.size() * 10);
+
+    // SELECT DISTINCT
+    {
+        auto slice = partition_slice_builder(s)
+            .with_no_static_columns()
+            .with_no_regular_columns()
+            .with_range(query::clustering_range::make_open_ended_both_sides())
+            .with_option<query::partition_slice::option::send_partition_key>()
+            .with_option<query::partition_slice::option::distinct>()
+            .with_option<query::partition_slice::option::allow_short_read>()
+            .build();
+
+        auto result = to_data_query_result(rr, ss.schema(), slice, query::max_rows, query::max_partitions, {}).get();
+
+        BOOST_REQUIRE_EQUAL(result.row_count(), pkeys.size());
+    }
+
+    // per-partition limit
+    {
+        auto slice = partition_slice_builder(s)
+            .with_partition_row_limit(2)
+            .with_range(query::clustering_range::make_open_ended_both_sides())
+            .with_option<query::partition_slice::option::allow_short_read>()
+            .build();
+
+        auto result = to_data_query_result(rr, ss.schema(), slice, query::max_rows, query::max_partitions, {}).get();
+
+        BOOST_REQUIRE_EQUAL(result.row_count(), pkeys.size() * 2);
+    }
+}
+
+// Max-purgeable has two values: one for regular and one for shadowable
+// tombstones. Check that the value is not sticky -- if a shadowable is requested
+// first, it won't apply to regular tombstones and vice-versa.
+SEASTAR_THREAD_TEST_CASE(test_mutation_compactor_sticky_max_purgeable) {
+    simple_schema ss;
+    auto s = ss.schema();
+
+    tests::reader_concurrency_semaphore_wrapper semaphore;
+    auto permit = semaphore.make_permit();
+
+    auto dk = ss.make_pkey(1);
+
+    const auto& v_def = *s->get_column_definition(to_bytes("v"));
+    const auto value = serialized("v");
+
+    const auto deletion_time = gc_clock::now() - std::chrono::hours(1) - s->gc_grace_seconds();
+    const auto compaction_time = gc_clock::now();
+    const api::timestamp_type shadowable_max_purgeable = 110;
+    const api::timestamp_type regular_max_purgeable = 50;
+    const api::timestamp_type timestamp = 100;
+
+    class mutation_rebuilding_consumer {
+        mutation_rebuilder_v2 _mr;
+
+    public:
+        explicit mutation_rebuilding_consumer(schema_ptr s) : _mr(std::move(s)) { }
+        void consume_new_partition(dht::decorated_key dk) { _mr.consume_new_partition(std::move(dk)); }
+        void consume(tombstone t) { _mr.consume(t); }
+        stop_iteration consume(static_row&& sr, tombstone, bool) { return _mr.consume(std::move(sr)); }
+        stop_iteration consume(clustering_row&& cr, row_tombstone, bool) { return _mr.consume(std::move(cr)); }
+        stop_iteration consume(range_tombstone_change&& rtc) { return _mr.consume(std::move(rtc)); }
+        stop_iteration consume_end_of_partition() { return _mr.consume_end_of_partition(); }
+        mutation_opt consume_end_of_stream() { return _mr.consume_end_of_stream(); }
+    };
+
+    auto get_max_purgeable = [] (const dht::decorated_key&, is_shadowable is) {
+        const auto ts = is == is_shadowable::yes ? shadowable_max_purgeable : regular_max_purgeable;
+        return max_purgeable{ts, max_purgeable::timestamp_source::none};
+    };
+
+    auto compact_and_expire = [&] (mutation mut) {
+        auto reader = make_mutation_reader_from_mutations(s, permit, std::move(mut));
+        auto close_reader = deferred_close(reader);
+
+        auto compactor = compact_for_compaction<mutation_rebuilding_consumer>(
+                *s,
+                compaction_time,
+                get_max_purgeable,
+                tombstone_gc_state(nullptr),
+                mutation_rebuilding_consumer(s));
+        auto mut_opt = reader.consume(std::move(compactor)).get();
+
+        BOOST_REQUIRE(mut_opt);
+
+        return *mut_opt;
+    };
+
+    // max-purgeable returned for shadowable tombstone becomes sticky and applies to row tombstone after it
+    {
+        mutation mut(s, dk);
+        mutation mut_compacted(s, dk);
+
+        auto row1 = clustering_row(ss.make_ckey(1));
+        row1.apply(shadowable_tombstone(timestamp, deletion_time));
+
+        auto row2 = clustering_row(ss.make_ckey(2));
+        row2.apply(tombstone(timestamp, deletion_time));
+
+        auto row3 = clustering_row(ss.make_ckey(3));
+        row3.cells().apply(v_def, atomic_cell::make_live(*v_def.type, timestamp, value));
+
+        mut_compacted.apply(mutation_fragment(*s, permit, clustering_row(*s, row2)));
+        mut_compacted.apply(mutation_fragment(*s, permit, clustering_row(*s, row3)));
+
+        mut.apply(mutation_fragment(*s, permit, std::move(row1)));
+        mut.apply(mutation_fragment(*s, permit, std::move(row2)));
+        mut.apply(mutation_fragment(*s, permit, std::move(row3)));
+
+        assert_that(compact_and_expire(std::move(mut))).is_equal_to(mut_compacted);
+    }
+
+    // max-purgeable returned for regular tombstone becomes sticky and applies to shadowable tombstone after it
+    {
+        mutation mut(s, dk);
+        mutation mut_compacted(s, dk);
+
+        auto row1 = clustering_row(ss.make_ckey(1));
+        row1.apply(tombstone(timestamp, deletion_time));
+
+        auto row2 = clustering_row(ss.make_ckey(2));
+        row2.apply(shadowable_tombstone(timestamp, deletion_time));
+
+        auto row3 = clustering_row(ss.make_ckey(3));
+        row3.cells().apply(v_def, atomic_cell::make_live(*v_def.type, timestamp, value));
+
+        mut_compacted.apply(mutation_fragment(*s, permit, clustering_row(*s, row1)));
+        mut_compacted.apply(mutation_fragment(*s, permit, clustering_row(*s, row3)));
+
+        mut.apply(mutation_fragment(*s, permit, std::move(row1)));
+        mut.apply(mutation_fragment(*s, permit, std::move(row2)));
+        mut.apply(mutation_fragment(*s, permit, std::move(row3)));
+
+        assert_that(compact_and_expire(std::move(mut))).is_equal_to(mut_compacted);
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_serialized_mutation_empty_and_nonfull_keys) {
+    auto random_spec = tests::make_random_schema_specification(
+            get_name(),
+            std::uniform_int_distribution<size_t>(1, 4),
+            std::uniform_int_distribution<size_t>(1, 4),
+            std::uniform_int_distribution<size_t>(2, 8),
+            std::uniform_int_distribution<size_t>(2, 8));
+    auto random_schema = tests::random_schema(tests::random::get_int<uint32_t>(), *random_spec);
+
+    auto schema = random_schema.schema();
+
+    auto updated_schema = schema_builder(schema)
+        .remove_column(schema->regular_column_at(0).name())
+        .build();
+
+    tests::reader_concurrency_semaphore_wrapper semaphore;
+
+    testlog.info("Random schema:\n{}", random_schema.cql());
+
+    const auto mutations = tests::generate_random_mutations(random_schema, 1).get();
+
+    {
+        const auto& mut = mutations.back();
+        frozen_mutation fm(mut);
+
+        assert_that(fm.unfreeze(schema)).is_equal_to(mut);
+    }
+
+    auto reset_abort = defer([abort = set_abort_on_internal_error(false)] {
+        set_abort_on_internal_error(abort);
+    });
+
+    auto check = [&] (const clustering_key& ckey) {
+        testlog.info("Adding row with bad key: {}", ckey);
+
+        auto mut = mutations.back();
+
+        // Need to sneak in the bad key via the back-door, the mutation_partition
+        // will rejects it via the regular insert/update methods.
+        auto& rows = mut.partition().mutable_clustered_rows();
+        auto e = alloc_strategy_unique_ptr<rows_entry>(current_allocator().construct<rows_entry>(ckey, deletable_row(*schema, mut.partition().clustered_rows().begin()->row())));
+        rows.insert_before_hint(rows.end(), std::move(e), rows_entry::tri_compare(*schema));
+
+        frozen_mutation fm(mut);
+        BOOST_REQUIRE_THROW(fm.unfreeze(schema), std::runtime_error);
+        BOOST_REQUIRE_THROW(fm.unfreeze(updated_schema), std::runtime_error);
+
+        canonical_mutation cm(mut);
+        BOOST_REQUIRE_THROW(cm.to_mutation(schema), std::runtime_error);
+        BOOST_REQUIRE_THROW(cm.to_mutation(updated_schema), std::runtime_error);
+    };
+
+    check(clustering_key::make_empty());
+
+    if (schema->clustering_key_size() > 1) {
+        auto full_ckey = random_schema.make_ckey(0);
+        full_ckey.erase(full_ckey.end() - 1);
+        check(clustering_key::from_exploded(*schema, full_ckey));
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_mutation_empty_and_nonfull_keys) {
+    auto random_spec = tests::make_random_schema_specification(
+            get_name(),
+            std::uniform_int_distribution<size_t>(1, 4),
+            std::uniform_int_distribution<size_t>(1, 4),
+            std::uniform_int_distribution<size_t>(2, 8),
+            std::uniform_int_distribution<size_t>(2, 8));
+    auto random_schema = tests::random_schema(tests::random::get_int<uint32_t>(), *random_spec);
+
+    auto schema = random_schema.schema();
+
+    testlog.info("Random schema:\n{}", random_schema.cql());
+
+    auto reset_abort = defer([abort = set_abort_on_internal_error(false)] {
+        set_abort_on_internal_error(abort);
+    });
+
+    auto check = [&] (const clustering_key& ckey) {
+        testlog.info("Adding row with bad key: {}", ckey);
+
+        mutation_partition mp(*schema);
+
+        BOOST_REQUIRE_THROW(mp.clustered_row(*schema, ckey), std::runtime_error);
+        BOOST_REQUIRE_THROW(mp.clustered_row(*schema, clustering_key(ckey)), std::runtime_error);
+        BOOST_REQUIRE_THROW(mp.clustered_row(*schema, clustering_key_view(ckey)), std::runtime_error);
+
+        BOOST_REQUIRE_THROW(mp.clustered_row(*schema, position_in_partition_view::for_key(ckey), is_dummy::no, is_continuous::no), std::runtime_error);
+        BOOST_REQUIRE_THROW(mp.clustered_rows_entry(*schema, position_in_partition_view::for_key(ckey), is_dummy::no, is_continuous::no), std::runtime_error);
+        BOOST_REQUIRE_THROW(mp.append_clustered_row(*schema, position_in_partition_view::for_key(ckey), is_dummy::no, is_continuous::no), std::runtime_error);
+    };
+
+    check(clustering_key::make_empty());
+
+    if (schema->clustering_key_size() > 1) {
+        auto full_ckey = random_schema.make_ckey(0);
+        full_ckey.erase(full_ckey.end() - 1);
+        check(clustering_key::from_exploded(*schema, full_ckey));
+    }
+
+    mutation_partition mp(*schema);
+    const auto ckey = clustering_key::from_exploded(*schema, random_schema.make_ckey(0));
+
+    BOOST_REQUIRE_THROW(mp.clustered_row(*schema, position_in_partition_view::before_key(ckey), is_dummy::no, is_continuous::no), std::runtime_error);
+    BOOST_REQUIRE_THROW(mp.clustered_row(*schema, position_in_partition_view::after_all_prefixed(ckey), is_dummy::no, is_continuous::no), std::runtime_error);
+    BOOST_REQUIRE_THROW(mp.clustered_row(*schema, position_in_partition_view::for_static_row(), is_dummy::no, is_continuous::no), std::runtime_error);
+
+    BOOST_REQUIRE_THROW(mp.clustered_rows_entry(*schema, position_in_partition_view::before_key(ckey), is_dummy::no, is_continuous::no), std::runtime_error);
+    BOOST_REQUIRE_THROW(mp.clustered_rows_entry(*schema, position_in_partition_view::after_all_prefixed(ckey), is_dummy::no, is_continuous::no), std::runtime_error);
+    BOOST_REQUIRE_THROW(mp.clustered_rows_entry(*schema, position_in_partition_view::for_static_row(), is_dummy::no, is_continuous::no), std::runtime_error);
+
+    BOOST_REQUIRE_THROW(mp.append_clustered_row(*schema, position_in_partition_view::before_key(ckey), is_dummy::no, is_continuous::no), std::runtime_error);
+    BOOST_REQUIRE_THROW(mp.append_clustered_row(*schema, position_in_partition_view::after_all_prefixed(ckey), is_dummy::no, is_continuous::no), std::runtime_error);
+    BOOST_REQUIRE_THROW(mp.append_clustered_row(*schema, position_in_partition_view::for_static_row(), is_dummy::no, is_continuous::no), std::runtime_error);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_mutation_partition_v2_empty_and_nonfull_keys) {
+    auto random_spec = tests::make_random_schema_specification(
+            get_name(),
+            std::uniform_int_distribution<size_t>(1, 4),
+            std::uniform_int_distribution<size_t>(1, 4),
+            std::uniform_int_distribution<size_t>(1, 1),
+            std::uniform_int_distribution<size_t>(1, 1));
+    auto random_schema = tests::random_schema(tests::random::get_int<uint32_t>(), *random_spec);
+
+    auto schema = random_schema.schema();
+
+    testlog.info("Random schema:\n{}", random_schema.cql());
+
+    auto reset_abort = defer([abort = set_abort_on_internal_error(false)] {
+        set_abort_on_internal_error(abort);
+    });
+
+    auto check = [&] (const clustering_key& ckey) {
+        testlog.info("Adding row with bad key: {}", ckey);
+
+        mutation_partition_v2 mp(*schema);
+
+        BOOST_REQUIRE_THROW(mp.clustered_row(*schema, ckey), std::runtime_error);
+        BOOST_REQUIRE_THROW(mp.clustered_row(*schema, clustering_key(ckey)), std::runtime_error);
+        BOOST_REQUIRE_THROW(mp.clustered_row(*schema, clustering_key_view(ckey)), std::runtime_error);
+
+        BOOST_REQUIRE_THROW(mp.clustered_row(*schema, position_in_partition_view::for_key(ckey), is_dummy::no, is_continuous::no), std::runtime_error);
+        BOOST_REQUIRE_THROW(mp.clustered_rows_entry(*schema, position_in_partition_view::for_key(ckey), is_dummy::no, is_continuous::no), std::runtime_error);
+        BOOST_REQUIRE_THROW(mp.append_clustered_row(*schema, position_in_partition_view::for_key(ckey), is_dummy::no, is_continuous::no), std::runtime_error);
+    };
+
+    check(clustering_key::make_empty());
+
+    if (schema->clustering_key_size() > 1) {
+        auto full_ckey = random_schema.make_ckey(0);
+        full_ckey.erase(full_ckey.end() - 1);
+        check(clustering_key::from_exploded(*schema, full_ckey));
+    }
+
+    mutation_partition_v2 mp(*schema);
+    const auto ckey = clustering_key::from_exploded(*schema, random_schema.make_ckey(0));
+
+    BOOST_REQUIRE_THROW(mp.clustered_row(*schema, position_in_partition_view::before_key(ckey), is_dummy::no, is_continuous::no), std::runtime_error);
+    BOOST_REQUIRE_THROW(mp.clustered_row(*schema, position_in_partition_view::after_all_prefixed(ckey), is_dummy::no, is_continuous::no), std::runtime_error);
+    BOOST_REQUIRE_THROW(mp.clustered_row(*schema, position_in_partition_view::for_static_row(), is_dummy::no, is_continuous::no), std::runtime_error);
+
+    BOOST_REQUIRE_THROW(mp.clustered_rows_entry(*schema, position_in_partition_view::before_key(ckey), is_dummy::no, is_continuous::no), std::runtime_error);
+    BOOST_REQUIRE_THROW(mp.clustered_rows_entry(*schema, position_in_partition_view::after_all_prefixed(ckey), is_dummy::no, is_continuous::no), std::runtime_error);
+    BOOST_REQUIRE_THROW(mp.clustered_rows_entry(*schema, position_in_partition_view::for_static_row(), is_dummy::no, is_continuous::no), std::runtime_error);
+
+    BOOST_REQUIRE_THROW(mp.append_clustered_row(*schema, position_in_partition_view::before_key(ckey), is_dummy::no, is_continuous::no), std::runtime_error);
+    BOOST_REQUIRE_THROW(mp.append_clustered_row(*schema, position_in_partition_view::after_all_prefixed(ckey), is_dummy::no, is_continuous::no), std::runtime_error);
+    BOOST_REQUIRE_THROW(mp.append_clustered_row(*schema, position_in_partition_view::for_static_row(), is_dummy::no, is_continuous::no), std::runtime_error);
 }

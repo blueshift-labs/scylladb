@@ -11,23 +11,29 @@
 
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sharded.hh>
+#include <seastar/core/gate.hh>
+#include <seastar/core/metrics.hh>
 
 #include "utils/assert.hh"
 #include "utils/disk-error-handler.hh"
-#include "gc_clock.hh"
+#include "db_clock.hh"
 #include "sstables/sstables.hh"
 #include "sstables/shareable_components.hh"
 #include "sstables/shared_sstable.hh"
 #include "sstables/version.hh"
 #include "db/cache_tracker.hh"
+#include "db/object_storage_endpoint_param.hh"
 #include "locator/host_id.hh"
 #include "reader_concurrency_semaphore.hh"
 #include "utils/s3/creds.hh"
 #include <boost/intrusive/list.hpp>
+#include "sstable_compressor_factory.hh"
+#include "sstables/sstables_manager_subscription.hh"
 
 namespace db {
 
 class large_data_handler;
+class corrupt_data_handler;
 class config;
 
 }   // namespace db
@@ -38,6 +44,7 @@ namespace gms { class feature_service; }
 
 namespace sstables {
 
+class object_storage_client;
 class directory_semaphore;
 using schema_ptr = lw_shared_ptr<const schema>;
 using shareable_components_ptr = lw_shared_ptr<shareable_components>;
@@ -47,29 +54,31 @@ static constexpr size_t default_sstable_buffer_size = 128 * 1024;
 class storage_manager : public peering_sharded_service<storage_manager> {
     struct config_updater {
         serialized_action action;
-        utils::observer<std::unordered_map<sstring, s3::endpoint_config>> observer;
+        utils::observer<std::vector<db::object_storage_endpoint_param>> observer;
         config_updater(const db::config& cfg, storage_manager&);
     };
 
-    struct s3_endpoint {
-        s3::endpoint_config_ptr cfg;
-        shared_ptr<s3::client> client;
-        s3_endpoint(s3::endpoint_config_ptr c) noexcept : cfg(std::move(c)) {}
+    struct object_storage_endpoint {
+        db::object_storage_endpoint_param cfg;
+        shared_ptr<object_storage_client> client;
+        object_storage_endpoint(db::object_storage_endpoint_param);
     };
 
-    semaphore _s3_clients_memory;
-    std::unordered_map<sstring, s3_endpoint> _s3_endpoints;
+    semaphore _object_storage_clients_memory;
+    std::unordered_map<sstring, object_storage_endpoint> _object_storage_endpoints;
     std::unique_ptr<config_updater> _config_updater;
+    seastar::metrics::metric_groups metrics;
 
     future<> update_config(const db::config&);
 
 public:
     struct config {
-        size_t s3_clients_memory = 16 << 20; // 16M by default
+        size_t object_storage_clients_memory = 16 << 20; // 16M by default
+        bool skip_metrics_registration = false;
     };
 
     storage_manager(const db::config&, config cfg);
-    shared_ptr<s3::client> get_endpoint_client(sstring endpoint);
+    shared_ptr<object_storage_client> get_endpoint_client(sstring endpoint);
     bool is_known_endpoint(sstring endpoint) const;
     future<> stop();
 };
@@ -82,19 +91,20 @@ class sstables_manager {
             boost::intrusive::member_hook<sstable, sstable::manager_set_link_type, &sstable::_manager_set_link>,
             boost::intrusive::constant_time_size<false>,
             boost::intrusive::compare<sstable::lesser_reclaimed_memory>>;
+
 private:
+    enum class notification_event_type {
+        // Note: other event types like "added" may be needed in the future
+        deleted
+    };
+    using signal_type = boost::signals2::signal_type<void (sstables::generation_type, notification_event_type), boost::signals2::keywords::mutex_type<boost::signals2::dummy_mutex>>::type;
+
     storage_manager* _storage;
     size_t _available_memory;
     db::large_data_handler& _large_data_handler;
+    db::corrupt_data_handler& _corrupt_data_handler;
     const db::config& _db_config;
     gms::feature_service& _features;
-    // _sstables_format is the format used for writing new sstables.
-    // Here we set its default value, but if we discover that all the nodes
-    // in the cluster support a newer format, _sstables_format will be set to
-    // that format. read_sstables_format() also overwrites _sstables_format
-    // if an sstable format was chosen earlier (and this choice was persisted
-    // in the system table).
-    sstable_version_types _format = sstable_version_types::me;
 
     // _active and _undergoing_close are used in scylla-gdb.py to fetch all sstables
     // on current shard using "scylla sstables" command. If those fields are renamed,
@@ -126,11 +136,28 @@ private:
 
     scheduling_group _maintenance_sg;
 
+    sstable_compressor_factory& _compressor_factory;
+
     const abort_source& _abort;
 
+    named_gate _signal_gate;
+    signal_type _signal_source;
+
 public:
-    explicit sstables_manager(sstring name, db::large_data_handler& large_data_handler, const db::config& dbcfg, gms::feature_service& feat, cache_tracker&, size_t available_memory, directory_semaphore& dir_sem,
-                              noncopyable_function<locator::host_id()>&& resolve_host_id, const abort_source& abort, scheduling_group maintenance_sg = current_scheduling_group(), storage_manager* shared = nullptr);
+    explicit sstables_manager(
+            sstring name,
+            db::large_data_handler& large_data_handler,
+            db::corrupt_data_handler& corrupt_data_handler,
+            const db::config& dbcfg,
+            gms::feature_service& feat,
+            cache_tracker&,
+            size_t available_memory,
+            directory_semaphore& dir_sem,
+            noncopyable_function<locator::host_id()>&& resolve_host_id,
+            sstable_compressor_factory&,
+            const abort_source& abort,
+            scheduling_group maintenance_sg = current_scheduling_group(),
+            storage_manager* shared = nullptr);
     virtual ~sstables_manager();
 
     shared_sstable make_sstable(schema_ptr schema,
@@ -139,11 +166,11 @@ public:
             sstable_state state = sstable_state::normal,
             sstable_version_types v = get_highest_sstable_version(),
             sstable_format_types f = sstable_format_types::big,
-            gc_clock::time_point now = gc_clock::now(),
+            db_clock::time_point now = db_clock::now(),
             io_error_handler_gen error_handler_gen = default_io_error_handler_gen(),
             size_t buffer_size = default_sstable_buffer_size);
 
-    shared_ptr<s3::client> get_endpoint_client(sstring endpoint) const {
+    shared_ptr<object_storage_client> get_endpoint_client(sstring endpoint) const {
         SCYLLA_ASSERT(_storage != nullptr);
         return _storage->get_endpoint_client(std::move(endpoint));
     }
@@ -154,12 +181,30 @@ public:
     }
 
     virtual sstable_writer_config configure_writer(sstring origin) const;
-    bool uuid_sstable_identifiers() const;
     const db::config& config() const { return _db_config; }
     cache_tracker& get_cache_tracker() { return _cache_tracker; }
 
-    void set_format(sstable_version_types format) noexcept { _format = format; }
-    sstables::sstable::version_types get_highest_supported_format() const noexcept { return _format; }
+    // Get the highest supported sstable version, according to cluster features.
+    sstables::sstable::version_types get_highest_supported_format() const noexcept;
+    // Get the preferred sstable version for writing new sstables,
+    // according to cluster features and database config.
+    //
+    // 1. The choice must be new enough to support existing data.
+    //    (For example, range tombstones with infinite endpoints were added in version "mc",
+    //     so if the enabled cluster features permit such tombstones to exist, we must
+    //     pick at least "mc").
+    // 2. The choice must be old enough to be supported by cluster features.
+    // 3. The choice should respect the config, as long as it doesn't contradict (1) and (2).
+    //    The user might wish to use an older format, and we should respect that if possible.
+    sstables::sstable::version_types get_preferred_sstable_version() const;
+    // Like get_sstable_version_for_write(), but additionally assume that
+    // all features implied by `existing_version` are enabled. 
+    //
+    // This is used when rewriting (reshaping or resharding) system sstables
+    // during startup. At this point cluster features aren't known to `feature_service` yet.
+    // But we must still pick some format compatible with the existing data.
+    // So use existing sstables to infer the set of enabled features.
+    sstables::sstable::version_types get_safe_sstable_version_for_rewrites(sstable_version_types existing_version) const;
 
     locator::host_id get_local_host_id() const;
 
@@ -199,6 +244,11 @@ public:
 
     std::vector<std::filesystem::path> get_local_directories(const data_dictionary::storage_options::local& so) const;
 
+    sstable_compressor_factory& get_compressor_factory() const { return _compressor_factory; }
+
+    // unsubscribe happens automatically when the handler is destroyed
+    void subscribe(sstables_manager_event_handler& handler);
+
 private:
     void add(sstable* sst);
     // Transition the sstable to the "inactive" state. It has no
@@ -229,6 +279,9 @@ private:
 private:
     db::large_data_handler& get_large_data_handler() const {
         return _large_data_handler;
+    }
+    db::corrupt_data_handler& get_corrupt_data_handler() const {
+        return _corrupt_data_handler;
     }
     friend class sstable;
 

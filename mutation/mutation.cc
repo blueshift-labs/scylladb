@@ -9,14 +9,14 @@
 #include <seastar/util/closeable.hh>
 
 #include "mutation.hh"
-#include "query-result-writer.hh"
+#include "query/query-result-writer.hh"
 #include "mutation_rebuilder.hh"
 #include "mutation/json.hh"
 #include "types/collection.hh"
 #include "types/tuple.hh"
 #include "dht/i_partitioner.hh"
 #include "reader_concurrency_semaphore.hh"
-#include "readers/from_mutations_v2.hh"
+#include "readers/from_mutations.hh"
 
 logging::logger mlog("mutation");
 
@@ -107,8 +107,8 @@ mutation_decorated_key_less_comparator::operator()(const mutation& m1, const mut
     return m1.decorated_key().less_compare(*m1.schema(), m2.decorated_key());
 }
 
-std::ranges::subrange<std::vector<mutation>::const_iterator>
-slice(const std::vector<mutation>& partitions, const dht::partition_range& r) {
+std::ranges::subrange<utils::chunked_vector<mutation>::const_iterator>
+slice(const utils::chunked_vector<mutation>& partitions, const dht::partition_range& r) {
     struct cmp {
         bool operator()(const dht::ring_position& pos, const mutation& m) const {
             return m.decorated_key().tri_compare(*m.schema(), pos) > 0;
@@ -212,20 +212,20 @@ class mutation_by_size_splitter {
         }
     };
     const schema_ptr _schema;
-    std::vector<mutation>& _target;
     const size_t _max_size;
+    std::function<void(mutation)> _process_mutation;
     std::optional<partition_state> _state;
     template <typename T>
     stop_iteration consume_fragment(T&& fragment) {
         const auto fragment_size = fragment.memory_usage(*_schema);
         if (_state->size && _state->size + _state->empty_partition_size + fragment_size > _max_size) {
-            _target.emplace_back(_state->builder.flush());
             // We could end up with an empty mutation if we consumed a range_tombstone_change
             // and the next fragment exceeds the limit. The tombstone range may not have been
             // closed yet and range_tombstone will not be created.
             // This should be a rare case though, so just pop such mutation.
-            if (_target.back().partition().empty()) {
-                _target.pop_back();
+            auto m = _state->builder.flush();
+            if (!m.partition().empty()) {
+                _process_mutation(std::move(m));
             }
             _state->size = 0;
         }
@@ -234,10 +234,10 @@ class mutation_by_size_splitter {
         return stop_iteration::no;
     }
 public:
-    mutation_by_size_splitter(schema_ptr schema, std::vector<mutation>& target, size_t max_size)
+    mutation_by_size_splitter(schema_ptr schema, size_t max_size, std::function<void(mutation)> process_mutation)
         : _schema(std::move(schema))
-        , _target(target)
         , _max_size(max_size)
+        , _process_mutation(process_mutation)
     {
     }
     void consume_new_partition(const dht::decorated_key& dk) {
@@ -264,7 +264,7 @@ public:
             // was already emitted in the previous mutation (because the previous mutation was flushed
             // after consuming a clustering_row at that position).
             if (!mut_opt->partition().empty()) {
-                _target.emplace_back(std::move(*mut_opt));
+                _process_mutation(std::move(*mut_opt));
             }
         } else {
             on_internal_error(mlog, "consume_end_of_stream didn't return a mutation");
@@ -278,19 +278,25 @@ public:
 };
 }
 
-future<> split_mutation(mutation source, std::vector<mutation>& target, size_t max_size) {
+future<> for_each_split_mutation(mutation source, size_t max_size, std::function<void(mutation)> process_mutation) {
     reader_concurrency_semaphore sem(reader_concurrency_semaphore::no_limits{}, "split_mutation",
         reader_concurrency_semaphore::register_metrics::no);
     {
         auto s = source.schema();
-        auto reader = make_mutation_reader_from_mutations_v2(s,
+        auto reader = make_mutation_reader_from_mutations(s,
             sem.make_tracking_only_permit(s, "split_mutation", db::no_timeout, {}),
             std::move(source));
         co_await with_closeable(std::move(reader), [&] (mutation_reader& reader) {
-            return reader.consume(mutation_by_size_splitter(s, target, max_size));
+            return reader.consume(mutation_by_size_splitter(s, max_size, std::move(process_mutation)));
         });
     }
     co_await sem.stop();
+}
+
+future<> split_mutation(mutation source, utils::chunked_vector<mutation>& target, size_t max_size) {
+    return for_each_split_mutation(std::move(source), max_size, [&target] (mutation m) {
+        target.emplace_back(std::move(m));
+    });
 }
 
 auto fmt::formatter<mutation>::format(const mutation& m, fmt::format_context& ctx) const
@@ -360,7 +366,13 @@ void mutation_partition_json_writer::write_atomic_cell_value(const atomic_cell_v
 }
 
 void mutation_partition_json_writer::write_collection_value(const collection_mutation_view_description& mv, data_type type) {
-    write_each_collection_cell(mv, type, [&] (atomic_cell_view v, data_type t) { write_atomic_cell_value(v, t); });
+    write_each_collection_cell(mv, type, [&] (atomic_cell_view v, data_type t) {
+        if (v.is_live()) {
+            write_atomic_cell_value(v, t);
+        } else {
+            writer().Null();
+        }
+    });
 }
 
 void mutation_partition_json_writer::write(gc_clock::duration ttl, gc_clock::time_point expiry) {

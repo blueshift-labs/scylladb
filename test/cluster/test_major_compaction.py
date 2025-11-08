@@ -180,14 +180,14 @@ async def test_shutdown_drain_during_compaction(manager: ManagerClient):
         # start compaction and wait for it to pause at the injection point
         logger.info("Start compaction")
         compaction_task = asyncio.create_task(manager.api.keyspace_compaction(server.ip_addr, ks, cf))
-        await log.wait_for("update_history_wait: waiting", mark, 30)
+        await log.wait_for("update_history_wait: waiting", from_mark=mark, timeout=30)
 
         mark = await log.mark()
         # Start server shutdown
         logger.info("Shutdown server")
         stop_task = asyncio.create_task(manager.server_stop_gracefully(server.server_id))
         # wait until the shutdown drain request is sent to compaction_manager
-        await log.wait_for("Asked to drain", mark, 30)
+        await log.wait_for("Asked to drain", from_mark=mark, timeout=30)
         # now resume compaction and let shutdown complete
         await injection_handler.message()
         # wait server to shutdown
@@ -199,3 +199,97 @@ async def test_shutdown_drain_during_compaction(manager: ManagerClient):
         # For dropping the keyspace
         await manager.server_start(server.server_id)
         await reconnect_driver(manager)
+
+@pytest.mark.asyncio
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_alter_compaction_strategy_during_compaction(manager: ManagerClient):
+    """
+    Test ALTERing compaction strategy during compaction doesn't crash the server
+    1. Create a single node cluster.
+    2. Create a table with compaction strategy = TWCS and populate it.
+    3. Inject error to make compaction wait when getting sstables for compaction.
+    4. Start compaction, wait for it to reach injection point
+    5. ALTER table to change compaction strategy to LCS
+    6. Let compaction proceed and finish
+    7. Verify no unexpected errors in logs
+    """
+    node1 = await manager.server_add(cmdline=['--logger-log-level', 'compaction=debug'])
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1};") as ks:
+        logger.info("Create table")
+        cf = "t1"
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk int, ck int, val int, PRIMARY KEY (pk, ck)) WITH compaction={{'class': 'TimeWindowCompactionStrategy'}}")
+
+        logger.info("Inject error to pause compaction midway")
+        injection_name="twcs_get_sstables_for_compaction"
+        await manager.api.enable_injection(node_ip=node1.ip_addr, injection=injection_name, one_shot=False)
+        server_log = await manager.server_open_log(node1.server_id)
+
+        logger.info("Populate table and start compaction")
+        insert_stmt = cql.prepare(f"INSERT INTO {ks}.{cf} (pk, ck, val) VALUES (?, ?, ?)")
+        for i in range(20):
+            for j in range(100):
+                await cql.run_async(insert_stmt, (i, j, i * j))
+        compaction_task = asyncio.create_task(manager.api.keyspace_compaction(node_ip=node1.ip_addr, keyspace=ks, table=cf))
+
+        logger.info("Waiting for compaction to be suspended")
+        await server_log.wait_for("twcs_get_sstables_for_compaction: waiting for message")
+
+        logger.info("Alter compaction strategy")
+        await cql.run_async(f"ALTER TABLE {ks}.{cf} WITH compaction = {{'class': 'LeveledCompactionStrategy'}};")
+
+        logger.info("Resume compaction and wait for it to finish")
+        await manager.api.message_injection(node_ip=node1.ip_addr, injection=injection_name)
+        await manager.api.disable_injection(node_ip=node1.ip_addr, injection=injection_name)
+        await compaction_task
+
+# Testcase for https://github.com/scylladb/scylladb/issues/24501
+@pytest.mark.asyncio
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_disable_autocompaction_during_major_compaction(manager: ManagerClient):
+    """
+    Test disable autocompaction during a major compaction doesn't stop the major compaction.
+    1. Create a single node cluster.
+    2. Create a table and populate it.
+    3. Inject error to make major compaction wait
+    4. Start compaction, wait for it to reach injection point
+    5. Disable autocompaction on the table
+    6. Resume the major compaction and expect it to complete successfully
+    """
+    logger.info("Starting a single node cluster")
+    server = await manager.server_add(cmdline=["--logger-log-level", "compaction=debug"])
+    # disable autocompaction on system and system_schema keyspaces to avoid interference with testing
+    await disable_autocompaction_across_keyspaces(manager, server.ip_addr, "system", "system_schema")
+
+    cf = "cf"
+    cql = manager.get_cql()
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1}") as ks:
+        logger.info("Creating table")
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} (pk int PRIMARY KEY)")
+
+        logger.info("Populating table")
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.{cf} (pk) VALUES ({k});") for k in range(100)])
+        await manager.api.keyspace_flush(server.ip_addr, ks, cf)
+
+        logger.info("Inject error to make major compaction wait")
+        injection = "major_compaction_wait"
+        await manager.api.enable_injection(server.ip_addr, injection, False)
+
+        logger.info("Start compaction and wait for it to pause at the injection point")
+        log = await manager.server_open_log(server.server_id)
+        mark = await log.mark()
+        compaction_task = asyncio.create_task(manager.api.keyspace_compaction(server.ip_addr, ks, cf))
+        await log.wait_for("major_compaction_wait: waiting", from_mark=mark, timeout=30)
+
+        # Now that major compaction is in progress, disable autocompaction on the table
+        logger.info("Disabling autocompaction on the table")
+        await manager.api.disable_autocompaction(server.ip_addr, ks, cf)
+
+        # now resume major compaction and it should complete successfully
+        logger.info("Resuming major compaction")
+        mark = await log.mark()
+        await manager.api.message_injection(server.ip_addr, injection)
+        await compaction_task
+        await log.wait_for(f"Major {ks}.{cf} .* Compacted .*", from_mark=mark, timeout=30)
+

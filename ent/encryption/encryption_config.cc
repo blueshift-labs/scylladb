@@ -75,14 +75,16 @@ KMIP requests will fail over/retry 'max_command_retries' times (default 3)
 
 The unique name of kms host that can be referenced in table schema.
 
-host.yourdomain.com={ endpoint=<http(s)://host[:port]>, aws_access_key_id=<AWS access id>, aws_secret_access_key=<AWS secret key>, aws_profile<profile>, aws_region=<AWS region>, aws_use_ec2_credentials<bool>, aws_use_ec2_region=<bool>, aws_assume_role_arn=<AWS role arn>, master_key=<alias or id>, keyfile=/path/to/keyfile, truststore=/path/to/truststore.pem, key_cache_millis=<cache ms>, timeout=<timeout ms> }:...
+host.yourdomain.com={ endpoint=<http(s)://host[:port]>, aws_access_key_id=<AWS access id>, aws_secret_access_key=<AWS secret key>, aws_session_token=<AWS session token>, aws_profile<profile>, aws_region=<AWS region>, aws_use_ec2_credentials<bool>, aws_use_ec2_region=<bool>, aws_assume_role_arn=<AWS role arn>, master_key=<alias or id>, keyfile=/path/to/keyfile, truststore=/path/to/truststore.pem, key_cache_millis=<cache ms>, timeout=<timeout ms> }:...
 
 Actual connection can be either an explicit endpoint (<host>:<port>), or selected automatic via aws_region.
 
 If aws_use_ec2_region is true, regions is instead queried from EC2 metadata.
 
-Authentication can be explicit with aws_access_key_id and aws_secret_access_key. Either secret or both can be omitted
-in which case the provider will try to read them from AWS credentials in ~/.aws/credentials
+Authentication can be explicit with long-term security credentials (aws_access_key_id,
+aws_secret_access_key) or temporary security credentials (aws_access_key_id,
+aws_secret_access_key, aws_session_token). If any of key id or secret are omitted, the provider will
+try to read them from the environment, and then from AWS credentials in ~/.aws/credentials.
 
 If aws_use_ec2_credentials is true, authentication is instead queried from EC2 metadata.
 
@@ -107,6 +109,19 @@ auth_file can contain either a user, service or impersonated service account.
 
 master_key is an GCP KMS key name from which all keys used for actual encryption of scylla data will be derived.
 This key must be pre-created with access policy allowing the above credentials Encrypt and Decrypt operations.
+
+)foo")
+		  , azure_hosts(this, "azure_hosts", value_status::Used, { },
+                                R"foo(Azure Key Vault host(s).
+
+The unique name of Azure Key Vault host that can be referenced in table schema.
+
+host.yourdomain.com={ azure_tenant_id=<the tenant hosting your service principal>, azure_client_id=<ID of your service principal>, azure_client_secret=<secret of the service principal>, azure_client_certificate_path=<path to PEM-encoded certificate and private key of the service principal>, master_key=<vault name>/<keyname>, truststore=/path/to/truststore.pem, priority_string=<tls priority string>, key_cache_expiry=<cache expiry in ms>, key_cache_refersh=<cache refresh in ms>}:...
+
+Authentication can be explicit with Service Principal credentials or by resolving default credentials (see Azure docs).
+
+master_key is a Vault key name from which all keys used for actual encryption of scylla data will be derived.
+This key must be pre-created with access policy allowing the above credentials Wrapkey and Unwrapkey operations.
 
 )foo")
         , user_info_encryption(this, "user_info_encryption", value_status::Used,

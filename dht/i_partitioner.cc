@@ -43,8 +43,8 @@ static_sharder::shard_of(const token& t) const {
     return dht::shard_of(_shard_count, _sharding_ignore_msb_bits, t);
 }
 
-unsigned
-static_sharder::shard_for_reads(const token& t) const {
+std::optional<unsigned>
+static_sharder::try_get_shard_for_reads(const token& t) const {
     return shard_of(t);
 }
 
@@ -193,7 +193,7 @@ ring_position_range_sharder::next(const schema& s) {
     if ((!_range.end() || shard_boundary.less_compare(s, _range.end()->value()))
             && !shard_boundary_token.is_maximum()) {
         // split the range at end_of_shard
-        auto start = _range.start();
+        auto start = _range.start_copy();
         auto end = interval_bound<ring_position>(shard_boundary, false);
         _range = dht::partition_range(
                 interval_bound<ring_position>(std::move(shard_boundary), true),
@@ -204,7 +204,7 @@ ring_position_range_sharder::next(const schema& s) {
     return ring_position_range_and_shard{std::move(_range), shard};
 }
 
-ring_position_range_vector_sharder::ring_position_range_vector_sharder(const sharder& sharder, dht::partition_range_vector ranges)
+ring_position_range_vector_sharder::ring_position_range_vector_sharder(const sharder& sharder, utils::chunked_vector<dht::partition_range> ranges)
         : _ranges(std::move(ranges))
         , _sharder(sharder)
         , _current_range(_ranges.begin()) {
@@ -232,7 +232,7 @@ future<utils::chunked_vector<partition_range>>
 split_range_to_single_shard(const schema& s, const static_sharder& sharder, const partition_range& pr, shard_id shard) {
     auto start_token = pr.start() ? pr.start()->value().token() : minimum_token();
     auto start_shard = sharder.shard_of(start_token);
-    auto start_boundary = start_shard == shard ? pr.start() : interval_bound<ring_position>(ring_position::starting_at(sharder.token_for_next_shard(start_token, shard)));
+    auto start_boundary = start_shard == shard ? pr.start_copy() : interval_bound<ring_position>(ring_position::starting_at(sharder.token_for_next_shard(start_token, shard)));
     start_token = start_shard == shard ? start_token : sharder.token_for_next_shard(start_token, shard);
     return repeat_until_value([&sharder,
             &pr,
@@ -513,8 +513,8 @@ auto_refreshing_sharder::refresh() {
     });
 }
 
-unsigned auto_refreshing_sharder::shard_for_reads(const token& t) const {
-    return _sharder->shard_for_reads(t);
+std::optional<unsigned> auto_refreshing_sharder::try_get_shard_for_reads(const token& t) const {
+    return _sharder->try_get_shard_for_reads(t);
 }
 
 dht::shard_replica_set
@@ -533,6 +533,30 @@ auto_refreshing_sharder::next_shard_for_reads(const dht::token& t) const {
 dht::token
 auto_refreshing_sharder::token_for_next_shard_for_reads(const dht::token& t, shard_id shard, unsigned spans) const {
     return _sharder->token_for_next_shard_for_reads(t, shard, spans);
+}
+
+double overlap_ratio(const dht::token_range& base, const dht::token_range& other) {
+    auto bound_range = [] (const token_range& tr) {
+        auto full_range = dht::token_range::make(first_token(), last_token());
+        return full_range.intersection(tr, token_comparator());
+    };
+    auto bounded_base = bound_range(base);
+    auto bounded_other = bound_range(other);
+    if (!bounded_base || !bounded_other) {
+        return 0.0;
+    }
+
+    // intersection of two bounded intervals should never yield an interval with unbounded range.
+    auto intersection = bounded_base->intersection(*bounded_other, token_comparator());
+    if (!intersection) {
+        return 0.0;
+    }
+    auto size_of_bounded_range = [] (const token_range& tr) {
+        // uses unbiased token (uint64_t) to avoid overflow when calculating size
+        return tr.end()->value().unbias() - tr.start()->value().unbias();
+    };
+
+    return double(size_of_bounded_range(*intersection)) / size_of_bounded_range(*bounded_base);
 }
 
 }

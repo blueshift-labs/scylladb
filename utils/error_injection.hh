@@ -10,6 +10,7 @@
 
 #include "utils/assert.hh"
 #include "utils/from_chars_exactly.hh"
+#include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/smp.hh>
@@ -166,6 +167,11 @@ class error_injection {
                 });
             }
         }
+
+        template <typename T>
+        void set(sstring name, const T& value) {
+            parameters[name] = std::to_string(value);
+        }
     };
 
     class injection_data;
@@ -198,13 +204,20 @@ public:
 
     public:
         template <typename Clock, typename Duration>
-        future<> wait_for_message(std::chrono::time_point<Clock, Duration> timeout) {
+        future<> wait_for_message(std::chrono::time_point<Clock, Duration> timeout, abort_source* as = nullptr) {
             if (!_shared_data) {
                 on_internal_error(errinj_logger, "injection_shared_data is not initialized");
             }
+            auto abort = as ? as->subscribe([this] () noexcept {
+                _shared_data->received_message_cv.broadcast();
+            }) : optimized_optional<abort_source::subscription>{};
 
             try {
                 co_await _shared_data->received_message_cv.wait(timeout, [&] {
+                    if (as) {
+                        as->check();
+                    }
+
                     if (!_share_messages) {
                         bool wakes_up = _shared_data->shared_read_message_count < _shared_data->received_message_count;
                         if (wakes_up) {
@@ -216,6 +229,9 @@ public:
 
                     return _read_messages_counter < _shared_data->received_message_count;
                 });
+            }
+            catch (const abort_requested_exception&) {
+                throw;
             }
             catch (const std::exception& e) {
                 on_internal_error(errinj_logger, "Error injection wait_for_message timeout: " + std::string(e.what()));
@@ -247,6 +263,14 @@ public:
                 on_internal_error(errinj_logger, "injection_shared_data is not initialized");
             }
             return _shared_data->template get<T>(std::string(key));
+        }
+
+        template <typename T>
+        void set(std::string_view key, const T& value) const {
+            if (!_shared_data) {
+                on_internal_error(errinj_logger, "injection_shared_data is not initialized");
+            }
+            return _shared_data->template set<T>(sstring(key), value);
         }
 
         friend class error_injection;
@@ -388,6 +412,16 @@ public:
         return seastar::sleep(duration);
     }
 
+    // \brief Inject an abortable sleep for milliseconds
+    [[gnu::always_inline]]
+    future<> inject(const std::string_view& name, const std::chrono::milliseconds duration, abort_source& as) {
+        if (!enter(name)) {
+            return make_ready_future<>();
+        }
+        errinj_logger.debug("Triggering abortable sleep injection \"{}\" ({}ms)", name, duration.count());
+        return seastar::sleep_abortable(duration, as);
+    }    
+
     // \brief Inject a sleep to deadline (timeout)
     template <typename Clock, typename Duration>
     [[gnu::always_inline]]
@@ -459,12 +493,18 @@ public:
     }
 
     template <typename T = std::string_view>
-    std::optional<T> inject_parameter(const std::string_view& name) {
+    std::optional<T> inject_parameter(const std::string_view& name, const std::string_view param_name) {
         auto* data = get_data(name);
         if (!data) {
             return std::nullopt;
         }
-        return data->shared_data->template get<T>("value");
+        return data->shared_data->template get<T>(std::string(param_name));
+    }
+
+    template <typename T = std::string_view>
+    [[gnu::always_inline]]
+    std::optional<T> inject_parameter(const std::string_view& name) {
+         return inject_parameter<T>(name, "value");
     }
 
     // \brief Export the value of the parameter with the given name
@@ -577,6 +617,13 @@ public:
         return make_ready_future<>();
     }
 
+    // Inject abortable sleep
+    [[gnu::always_inline]]
+    future<> inject(const std::string_view& name,
+            const std::chrono::milliseconds duration, abort_source& as) {
+        return make_ready_future<>();
+    }
+
     // \brief Inject a sleep to deadline (timeout)
     template <typename Clock, typename Duration>
     [[gnu::always_inline]]
@@ -607,7 +654,13 @@ public:
         return make_ready_future<>();
     }
 
-    template <typename T>
+    template <typename T = std::string_view>
+    [[gnu::always_inline]]
+    std::optional<T> inject_parameter(const std::string_view& name, const std::string_view param_name) {
+        return std::nullopt;
+    }
+
+    template <typename T = std::string_view>
     [[gnu::always_inline]]
     std::optional<T> inject_parameter(const std::string_view& name) {
         return std::nullopt;

@@ -6,8 +6,8 @@
 #include "expression.hh"
 
 #include "bytes.hh"
-#include "keys.hh"
-#include "interval.hh"
+#include "keys/keys.hh"
+#include "utils/interval.hh"
 #include "cql3/expr/restrictions.hh"
 #include "cql3/assignment_testable.hh"
 #include "cql3/statements/bound.hh"

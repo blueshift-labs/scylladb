@@ -6,10 +6,10 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "db/view/view_building_worker.hh"
 #include "message/messaging_service.hh"
 #include "streaming/stream_blob.hh"
 #include "streaming/stream_plan.hh"
-#include "gms/inet_address.hh"
 #include "utils/pretty_printers.hh"
 #include "utils/error_injection.hh"
 #include "locator/host_id.hh"
@@ -31,6 +31,7 @@
 #include <cfloat>
 #include <filesystem>
 #include <fmt/ranges.h>
+#include "replica/exceptions.hh"
 
 namespace streaming {
 
@@ -44,8 +45,9 @@ static sstables::sstable_state sstable_state(const streaming::stream_blob_meta& 
     return meta.sstable_state.value_or(sstables::sstable_state::normal);
 }
 
-static future<> load_sstable_for_tablet(const file_stream_id& ops_id, replica::database& db, table_id id, sstables::sstable_state state, sstables::entry_descriptor desc, seastar::shard_id shard) {
-    co_await db.container().invoke_on(shard, [id, desc, state, ops_id] (replica::database& db) -> future<> {
+static future<> load_sstable_for_tablet(const file_stream_id& ops_id, replica::database& db, db::view::view_building_worker& vbw, table_id id, sstables::sstable_state state, sstables::entry_descriptor desc, seastar::shard_id shard) {
+    auto& sharded_vbw = vbw.container();
+    co_await db.container().invoke_on(shard, [&sharded_vbw, id, desc, state, ops_id] (replica::database& db) -> future<> {
         replica::table& t = db.find_column_family(id);
         auto erm = t.get_effective_replication_map();
         auto& sstm = t.get_sstables_manager();
@@ -53,6 +55,17 @@ static future<> load_sstable_for_tablet(const file_stream_id& ops_id, replica::d
         co_await sst->load(erm->get_sharder(*t.schema()));
         co_await t.add_sstable_and_update_cache(sst);
         blogger.info("stream_sstables[{}] Loaded sstable {} successfully", ops_id, sst->toc_filename());
+
+        if (state == sstables::sstable_state::staging) {
+            // If the sstable is in staging state, register it to view building worker
+            // to generate view updates from it.
+            // But because the tablet is still in migration process, register the sstable
+            // to the view building worker, which will create a view building task for it,
+            // so then, the view building coordinator can decide to process it once the migration
+            // is finished.
+            // (Instead of registering the sstable to view update generator which may process it immediately.)
+            co_await sharded_vbw.local().register_staging_sstable_tasks({sst}, t.schema()->id());
+        }
     });
 }
 
@@ -120,7 +133,7 @@ static void may_inject_error(const streaming::stream_blob_meta& meta, bool may_i
 
 future<> stream_blob_handler(replica::database& db,
         netw::messaging_service& ms,
-        gms::inet_address from,
+        locator::host_id from,
         streaming::stream_blob_meta meta,
         rpc::sink<streaming::stream_blob_cmd_data> sink,
         rpc::source<streaming::stream_blob_cmd_data> source,
@@ -137,13 +150,13 @@ future<> stream_blob_handler(replica::database& db,
 
     // Will log a message when streaming is done. Used to synchronize tests.
     lw_shared_ptr<std::any> log_done;
-    if (utils::get_local_injector().is_enabled("stream_mutation_fragments")) {
-        log_done = make_lw_shared<std::any>(seastar::make_shared(seastar::defer([] {
-            blogger.info("stream_mutation_fragments: done (tablets)");
-        })));
-    }
 
     try {
+        if (utils::get_local_injector().is_enabled("stream_mutation_fragments")) {
+            log_done = make_lw_shared<std::any>(seastar::make_shared(seastar::defer([] {
+                blogger.info("stream_mutation_fragments: done (tablets)");
+            })));
+        }
         auto status = get_tablet_stream(meta.ops_id);
         auto guard = service::topology_guard(meta.topo_guard);
 
@@ -179,6 +192,10 @@ future<> stream_blob_handler(replica::database& db,
                 }
                 blogger.info("stream_mutation_fragments: released (tablets)");
             });
+
+            if (db.is_in_critical_disk_utilization_mode()) {
+                throw replica::critical_disk_utilization_exception("rejected streamed file");
+            }
 
             stream_blob_cmd_data& cmd_data = std::get<0>(*opt);
             auto cmd = cmd_data.cmd;
@@ -240,8 +257,6 @@ future<> stream_blob_handler(replica::database& db,
         error = std::current_exception();
     }
     if (error) {
-        blogger.warn("fstream[{}] Follower failed peer={} file={} received_size={} bw={} error={}",
-                meta.ops_id, from, meta.filename, total_size, get_bw(total_size, start_time), error);
         if (!fstream_closed) {
             try {
                 if (fstream) {
@@ -298,6 +313,8 @@ future<> stream_blob_handler(replica::database& db,
                     meta.ops_id, meta.filename, std::current_exception());
         }
 
+        blogger.warn("fstream[{}] Follower failed peer={} file={} received_size={} bw={} error={}",
+                meta.ops_id, from, meta.filename, total_size, get_bw(total_size, start_time), error);
         // Do not call rethrow_exception(error) because the caller could do nothing but log
         // the error. We have already logged the error here.
     } else {
@@ -309,13 +326,13 @@ future<> stream_blob_handler(replica::database& db,
 }
 
 
-future<> stream_blob_handler(replica::database& db, netw::messaging_service& ms,
-        gms::inet_address from,
+future<> stream_blob_handler(replica::database& db, db::view::view_building_worker& vbw, netw::messaging_service& ms,
+        locator::host_id from,
         streaming::stream_blob_meta meta,
         rpc::sink<streaming::stream_blob_cmd_data> sink,
         rpc::source<streaming::stream_blob_cmd_data> source) {
 
-    co_await stream_blob_handler(db, ms, std::move(from), meta, std::move(sink), std::move(source), [](replica::database& db, const streaming::stream_blob_meta& meta) -> future<output_result> {
+    co_await stream_blob_handler(db, ms, std::move(from), meta, std::move(sink), std::move(source), [&vbw] (replica::database& db, const streaming::stream_blob_meta& meta) -> future<output_result> {
         auto foptions = file_open_options();
         foptions.sloppy_size = true;
         foptions.extent_allocation_size_hint = 32 << 20;
@@ -329,7 +346,7 @@ future<> stream_blob_handler(replica::database& db, netw::messaging_service& ms,
         auto sstable_sink = sstables::create_stream_sink(table.schema(), sstm, table.get_storage_options(), sstable_state(meta), meta.filename, meta.fops == file_ops::load_sstables);
         auto out = co_await sstable_sink->output(foptions, stream_options);
         co_return output_result{
-            [sstable_sink = std::move(sstable_sink), &meta, &db](store_result res) -> future<> {
+            [sstable_sink = std::move(sstable_sink), &meta, &db, &vbw](store_result res) -> future<> {
                 if (res != store_result::ok) {
                     co_await sstable_sink->abort();
                     co_return;
@@ -339,7 +356,7 @@ future<> stream_blob_handler(replica::database& db, netw::messaging_service& ms,
                     blogger.debug("stream_sstables[{}] Loading sstable {} on shard {}", meta.ops_id, sst->toc_filename(), meta.dst_shard_id);
                     auto desc = sst->get_descriptor(sstables::component_type::TOC);
                     sst = {};
-                    co_await load_sstable_for_tablet(meta.ops_id, db, meta.table, sstable_state(meta), std::move(desc), meta.dst_shard_id);
+                    co_await load_sstable_for_tablet(meta.ops_id, db, vbw, meta.table, sstable_state(meta), std::move(desc), meta.dst_shard_id);
                 }
             },
             std::move(out)
@@ -374,7 +391,7 @@ namespace streaming {
 // Send files in the files list to the nodes in targets list over network
 // Returns number of bytes sent over network
 future<size_t>
-tablet_stream_files(netw::messaging_service& ms, std::list<stream_blob_info> sources, std::vector<node_and_shard> targets, table_id table, file_stream_id ops_id, host2ip_t host2ip, service::frozen_topology_guard topo_guard, bool inject_errors) {
+tablet_stream_files(netw::messaging_service& ms, std::list<stream_blob_info> sources, std::vector<node_and_shard> targets, table_id table, file_stream_id ops_id, service::frozen_topology_guard topo_guard, bool inject_errors) {
     size_t ops_total_size = 0;
     if (targets.empty()) {
         co_return ops_total_size;
@@ -387,7 +404,7 @@ tablet_stream_files(netw::messaging_service& ms, std::list<stream_blob_info> sou
             ops_id, sources.size(), sources, targets);
 
     struct sink_and_source {
-        gms::inet_address node;
+        locator::host_id node;
         rpc::sink<streaming::stream_blob_cmd_data> sink;
         rpc::source<streaming::stream_blob_cmd_data> source;
         bool sink_closed = false;
@@ -428,10 +445,9 @@ tablet_stream_files(netw::messaging_service& ms, std::list<stream_blob_info> sou
             for (auto& x : targets) {
                 const auto& node = x.node;
                 meta.dst_shard_id = x.shard;
-                auto ip = co_await host2ip(node);
-                blogger.debug("fstream[{}] Master creating sink and source for node={}/{}, file={}, targets={}", ops_id, node, ip, filename, targets);
+                blogger.debug("fstream[{}] Master creating sink and source for node={}/{}, file={}, targets={}", ops_id, node, node, filename, targets);
                 auto [sink, source] = co_await ms.make_sink_and_source_for_stream_blob(meta, node);
-                ss.push_back(sink_and_source{ip, std::move(sink), std::move(source)});
+                ss.push_back(sink_and_source{node, std::move(sink), std::move(source)});
             }
 
             // This fiber sends data to peer node
@@ -600,7 +616,7 @@ tablet_stream_files(netw::messaging_service& ms, std::list<stream_blob_info> sou
 }
 
 
-future<stream_files_response> tablet_stream_files_handler(replica::database& db, netw::messaging_service& ms, streaming::stream_files_request req, host2ip_t host2ip) {
+future<stream_files_response> tablet_stream_files_handler(replica::database& db, netw::messaging_service& ms, streaming::stream_files_request req) {
     stream_files_response resp;
     auto& table = db.find_column_family(req.table);
     auto sstables = co_await table.take_storage_snapshot(req.range);
@@ -618,7 +634,7 @@ future<stream_files_response> tablet_stream_files_handler(replica::database& db,
     });
     auto files = std::list<stream_blob_info>();
 
-    sstables::sstable_generation_generator sst_gen(0);
+    auto& sst_gen = table.get_sstable_generation_generator();
 
     for (auto& sst_snapshot : sstables) {
         auto& sst = sst_snapshot.sst;
@@ -626,7 +642,7 @@ future<stream_files_response> tablet_stream_files_handler(replica::database& db,
         auto sst_state = sst->state();
 
         auto sources = create_stream_sources(sst_snapshot);
-        auto newgen = fmt::to_string(sst_gen(sstables::uuid_identifiers::yes));
+        auto newgen = fmt::to_string(sst_gen());
 
         for (auto&& s : sources) {
             auto oldname = s->component_basename();
@@ -653,11 +669,12 @@ future<stream_files_response> tablet_stream_files_handler(replica::database& db,
     blogger.debug("stream_sstables[{}] Started sending sstable_nr={} files_nr={} files={} range={}",
             req.ops_id, sstables.size(), files.size(), files, req.range);
     auto ops_start_time = std::chrono::steady_clock::now();
-    size_t stream_bytes = co_await tablet_stream_files(ms, std::move(files), req.targets, req.table, req.ops_id, std::move(host2ip), req.topo_guard);
+    auto files_nr = files.size();
+    size_t stream_bytes = co_await tablet_stream_files(ms, std::move(files), req.targets, req.table, req.ops_id, req.topo_guard);
     resp.stream_bytes = stream_bytes;
     auto duration = std::chrono::steady_clock::now() - ops_start_time;
-    blogger.info("stream_sstables[{}] Finished sending sstable_nr={} files_nr={} files={} range={} stream_bytes={} stream_time={} stream_bw={}",
-            req.ops_id, sstables.size(), files.size(), files, req.range, stream_bytes, duration, get_bw(stream_bytes, ops_start_time));
+    blogger.info("stream_sstables[{}] Finished sending sstable_nr={} files_nr={} range={} stream_bytes={} stream_time={} stream_bw={}",
+            req.ops_id, sstables.size(), files_nr, req.range, stream_bytes, duration, get_bw(stream_bytes, ops_start_time));
     co_return resp;
 }
 

@@ -16,7 +16,7 @@
 #include "streaming/stream_reason.hh"
 #include "service/topology_guard.hh"
 #include "gms/inet_address.hh"
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/abort_source.hh>
 #include <unordered_map>
 #include <memory>
@@ -76,7 +76,7 @@ public:
         }
     };
 
-    range_streamer(distributed<replica::database>& db, sharded<streaming::stream_manager>& sm, const token_metadata_ptr tmptr, abort_source& abort_source, std::unordered_set<token> tokens,
+    range_streamer(sharded<replica::database>& db, sharded<streaming::stream_manager>& sm, const token_metadata_ptr tmptr, abort_source& abort_source, std::unordered_set<token> tokens,
             locator::host_id address, locator::endpoint_dc_rack dr, sstring description, streaming::stream_reason reason,
             service::frozen_topology_guard topo_guard,
             std::vector<sstring> tables = {})
@@ -95,7 +95,7 @@ public:
         _abort_source.check();
     }
 
-    range_streamer(distributed<replica::database>& db, sharded<streaming::stream_manager>& sm, const token_metadata_ptr tmptr, abort_source& abort_source,
+    range_streamer(sharded<replica::database>& db, sharded<streaming::stream_manager>& sm, const token_metadata_ptr tmptr, abort_source& abort_source,
             locator::host_id address, locator::endpoint_dc_rack dr, sstring description, streaming::stream_reason reason, service::frozen_topology_guard topo_guard, std::vector<sstring> tables = {})
         : range_streamer(db, sm, std::move(tmptr), abort_source, std::unordered_set<token>(), address, std::move(dr), description, reason, std::move(topo_guard), std::move(tables)) {
     }
@@ -104,24 +104,24 @@ public:
         _source_filters.emplace(std::move(filter));
     }
 
-    future<> add_ranges(const sstring& keyspace_name, locator::vnode_effective_replication_map_ptr erm, dht::token_range_vector ranges, gms::gossiper& gossiper, bool is_replacing);
+    future<> add_ranges(const sstring& keyspace_name, locator::static_effective_replication_map_ptr erm, dht::token_range_vector ranges, gms::gossiper& gossiper, bool is_replacing);
     void add_tx_ranges(const sstring& keyspace_name, std::unordered_map<locator::host_id, dht::token_range_vector> ranges_per_endpoint);
     void add_rx_ranges(const sstring& keyspace_name, std::unordered_map<locator::host_id, dht::token_range_vector> ranges_per_endpoint);
 private:
-    bool use_strict_sources_for_ranges(const sstring& keyspace_name, const locator::vnode_effective_replication_map_ptr& erm);
+    bool use_strict_sources_for_ranges(const sstring& keyspace_name, const locator::effective_replication_map& erm);
     /**
      * Get a map of all ranges and their respective sources that are candidates for streaming the given ranges
      * to us. For each range, the list of sources is sorted by proximity relative to the given destAddress.
      */
     std::unordered_map<dht::token_range, std::vector<locator::host_id>>
-    get_all_ranges_with_sources_for(const sstring& keyspace_name, locator::vnode_effective_replication_map_ptr erm, dht::token_range_vector desired_ranges);
+    get_all_ranges_with_sources_for(const sstring& keyspace_name, const locator::vnode_effective_replication_map* erm, dht::token_range_vector desired_ranges);
     /**
      * Get a map of all ranges and the source that will be cleaned up once this bootstrapped node is added for the given ranges.
      * For each range, the list should only contain a single source. This allows us to consistently migrate data without violating
      * consistency.
      */
     std::unordered_map<dht::token_range, std::vector<locator::host_id>>
-    get_all_ranges_with_strict_sources_for(const sstring& keyspace_name, locator::vnode_effective_replication_map_ptr erm, dht::token_range_vector desired_ranges, gms::gossiper& gossiper);
+    get_all_ranges_with_strict_sources_for(const sstring& keyspace_name, const locator::vnode_effective_replication_map* erm, dht::token_range_vector desired_ranges, gms::gossiper& gossiper);
 private:
     /**
      * @param rangesWithSources The ranges we want to fetch (key) and their potential sources (value)
@@ -151,7 +151,7 @@ public:
     future<> stream_async();
     size_t nr_ranges_to_stream();
 private:
-    distributed<replica::database>& _db;
+    sharded<replica::database>& _db;
     sharded<streaming::stream_manager>& _stream_manager;
     token_metadata_ptr _token_metadata_ptr;
     abort_source& _abort_source;

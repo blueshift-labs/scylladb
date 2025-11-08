@@ -65,8 +65,7 @@ SCYLLA_BUILD_DIR_FULLPATH="${SCYLLA_DIR}"/"${SCYLLA_BUILD_DIR}"
 SCYLLA_NINJA_FILE_FULLPATH="${SCYLLA_DIR}"/"${SCYLLA_NINJA_FILE}"
 
 # Which LLVM release to build in order to compile Scylla
-LLVM_CLANG_TAG=19.1.7
-CLANG_SUFFIX=19
+LLVM_CLANG_TAG=20.1.8
 
 CLANG_ARCHIVE=$(cd "${SCYLLA_DIR}" && realpath -m "${CLANG_ARCHIVE}")
 
@@ -103,6 +102,7 @@ SCYLLA_OPTS=(
     --compiler="${CLANG_BUILD_DIR}/build/bin/clang++"
     --build-dir="${SCYLLA_BUILD_DIR}"
     --out="${SCYLLA_NINJA_FILE}"
+    --use-profile=""
 )
 
 # Utilizing LLVM_DISTRIBUTION_COMPONENTS to avoid

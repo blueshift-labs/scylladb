@@ -141,12 +141,13 @@ future<> directory_initializer::ensure_rebalanced() {
 }
 
 manager::manager(service::storage_proxy& proxy, sstring hints_directory, host_filter filter, int64_t max_hint_window_ms,
-        resource_manager& res_manager, distributed<replica::database>& db)
+        resource_manager& res_manager, sharded<replica::database>& db)
     : _hints_dir(fs::path(hints_directory) / fmt::to_string(this_shard_id()))
     , _host_filter(std::move(filter))
     , _proxy(proxy)
     , _max_hint_window_us(max_hint_window_ms * 1000)
     , _local_db(db.local())
+    , _draining_eps_gate(seastar::format("hints::manager::{}", _hints_dir.native()))
     , _resource_manager(res_manager)
 {
     if (utils::get_local_injector().enter("decrease_hints_flush_period")) {
@@ -504,20 +505,20 @@ bool manager::can_hint_for(endpoint_id ep) const noexcept {
     // hints where N is the total number nodes in the cluster.
     const auto hipf = hints_in_progress_for(ep);
     if (_stats.size_of_hints_in_progress > max_size_of_hints_in_progress() && hipf > 0) {
-        manager_logger.trace("size_of_hints_in_progress {} hints_in_progress_for({}) {}",
+        manager_logger.trace("can_hint_for: size_of_hints_in_progress {} hints_in_progress_for({}) {}",
                 _stats.size_of_hints_in_progress, ep, hipf);
         return false;
     }
 
     // Check that the destination DC is "hintable".
     if (!check_dc_for(ep)) {
-        manager_logger.trace("{}'s DC is not hintable", ep);
+        manager_logger.trace("can_hint_for: {}'s DC is not hintable", ep);
         return false;
     }
 
     const bool node_is_alive = local_gossiper().get_endpoint_downtime(ep) <= _max_hint_window_us;
     if (!node_is_alive) {
-        manager_logger.trace("{} has been down for too long, not hinting", ep);
+        manager_logger.trace("can_hint_for: {} has been down for too long, not hinting", ep);
         return false;
     }
 
@@ -538,7 +539,7 @@ future<> manager::change_host_filter(host_filter filter) {
                 "change_host_filter: cannot change the configuration because hints all hints were drained"});
     }
 
-    manager_logger.debug("change_host_filter: changing from {} to {}", _host_filter, filter);
+    manager_logger.info("change_host_filter: changing from {} to {}", _host_filter, filter);
 
     // Change the host_filter now and save the old one so that we can
     // roll back in case of failure
@@ -610,11 +611,19 @@ future<> manager::change_host_filter(host_filter filter) {
             });
         });
     } catch (...) {
+        const sstring exception_message = eptr
+                ? seastar::format("{} + {}", eptr, std::current_exception())
+                : seastar::format("{}", std::current_exception());
+
+        manager_logger.warn("Changing the host filter has failed: {}", exception_message);
+
         if (eptr) {
             std::throw_with_nested(eptr);
         }
         throw;
     }
+
+    manager_logger.info("The host filter has been changed successfully");
 }
 
 bool manager::check_dc_for(endpoint_id ep) const noexcept {
@@ -634,7 +643,7 @@ future<> manager::drain_for(endpoint_id host_id, gms::inet_address ip) noexcept 
         co_return;
     }
 
-    manager_logger.trace("Draining starts for {}", host_id);
+    manager_logger.info("Draining starts for {}", host_id);
 
     const auto holder = seastar::gate::holder{_draining_eps_gate};
     // As long as we hold on to this lock, no migration of hinted handoff to host IDs
@@ -660,7 +669,7 @@ future<> manager::drain_for(endpoint_id host_id, gms::inet_address ip) noexcept 
 
             return ep_man.with_file_update_mutex([&ep_man] -> future<> {
                 return remove_file(ep_man.hints_dir().native()).then([&ep_man] {
-                    manager_logger.debug("Removed hint directory for {}", ep_man.end_point_key());
+                    manager_logger.info("Removed hint directory for {}", ep_man.end_point_key());
                 });
             });
         });
@@ -721,7 +730,7 @@ future<> manager::drain_for(endpoint_id host_id, gms::inet_address ip) noexcept 
         manager_logger.error("Exception when draining {}: {}", host_id, eptr);
     }
 
-    manager_logger.trace("drain_for: finished draining {}", host_id);
+    manager_logger.info("drain_for: finished draining {}", host_id);
 }
 
 void manager::update_backlog(size_t backlog, size_t max_backlog) {

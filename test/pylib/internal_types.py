@@ -6,7 +6,7 @@
 """Internal types for handling Scylla test servers.
 """
 
-from enum import Enum, auto
+from enum import IntEnum, auto
 from typing import NewType, NamedTuple
 
 
@@ -29,8 +29,11 @@ class ServerInfo(NamedTuple):
     def as_dict(self) -> dict[str, object]:
         return {"server_id": self.server_id, "ip_addr": self.ip_addr, "rpc_address": self.rpc_address, "datacenter": self.datacenter, "rack": self.rack}
 
+    def property_file(self) -> dict[str, str]:
+        return {"dc": self.datacenter, "rack": self.rack}
 
-class ServerUpState(Enum):
+
+class ServerUpState(IntEnum):
     PROCESS_STARTED = auto()
     HOST_ID_QUERIED = auto()
     CQL_CONNECTED = auto()

@@ -22,8 +22,8 @@
 
 #include "sstables/sstables.hh"
 #include "compaction/compaction_manager.hh"
-#include "compress.hh"
-#include "counters.hh"
+#include "sstables/compressor.hh"
+#include "mutation/counters.hh"
 #include "schema/schema_builder.hh"
 #include "test/boost/sstable_test.hh"
 #include "test/lib/mutation_reader_assertions.hh"
@@ -32,7 +32,7 @@
 #include "test/lib/random_utils.hh"
 #include "test/lib/test_utils.hh"
 #include "sstables/types.hh"
-#include "keys.hh"
+#include "keys/keys.hh"
 #include "types/types.hh"
 #include "types/user.hh"
 #include "partition_slice_builder.hh"
@@ -47,18 +47,17 @@
 
 using namespace sstables;
 
-class sstable_assertions final {
+class sstable_assertions final : public sstables::test {
     test_env& _env;
-    shared_sstable _sst;
 
     sstable_assertions(test_env& env, schema_ptr schema, const sstring& path, sstable_version_types version, sstables::generation_type generation)
-        : _env(env)
-        , _sst(_env.make_sstable(std::move(schema),
+        : test(env.make_sstable(std::move(schema),
                             path,
                             generation,
                             version,
                             sstable_format_types::big,
                             1))
+        , _env(env)
     { }
 public:
     sstable_assertions(test_env& env, schema_ptr schema, const sstring& path)
@@ -72,18 +71,6 @@ public:
     test_env& get_env() {
         return _env;
     }
-    void read_toc() {
-        _sst->read_toc().get();
-    }
-    void read_summary() {
-        _sst->read_summary().get();
-    }
-    void read_filter() {
-        _sst->read_filter().get();
-    }
-    void read_statistics() {
-        _sst->read_statistics().get();
-    }
     void load() {
         _sst->load(_sst->get_schema()->get_sharder()).get();
     }
@@ -95,12 +82,8 @@ public:
         return _sst->make_reader(_sst->_schema, _env.make_reader_permit(), query::full_partition_range, _sst->_schema->full_slice());
     }
 
-    const stats_metadata& get_stats_metadata() const {
-        return _sst->get_stats_metadata();
-    }
-
-    const shared_sstable get_sstable() const noexcept {
-        return _sst;
+    const sstable* operator->() const noexcept {
+        return &*_sst;
     }
 
     mutation_reader make_reader(
@@ -207,7 +190,7 @@ SEASTAR_TEST_CASE(test_uncompressed_filtering_and_forwarding_read) {
     BOOST_REQUIRE(val_cdef);
 
     auto to_expected = [val_cdef] (int val) {
-        return std::vector<flat_reader_assertions_v2::expected_column>{{val_cdef, int32_type->decompose(int32_t(val))}};
+        return std::vector<mutation_reader_assertions::expected_column>{{val_cdef, int32_type->decompose(int32_t(val))}};
     };
 
     // Sequential read
@@ -458,7 +441,7 @@ SEASTAR_TEST_CASE(test_uncompressed_skip_using_index_rows) {
     BOOST_REQUIRE(rc_cdef);
 
     auto to_expected = [rc_cdef] (sstring val) {
-        return std::vector<flat_reader_assertions_v2::expected_column>{{rc_cdef, utf8_type->decompose(val)}};
+        return std::vector<mutation_reader_assertions::expected_column>{{rc_cdef, utf8_type->decompose(val)}};
     };
     sstring rc_base(1024, 'b');
 
@@ -720,7 +703,7 @@ SEASTAR_TEST_CASE(test_uncompressed_filtering_and_forwarding_range_tombstones_re
     BOOST_REQUIRE(rc_cdef);
 
     auto to_expected = [rc_cdef] (int val) {
-        return std::vector<flat_reader_assertions_v2::expected_column>{{rc_cdef, int32_type->decompose(int32_t(val))}};
+        return std::vector<mutation_reader_assertions::expected_column>{{rc_cdef, int32_type->decompose(int32_t(val))}};
     };
 
     // Sequential read
@@ -1016,7 +999,7 @@ SEASTAR_TEST_CASE(test_uncompressed_slicing_interleaved_rows_and_rts_read) {
     BOOST_REQUIRE(rc_cdef);
 
     auto to_expected = [rc_cdef] (int val) {
-        return std::vector<flat_reader_assertions_v2::expected_column>{{rc_cdef, int32_type->decompose(int32_t(val))}};
+        return std::vector<mutation_reader_assertions::expected_column>{{rc_cdef, int32_type->decompose(int32_t(val))}};
     };
 
     // Sequential read
@@ -1309,7 +1292,7 @@ SEASTAR_TEST_CASE(test_uncompressed_compound_static_row_read) {
     BOOST_REQUIRE(val_cdef);
 
     auto generate = [&] (int int_val, std::string_view text_val, std::string_view inet_val) {
-        std::vector<flat_reader_assertions_v2::expected_column> columns;
+        std::vector<mutation_reader_assertions::expected_column> columns;
 
         columns.push_back({s_int_cdef, int32_type->decompose(int_val)});
         columns.push_back({s_text_cdef, utf8_type->from_string(text_val)});
@@ -1525,7 +1508,7 @@ SEASTAR_TEST_CASE(test_uncompressed_counters_read) {
     BOOST_REQUIRE(cdef);
 
     auto generate = [&] (api::timestamp_type timestamp, int64_t value, int64_t clock) {
-        std::vector<flat_reader_assertions_v2::assert_function> assertions;
+        std::vector<mutation_reader_assertions::assert_function> assertions;
 
         assertions.push_back([&, timestamp, value, clock] (const column_definition& def,
                                                            const atomic_cell_or_collection* cell) {
@@ -1671,7 +1654,7 @@ static future<> test_partition_key_with_values_of_different_types_read(const sst
     auto generate = [&] (bool bool_val, double double_val, float float_val, int int_val, long long_val,
                          std::string_view timestamp_val, std::string_view timeuuid_val, std::string_view uuid_val,
                          std::string_view text_val) {
-        std::vector<flat_reader_assertions_v2::expected_column> columns;
+        std::vector<mutation_reader_assertions::expected_column> columns;
 
         columns.push_back({bool_cdef, boolean_type->decompose(bool_val)});
         columns.push_back({double_cdef, double_type->decompose(double_val)});
@@ -1737,24 +1720,26 @@ SEASTAR_TEST_CASE(test_uncompressed_partition_key_with_values_of_different_types
 
 SEASTAR_TEST_CASE(test_lz4_partition_key_with_values_of_different_types_read) {
     return test_partition_key_with_values_of_different_types_read(
-        LZ4_PARTITION_KEY_WITH_VALUES_OF_DIFFERENT_TYPES_PATH, compressor::lz4);
+        LZ4_PARTITION_KEY_WITH_VALUES_OF_DIFFERENT_TYPES_PATH, compression_parameters::algorithm::lz4);
 }
 
 SEASTAR_TEST_CASE(test_snappy_partition_key_with_values_of_different_types_read) {
     return test_partition_key_with_values_of_different_types_read(
-        SNAPPY_PARTITION_KEY_WITH_VALUES_OF_DIFFERENT_TYPES_PATH, compressor::snappy);
+        SNAPPY_PARTITION_KEY_WITH_VALUES_OF_DIFFERENT_TYPES_PATH, compression_parameters::algorithm::snappy);
 }
 
 SEASTAR_TEST_CASE(test_deflate_partition_key_with_values_of_different_types_read) {
     return test_partition_key_with_values_of_different_types_read(
-        DEFLATE_PARTITION_KEY_WITH_VALUES_OF_DIFFERENT_TYPES_PATH, compressor::deflate);
+        DEFLATE_PARTITION_KEY_WITH_VALUES_OF_DIFFERENT_TYPES_PATH, compression_parameters::algorithm::deflate);
 }
 
 SEASTAR_TEST_CASE(test_zstd_partition_key_with_values_of_different_types_read) {
     return test_partition_key_with_values_of_different_types_read(
-        ZSTD_PARTITION_KEY_WITH_VALUES_OF_DIFFERENT_TYPES_PATH, compressor::create({
+        ZSTD_PARTITION_KEY_WITH_VALUES_OF_DIFFERENT_TYPES_PATH, std::map<sstring, sstring>{
             {"sstable_compression", "org.apache.cassandra.io.compress.ZstdCompressor"},
-            {"compression_level", "1"}}));
+            {"compression_level", "1"}
+        }
+    );
 }
 
 // Following test runs on files in test/resource/sstables/3.x/zstd/multiple_chunks.
@@ -1778,10 +1763,10 @@ static schema_ptr make_zstd_multiple_chunks_schema() {
     return schema_builder("test_ks", "test_table")
         .with_column("val1", int32_type, column_kind::partition_key)
         .with_column("val2", int32_type, column_kind::clustering_key)
-        .set_compressor_params(compression_parameters{compressor::create({
+        .set_compressor_params(compression_parameters{std::map<sstring, sstring>{
             {"sstable_compression", "org.apache.cassandra.io.compress.ZstdCompressor"},
             {"compression_level", "5"},
-            {"chunk_length_in_kb", "4"}})})
+            {"chunk_length_in_kb", "4"}}})
         .build();
 }
 
@@ -1799,7 +1784,7 @@ SEASTAR_TEST_CASE(test_zstd_compression) {
         return dht::decorate_key(*ZSTD_MULTIPLE_CHUNKS_SCHEMA, pk);
     };
 
-    flat_reader_assertions_v2 assertions(sst.make_reader());
+    mutation_reader_assertions assertions(sst.make_reader());
     assertions.produces_partition_start(to_key(0));
     for (int i = 1; i <= 2000; ++i) {
         assertions.produces_row_with_key(clustering_key::from_exploded(*ZSTD_MULTIPLE_CHUNKS_SCHEMA, {int32_type->decompose(i)}));
@@ -1908,7 +1893,7 @@ SEASTAR_TEST_CASE(test_uncompressed_subset_of_columns_read) {
                          std::optional<float> float_val, std::optional<int> int_val, std::optional<long> long_val,
                          std::optional<std::string_view> timestamp_val, std::optional<std::string_view> timeuuid_val,
                          std::optional<std::string_view> uuid_val, std::optional<std::string_view> text_val) {
-        std::vector<flat_reader_assertions_v2::expected_column> columns;
+        std::vector<mutation_reader_assertions::expected_column> columns;
 
         if (bool_val) {
             columns.push_back({bool_cdef, boolean_type->decompose(*bool_val)});
@@ -2115,7 +2100,7 @@ SEASTAR_TEST_CASE(test_uncompressed_large_subset_of_columns_sparse_read) {
     }
 
     auto generate = [&] (const std::vector<std::pair<int, int>>& column_values) {
-        std::vector<flat_reader_assertions_v2::expected_column> columns;
+        std::vector<mutation_reader_assertions::expected_column> columns;
 
         for (auto& p : column_values) {
             columns.push_back({column_defs[p.first - 1], int32_type->decompose(p.second)});
@@ -2333,7 +2318,7 @@ SEASTAR_TEST_CASE(test_uncompressed_large_subset_of_columns_dense_read) {
     }
 
     auto generate = [&] (const std::vector<std::pair<int, int>>& column_values) {
-        std::vector<flat_reader_assertions_v2::expected_column> columns;
+        std::vector<mutation_reader_assertions::expected_column> columns;
 
         for (auto& p : column_values) {
             columns.push_back({column_defs[p.first - 1], int32_type->decompose(p.second)});
@@ -2439,7 +2424,7 @@ SEASTAR_TEST_CASE(test_uncompressed_deleted_cells_read) {
     BOOST_REQUIRE(int_cdef);
 
     auto generate = [&] (uint64_t timestamp, uint64_t deletion_time) {
-        std::vector<flat_reader_assertions_v2::assert_function> assertions;
+        std::vector<mutation_reader_assertions::assert_function> assertions;
 
         assertions.push_back([timestamp, deletion_time] (const column_definition& def,
                                  const atomic_cell_or_collection* cell) {
@@ -2647,7 +2632,7 @@ static thread_local const schema_ptr UNCOMPRESSED_SIMPLE_SCHEMA =
 SEASTAR_TEST_CASE(test_uncompressed_simple_read_toc) {
   return test_env::do_with_async([] (test_env& env) {
     sstable_assertions sst(env, UNCOMPRESSED_SIMPLE_SCHEMA, UNCOMPRESSED_SIMPLE_PATH);
-    sst.read_toc();
+    sst.read_toc().get();
     using ct = component_type;
     sst.assert_toc({ct::Index,
                     ct::Data,
@@ -2663,24 +2648,24 @@ SEASTAR_TEST_CASE(test_uncompressed_simple_read_toc) {
 SEASTAR_TEST_CASE(test_uncompressed_simple_read_summary) {
   return test_env::do_with_async([] (test_env& env) {
     sstable_assertions sst(env, UNCOMPRESSED_SIMPLE_SCHEMA, UNCOMPRESSED_SIMPLE_PATH);
-    sst.read_toc();
-    sst.read_summary();
+    sst.read_toc().get();
+    sst.read_summary().get();
   });
 }
 
 SEASTAR_TEST_CASE(test_uncompressed_simple_read_filter) {
   return test_env::do_with_async([] (test_env& env) {
     sstable_assertions sst(env, UNCOMPRESSED_SIMPLE_SCHEMA, UNCOMPRESSED_SIMPLE_PATH);
-    sst.read_toc();
-    sst.read_filter();
+    sst.read_toc().get();
+    sst.read_filter().get();
   });
 }
 
 SEASTAR_TEST_CASE(test_uncompressed_simple_read_statistics) {
   return test_env::do_with_async([] (test_env& env) {
     sstable_assertions sst(env, UNCOMPRESSED_SIMPLE_SCHEMA, UNCOMPRESSED_SIMPLE_PATH);
-    sst.read_toc();
-    sst.read_statistics();
+    sst.read_toc().get();
+    sst.read_statistics().get();
   });
 }
 
@@ -2908,7 +2893,7 @@ SEASTAR_TEST_CASE(test_uncompressed_collections_read) {
     BOOST_REQUIRE(map_cdef);
 
     auto generate = [&] (std::vector<int> set_val, std::vector<sstring> list_val, std::vector<std::pair<int, sstring>> map_val) {
-        std::vector<flat_reader_assertions_v2::assert_function> assertions;
+        std::vector<mutation_reader_assertions::assert_function> assertions;
 
         assertions.push_back([val = std::move(set_val)] (const column_definition& def,
                                                          const atomic_cell_or_collection* cell) {
@@ -3022,17 +3007,17 @@ static mutation_reader compacted_sstable_reader(test_env& env, schema_ptr s,
     auto sstables = open_sstables(env, s, format("test/resource/sstables/3.x/uncompressed/{}", table_name), generations);
     sstables::shared_sstable compacted_sst;
 
-    auto desc = sstables::compaction_descriptor(std::move(sstables));
+    auto desc = compaction::compaction_descriptor(std::move(sstables));
     desc.creator = [&] (shard_id dummy) {
         compacted_sst = env.make_sstable(s);
         return compacted_sst;
     };
     desc.replacer = replacer_fn_no_op();
-    auto cdata = compaction_manager::create_compaction_data();
-    compaction_progress_monitor progress_monitor;
-    sstables::compact_sstables(std::move(desc), cdata, cf->try_get_table_state_with_static_sharding(), progress_monitor).get();
+    auto cdata = compaction::compaction_manager::create_compaction_data();
+    compaction::compaction_progress_monitor progress_monitor;
+    compaction::compact_sstables(std::move(desc), cdata, cf->try_get_compaction_group_view_with_static_sharding(), progress_monitor).get();
 
-    return compacted_sst->as_mutation_source().make_reader_v2(s, env.make_reader_permit(), query::full_partition_range, s->full_slice());
+    return compacted_sst->as_mutation_source().make_mutation_reader(s, env.make_reader_permit(), query::full_partition_range, s->full_slice());
 }
 
 SEASTAR_TEST_CASE(compact_deleted_row) {
@@ -3181,10 +3166,22 @@ static sstring get_write_test_path(sstring table_name) {
 
 // This method should not be called for compressed sstables because compression is not deterministic
 static void compare_sstables(const std::filesystem::path& result_path, sstring table_name, sstable_version_types version, sstables::shared_sstable sst) {
-    for (auto file_type : {component_type::Data,
-                           component_type::Index,
-                           component_type::Digest,
-                           component_type::Filter}) {
+    // Note: for `ms`, we could test that Partition.db and Rows.db don't change
+    // over time, but do we want that?
+    // Index.db depends only on one parameter aside from the data itself: the index block size.
+    // But Partitions.db and Rows.db are more free-form than that. The writer can freely choose
+    // node types and moves nodes around the file.
+    auto file_types = has_summary_and_index(version)
+        ? std::vector<component_type>{
+            component_type::Data, 
+            component_type::Index,
+            component_type::Digest,
+            component_type::Filter}
+        : std::vector<component_type>{
+            component_type::Data,
+            component_type::Digest,
+            component_type::Filter};
+    for (auto file_type : file_types) {
         auto orig_filename =
                 sstable::filename(get_write_test_path(table_name),
                                   "ks", table_name, sstables::sstable_version_types::mc, generation_from_value(1), big, file_type);
@@ -3207,8 +3204,8 @@ static sstables::shared_sstable write_sstables(test_env& env, schema_ptr s, lw_s
 
     sst->write_components(make_combined_reader(s,
         env.make_reader_permit(),
-        mt1->make_flat_reader(s, env.make_reader_permit()),
-        mt2->make_flat_reader(s, env.make_reader_permit())), 1, s, env.manager().configure_writer(), mt1->get_encoding_stats()).get();
+        mt1->make_mutation_reader(s, env.make_reader_permit()),
+        mt2->make_mutation_reader(s, env.make_reader_permit())), 1, s, env.manager().configure_writer(), mt1->get_encoding_stats()).get();
     return sst;
 }
 
@@ -3233,7 +3230,7 @@ static sstables::shared_sstable write_and_compare_sstables(test_env& env, schema
     return sst;
 }
 
-static sstable_assertions validate_read(test_env& env, shared_sstable input_sst, std::vector<mutation> mutations) {
+static sstable_assertions validate_read(test_env& env, shared_sstable input_sst, utils::chunked_vector<mutation> mutations) {
     sstable_assertions sst(env, input_sst);
     sst.load();
 
@@ -3246,10 +3243,11 @@ static sstable_assertions validate_read(test_env& env, shared_sstable input_sst,
     return sst;
 }
 
-constexpr std::array<sstable_version_types, 3> test_sstable_versions = {
+constexpr std::array<sstable_version_types, 4> test_sstable_versions = {
     sstable_version_types::mc,
     sstable_version_types::md,
     sstable_version_types::me,
+    sstable_version_types::ms,
 };
 
 static void write_mut_and_compare_sstables_version(test_env& env, schema_ptr s, mutation& mut, const sstring& table_name,
@@ -3284,7 +3282,7 @@ static void do_validate_stats_metadata(schema_ptr s, sstable_assertions& written
     auto orig_sst = written_sst.get_env().reusable_sst(s, get_write_test_path(table_name), 1, sstable_version_types::mc).get();
 
     const auto& orig_stats = orig_sst->get_stats_metadata();
-    const auto& written_stats = written_sst.get_stats_metadata();
+    const auto& written_stats = written_sst->get_stats_metadata();
 
     auto check_estimated_histogram = [] (const utils::estimated_histogram& lhs, const utils::estimated_histogram& rhs) {
         BOOST_REQUIRE(lhs.bucket_offsets == rhs.bucket_offsets);
@@ -3299,7 +3297,7 @@ static void do_validate_stats_metadata(schema_ptr s, sstable_assertions& written
     BOOST_REQUIRE_EQUAL(orig_stats.max_local_deletion_time, written_stats.max_local_deletion_time);
     BOOST_REQUIRE_EQUAL(orig_stats.min_ttl, written_stats.min_ttl);
     BOOST_REQUIRE_EQUAL(orig_stats.max_ttl, written_stats.max_ttl);
-    if (orig_sst->has_correct_min_max_column_names() && written_sst.get_sstable()->has_correct_min_max_column_names()) {
+    if (orig_sst->has_correct_min_max_column_names() && written_sst->has_correct_min_max_column_names()) {
         BOOST_REQUIRE(orig_stats.min_column_names.elements == written_stats.min_column_names.elements);
         BOOST_REQUIRE(orig_stats.max_column_names.elements == written_stats.max_column_names.elements);
     }
@@ -3310,7 +3308,7 @@ static void do_validate_stats_metadata(schema_ptr s, sstable_assertions& written
 }
 
 static void check_min_max_column_names(sstable_assertions& written_sst, std::vector<bytes> min_components, std::vector<bytes> max_components) {
-    const auto& st = written_sst.get_stats_metadata();
+    const auto& st = written_sst->get_stats_metadata();
     BOOST_TEST_MESSAGE(fmt::format("min {}/{} max {}/{}", st.min_column_names.elements.size(), min_components.size(), st.max_column_names.elements.size(), max_components.size()));
     BOOST_REQUIRE(st.min_column_names.elements.size() == min_components.size());
     for (auto i = 0U; i < st.min_column_names.elements.size(); i++) {
@@ -3361,7 +3359,7 @@ static void write_mut_and_validate(test_env& env, schema_ptr s, const sstring& t
     }
 }
 
-static void write_mut_and_validate_version(test_env& env, schema_ptr s, const sstring& table_name, std::vector<mutation> muts,
+static void write_mut_and_validate_version(test_env& env, schema_ptr s, const sstring& table_name, utils::chunked_vector<mutation> muts,
         sstable_version_types version, validate_stats_metadata validate_flag) {
     lw_shared_ptr<replica::memtable> mt = make_memtable(s, muts);
     auto sst = write_and_compare_sstables(env, s, mt, table_name, version);
@@ -3371,7 +3369,7 @@ static void write_mut_and_validate_version(test_env& env, schema_ptr s, const ss
     }
 }
 
-static void write_mut_and_validate(test_env& env, schema_ptr s, const sstring& table_name, std::vector<mutation> muts,
+static void write_mut_and_validate(test_env& env, schema_ptr s, const sstring& table_name, utils::chunked_vector<mutation> muts,
         validate_stats_metadata validate_flag = validate_stats_metadata::no) {
     for (auto version : test_sstable_versions) {
         write_mut_and_validate_version(env, s, table_name, muts, version, validate_flag);
@@ -3668,7 +3666,7 @@ SEASTAR_TEST_CASE(test_write_multiple_partitions) {
     // INSERT INTO multiple_partitions (pk, rc1) VALUES (1, 10) USING TIMESTAMP 1525385507816568;
     // INSERT INTO multiple_partitions (pk, rc2) VALUES (2, 20) USING TIMESTAMP 1525385507816578;
     // INSERT INTO multiple_partitions (pk, rc3) VALUES (3, 30) USING TIMESTAMP 1525385507816588;
-    std::vector<mutation> muts;
+    utils::chunked_vector<mutation> muts;
     for (auto i : std::views::iota(1, 4)) {
         auto key = partition_key::from_deeply_exploded(*s, {i});
         muts.emplace_back(s, key);
@@ -3691,7 +3689,7 @@ static future<> test_write_many_partitions(sstring table_name, tombstone partiti
     builder.set_compressor_params(cp);
     schema_ptr s = builder.build(schema_builder::compact_storage::no);
 
-    std::vector<mutation> muts;
+    utils::chunked_vector<mutation> muts;
     for (auto i : std::views::iota(0, 65536)) {
         auto key = partition_key::from_deeply_exploded(*s, {i});
         muts.emplace_back(s, key);
@@ -3700,7 +3698,7 @@ static future<> test_write_many_partitions(sstring table_name, tombstone partiti
         }
     }
 
-    bool compressed = cp.get_compressor() != nullptr;
+    bool compressed = cp.get_algorithm() != compression_parameters::algorithm::none;
     for (auto version : test_sstable_versions) {
         lw_shared_ptr<replica::memtable> mt = make_memtable(s, muts);
         auto sst = compressed ? write_sstables(env, s, mt, version) : write_and_compare_sstables(env, s, mt, table_name, version);
@@ -3728,30 +3726,30 @@ SEASTAR_TEST_CASE(test_write_many_partitions_lz4) {
     return test_write_many_partitions(
             "many_partitions_lz4",
             tombstone{},
-            compression_parameters{compressor::lz4});
+            compression_parameters{compression_parameters::algorithm::lz4});
 }
 
 SEASTAR_TEST_CASE(test_write_many_partitions_snappy) {
     return test_write_many_partitions(
             "many_partitions_snappy",
             tombstone{},
-            compression_parameters{compressor::snappy});
+            compression_parameters{compression_parameters::algorithm::snappy});
 }
 
 SEASTAR_TEST_CASE(test_write_many_partitions_deflate) {
     return test_write_many_partitions(
             "many_partitions_deflate",
             tombstone{},
-            compression_parameters{compressor::deflate});
+            compression_parameters{compression_parameters::algorithm::deflate});
 }
 
 SEASTAR_TEST_CASE(test_write_many_partitions_zstd) {
     return test_write_many_partitions(
             "many_partitions_zstd",
             tombstone{},
-            compression_parameters{compressor::create({
+            compression_parameters{std::map<sstring, sstring>{
                 {"sstable_compression", "org.apache.cassandra.io.compress.ZstdCompressor"}
-            })});
+            }});
 }
 
 SEASTAR_TEST_CASE(test_write_multiple_rows) {
@@ -4543,8 +4541,8 @@ static sstring get_read_index_test_path(sstring table_name) {
     return format("test/resource/sstables/3.x/uncompressed/read_{}", table_name);
 }
 
-static std::unique_ptr<index_reader> get_index_reader(shared_sstable sst, reader_permit permit) {
-    return std::make_unique<index_reader>(sst, std::move(permit));
+static std::unique_ptr<abstract_index_reader> get_index_reader(shared_sstable sst, reader_permit permit) {
+    return sst->make_index_reader(std::move(permit));
 }
 
 shared_sstable make_test_sstable(test_env& env, schema_ptr schema, const sstring& table_name) {
@@ -4748,7 +4746,7 @@ SEASTAR_TEST_CASE(test_uncompressed_read_two_rows_fast_forwarding) {
     BOOST_REQUIRE(rc_cdef);
 
     auto to_expected = [rc_cdef] (int val) {
-        return std::vector<flat_reader_assertions_v2::expected_column>{{rc_cdef, int32_type->decompose(int32_t(val))}};
+        return std::vector<mutation_reader_assertions::expected_column>{{rc_cdef, int32_type->decompose(int32_t(val))}};
     };
 
     auto r = assert_that(sst.make_reader(query::full_partition_range,
@@ -5162,7 +5160,7 @@ static void test_sstable_write_large_row_f(schema_ptr s, reader_permit permit, r
         // trigger depends on the size of rows after they are written in the MC format and that size
         // depends on the encoding statistics (because of variable-length encoding). The original values
         // were chosen with the default-constructed encoding_stats, so let's keep it that way.
-        sst->write_components(mt.make_flat_reader(s, std::move(permit)), 1, s, env.manager().configure_writer("test"), encoding_stats{}).get();
+        sst->write_components(mt.make_mutation_reader(s, std::move(permit)), 1, s, env.manager().configure_writer("test"), encoding_stats{}).get();
         BOOST_REQUIRE_EQUAL(i, expected.size());
     }, { &handler }).get();
 }
@@ -5216,7 +5214,7 @@ static void test_sstable_write_large_cell_f(schema_ptr s, reader_permit permit, 
         // trigger depends on the size of rows after they are written in the MC format and that size
         // depends on the encoding statistics (because of variable-length encoding). The original values
         // were chosen with the default-constructed encoding_stats, so let's keep it that way.
-        sst->write_components(mt.make_flat_reader(s, std::move(permit)), 1, s, env.manager().configure_writer("test"), encoding_stats{}).get();
+        sst->write_components(mt.make_mutation_reader(s, std::move(permit)), 1, s, env.manager().configure_writer("test"), encoding_stats{}).get();
         BOOST_REQUIRE_EQUAL(i, expected.size());
     }, { &handler }).get();
 }
@@ -5275,7 +5273,7 @@ static void test_sstable_log_too_many_rows_f(int rows, int range_tombstones, uin
 
     sstables::test_env::do_with_async([&] (auto& env) {
         auto sst = env.make_sstable(sc, version);
-        sst->write_components(mt->make_flat_reader(sc, semaphore.make_permit()), 1, sc, env.manager().configure_writer("test"), encoding_stats{}).get();
+        sst->write_components(mt->make_mutation_reader(sc, semaphore.make_permit()), 1, sc, env.manager().configure_writer("test"), encoding_stats{}).get();
 
         BOOST_REQUIRE_EQUAL(logged, expected);
     }, { &handler }).get();
@@ -5388,7 +5386,7 @@ static void test_sstable_log_too_many_dead_rows_f(int rows, uint64_t threshold, 
 
     sstables::test_env::do_with_async([&] (auto& env) {
         auto sst = env.make_sstable(sc, version);
-        sst->write_components(mt->make_flat_reader(sc, semaphore.make_permit()), 1, sc, env.manager().configure_writer("test"), encoding_stats{}).get();
+        sst->write_components(mt->make_mutation_reader(sc, semaphore.make_permit()), 1, sc, env.manager().configure_writer("test"), encoding_stats{}).get();
 
         BOOST_REQUIRE_EQUAL(logged, expected);
     }, { &handler }).get();
@@ -5440,7 +5438,7 @@ static void test_sstable_too_many_collection_elements_f(int elements, uint64_t t
 
     sstables::test_env::do_with_async([&] (auto& env) {
         auto sst = env.make_sstable(sc, version);
-        sst->write_components(mt->make_flat_reader(sc, semaphore.make_permit()), 1, sc, env.manager().configure_writer("test"), encoding_stats{}).get();
+        sst->write_components(mt->make_mutation_reader(sc, semaphore.make_permit()), 1, sc, env.manager().configure_writer("test"), encoding_stats{}).get();
 
         BOOST_REQUIRE_EQUAL(logged, expected);
     }, { &handler }).get();
@@ -5602,7 +5600,7 @@ SEASTAR_TEST_CASE(test_compression_premature_eof) {
             return dht::decorate_key(*ZSTD_MULTIPLE_CHUNKS_SCHEMA, pk);
         };
 
-        flat_reader_assertions_v2 assertions(sst.make_reader());
+        mutation_reader_assertions assertions(sst.make_reader());
         try {
             assertions.produces_partition_start(to_key(0));
             BOOST_FAIL("produces_partition_start unexpectedly");
@@ -5639,7 +5637,7 @@ SEASTAR_TEST_CASE(test_alter_bloom_fp_chance_during_write) {
         mt->apply(m);
 
         auto sst = env.make_sstable(s2, sstable_version_types::me);
-        sst->write_components(mt->make_flat_reader(s1, env.make_reader_permit()), 1, s1, env.manager().configure_writer(), mt->get_encoding_stats()).get();
+        sst->write_components(mt->make_mutation_reader(s1, env.make_reader_permit()), 1, s1, env.manager().configure_writer(), mt->get_encoding_stats()).get();
 
         sstable_assertions sa(env, sst);
         sa.load();
@@ -5679,7 +5677,7 @@ SEASTAR_TEST_CASE(test_alter_compression_during_write) {
         mt->apply(m);
 
         auto sst = env.make_sstable(s2, sstable_version_types::me);
-        sst->write_components(mt->make_flat_reader(s1, env.make_reader_permit()), 1, s1, env.manager().configure_writer(), mt->get_encoding_stats()).get();
+        sst->write_components(mt->make_mutation_reader(s1, env.make_reader_permit()), 1, s1, env.manager().configure_writer(), mt->get_encoding_stats()).get();
 
         sstable_assertions sa(env, sst);
         sa.load();

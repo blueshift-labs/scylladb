@@ -295,8 +295,12 @@ def testKeyspace(cql):
 
     execute(cql, n, "CREATE KEYSPACE %s WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 }")
     execute(cql, n, "DROP KEYSPACE %s")
+    # The original Cassandra test checked that a 53-character keyspace name doesn't work
+    # but Scylla increased the 48-character limit to 192 characters, so this test was modified
+    # to check length of 500, to produce the same outcome on Scylla and Cassandra.
+    too_long_keyspace_name = "k" * 500
     assertInvalid(cql, "", 
-         "CREATE KEYSPACE My_much_much_too_long_identifier_that_should_not_work WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 }")
+         f"CREATE KEYSPACE {too_long_keyspace_name} WITH replication = {{ 'class' : 'SimpleStrategy', 'replication_factor' : 1 }}")
 
     # FIXME: Cassandra throws InvalidRequest here, but Scylla uses
     # ConfigurationException. We shouldn't have done that... But I consider
@@ -312,7 +316,7 @@ def testKeyspace(cql):
 def testCreateKeyspaceWithNTSOnlyAcceptsConfiguredDataCenterNames(cql, this_dc):
     n = unique_name()
     assertInvalidThrow(cql, n, ConfigurationException, "CREATE KEYSPACE %s WITH replication = { 'class' : 'NetworkTopologyStrategy', 'INVALID_DC' : 2 }")
-    execute(cql, n, "CREATE KEYSPACE %s WITH replication = {'class' : 'NetworkTopologyStrategy', '" + this_dc + "' : 2 }")
+    execute(cql, n, "CREATE KEYSPACE %s WITH replication = {'class' : 'NetworkTopologyStrategy', '" + this_dc + "' : 1 }")
     execute(cql, n, "DROP KEYSPACE IF EXISTS %s")
 
     # Mix valid and invalid, should throw an exception
@@ -320,7 +324,6 @@ def testCreateKeyspaceWithNTSOnlyAcceptsConfiguredDataCenterNames(cql, this_dc):
     execute(cql, n, "DROP KEYSPACE IF EXISTS %s")
 
 # Test {@link ConfigurationException} is not thrown on create NetworkTopologyStrategy keyspace without any options.
-@pytest.mark.xfail(reason="Issue #16028")
 def testCreateKeyspaceWithNetworkTopologyStrategyNoOptions(cql):
     n = unique_name()
     execute(cql, n, "CREATE KEYSPACE %s with replication = { 'class': 'NetworkTopologyStrategy' }")

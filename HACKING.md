@@ -43,7 +43,7 @@ $ ./tools/toolchain/dbuild ninja build/release/scylla
 $ ./tools/toolchain/dbuild ./build/release/scylla --developer-mode 1
 ```
 
-Note: do not mix environemtns - either perform all your work with dbuild, or natively on the host.
+Note: do not mix environments - either perform all your work with dbuild, or natively on the host.
 Note2: you can get to an interactive shell within dbuild by running it without any parameters:
 ```bash
 $ ./tools/toolchain/dbuild
@@ -91,7 +91,7 @@ You can also specify a single mode. For example
 $ ninja-build release
 ```
 
-Will build everytihng in release mode. The valid modes are
+Will build everything in release mode. The valid modes are
 
 * Debug: Enables [AddressSanitizer](https://github.com/google/sanitizers/wiki/AddressSanitizer)
   and other sanity checks. It has no optimizations, which allows for debugging with tools like
@@ -220,28 +220,9 @@ On a development machine, one might run Scylla as
 $ SCYLLA_HOME=$HOME/scylla build/release/scylla --overprovisioned --developer-mode=yes
 ```
 
-To interact with scylla it is recommended to build our versions of
-cqlsh and nodetool. They are available at
-https://github.com/scylladb/scylla-tools-java and can be built with
-
-```bash
-$ sudo ./install-dependencies.sh
-$ ant jar
-```
-
-cqlsh should work out of the box, but nodetool depends on a running
-scylla-jmx (https://github.com/scylladb/scylla-jmx). It can be build
-with
-
-```bash
-$ mvn package
-```
-
-and must be started with
-
-```bash
-$ ./scripts/scylla-jmx
-```
+To interact with scylla it is recommended to build our version of
+cqlsh. It is available at
+https://github.com/scylladb/scylla-cqlsh and is available as a submodule.
 
 ### Branches and tags
 
@@ -380,7 +361,7 @@ avoid that the gold linker can be told to create an index with
 
 More info at https://gcc.gnu.org/wiki/DebugFission.
 
-Both options can be enable by passing `--split-dwarf` to configure.py.
+Both options can be enabled by passing `--split-dwarf` to configure.py.
 
 Note that distcc is *not* compatible with it, but icecream
 (https://github.com/icecc/icecream) is.
@@ -389,7 +370,7 @@ Note that distcc is *not* compatible with it, but icecream
 
 Sometimes Scylla development is closely tied with a feature being developed in Seastar. It can be useful to compile Scylla with a particular check-out of Seastar.
 
-One way to do this it to create a local remote for the Seastar submodule in the Scylla repository:
+One way to do this is to create a local remote for the Seastar submodule in the Scylla repository:
 
 ```bash
 $ cd $HOME/src/scylla

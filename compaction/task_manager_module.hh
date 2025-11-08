@@ -24,6 +24,8 @@ class reshard_shard_descriptor;
 namespace compaction {
 
 class compaction_task_impl : public tasks::task_manager::task::impl {
+protected:
+    mutable uint64_t _expected_workload = 0;
 public:
     compaction_task_impl(tasks::task_manager::module_ptr module,
             tasks::task_id id,
@@ -35,16 +37,21 @@ public:
             tasks::task_id parent_id) noexcept
         : tasks::task_manager::task::impl(module, id, sequence_number, std::move(scope), std::move(keyspace), std::move(table), std::move(entity), parent_id)
     {
-        // FIXME: add progress units
+        _status.progress_units = "bytes";
     }
 
     virtual std::string type() const override = 0;
     virtual tasks::is_abortable is_abortable() const noexcept override;
 protected:
     virtual future<> run() override = 0;
+    future<uint64_t> get_table_task_workload(replica::database& db, const table_info& ti) const;
+    future<uint64_t> get_shard_task_workload(replica::database& db, const std::vector<table_info>& tables) const;
+    future<uint64_t> get_keyspace_task_workload(sharded<replica::database>& db, const std::vector<table_info>& tables) const;
 
-    future<tasks::task_manager::task::progress> get_progress(const sstables::compaction_data& cdata, const sstables::compaction_progress_monitor& progress_monitor) const;
+    future<tasks::task_manager::task::progress> get_progress(const compaction_data& cdata, const compaction_progress_monitor& progress_monitor) const;
 };
+
+using current_task_type = shared_ptr<compaction_task_impl>;
 
 enum class flush_mode {
     skip,               // Skip flushing.  Useful when application explicitly flushes all tables prior to compaction
@@ -67,9 +74,7 @@ public:
         : compaction_task_impl(module, id, sequence_number, std::move(scope), std::move(keyspace), std::move(table), std::move(entity), parent_id)
         , _flush_mode(fm)
         , _consider_only_existing_data(consider_only_existing_data)
-    {
-        // FIXME: add progress units
-    }
+    {}
 
     virtual std::string type() const override {
         return "major compaction";
@@ -98,6 +103,7 @@ public:
     tasks::is_user_task is_user_task() const noexcept override;
 protected:
     virtual future<> run() override;
+    virtual future<std::optional<double>> expected_total_workload() const override;
 };
 
 class major_keyspace_compaction_task_impl : public major_compaction_task_impl {
@@ -107,7 +113,7 @@ private:
     // _cvp and _current_task are engaged when the task is invoked from
     // global_major_compaction_task_impl
     seastar::condition_variable* _cv;
-    tasks::task_manager::task_ptr* _current_task;
+    current_task_type* _current_task;
 public:
     major_keyspace_compaction_task_impl(tasks::task_manager::module_ptr module,
             std::string keyspace,
@@ -117,7 +123,7 @@ public:
             std::optional<flush_mode> fm = std::nullopt,
             bool consider_only_existing_data = false,
             seastar::condition_variable* cv = nullptr,
-            tasks::task_manager::task_ptr* current_task = nullptr) noexcept
+            current_task_type* current_task = nullptr) noexcept
         : major_compaction_task_impl(module, tasks::task_id::create_random_id(),
                 parent_id ? 0 : module->new_sequence_number(),
                 "keyspace", std::move(keyspace), "", "", parent_id,
@@ -131,6 +137,7 @@ public:
     tasks::is_user_task is_user_task() const noexcept override;
 protected:
     virtual future<> run() override;
+    virtual future<std::optional<double>> expected_total_workload() const override;
 };
 
 class shard_major_keyspace_compaction_task_impl : public major_compaction_task_impl {
@@ -151,6 +158,7 @@ public:
     {}
 protected:
     virtual future<> run() override;
+    virtual future<std::optional<double>> expected_total_workload() const override;
 };
 
 class table_major_keyspace_compaction_task_impl : public major_compaction_task_impl {
@@ -158,7 +166,7 @@ private:
     replica::database& _db;
     table_info _ti;
     seastar::condition_variable& _cv;
-    tasks::task_manager::task_ptr& _current_task;
+    current_task_type& _current_task;
 public:
     table_major_keyspace_compaction_task_impl(tasks::task_manager::module_ptr module,
             std::string keyspace,
@@ -167,7 +175,7 @@ public:
             replica::database& db,
             table_info ti,
             seastar::condition_variable& cv,
-            tasks::task_manager::task_ptr& current_task,
+            current_task_type& current_task,
             flush_mode fm,
             bool consider_only_existing_data) noexcept
         : major_compaction_task_impl(module, tasks::task_id::create_random_id(), 0, "table", std::move(keyspace), std::move(table), "", parent_id, fm, consider_only_existing_data)
@@ -178,6 +186,7 @@ public:
     {}
 protected:
     virtual future<> run() override;
+    virtual future<std::optional<double>> expected_total_workload() const override;
 };
 
 
@@ -192,9 +201,7 @@ public:
             std::string entity,
             tasks::task_id parent_id) noexcept
         : compaction_task_impl(module, id, sequence_number, std::move(scope), std::move(keyspace), std::move(table), std::move(entity), parent_id)
-    {
-        // FIXME: add progress units
-    }
+    {}
 
     virtual std::string type() const override {
         return "cleanup compaction";
@@ -226,6 +233,7 @@ public:
     tasks::is_user_task is_user_task() const noexcept override;
 protected:
     virtual future<> run() override;
+    virtual future<std::optional<double>> expected_total_workload() const override;
 };
 
 class global_cleanup_compaction_task_impl : public compaction_task_impl {
@@ -244,6 +252,7 @@ public:
     tasks::is_user_task is_user_task() const noexcept override;
 private:
     future<> run() final;
+    virtual future<std::optional<double>> expected_total_workload() const override;
 };
 
 class shard_cleanup_keyspace_compaction_task_impl : public cleanup_compaction_task_impl {
@@ -262,6 +271,7 @@ public:
     {}
 protected:
     virtual future<> run() override;
+    virtual future<std::optional<double>> expected_total_workload() const override;
 };
 
 class table_cleanup_keyspace_compaction_task_impl : public cleanup_compaction_task_impl {
@@ -269,7 +279,7 @@ private:
     replica::database& _db;
     table_info _ti;
     seastar::condition_variable& _cv;
-    tasks::task_manager::task_ptr& _current_task;
+    current_task_type& _current_task;
 public:
     table_cleanup_keyspace_compaction_task_impl(tasks::task_manager::module_ptr module,
             std::string keyspace,
@@ -278,7 +288,7 @@ public:
             replica::database& db,
             table_info ti,
             seastar::condition_variable& cv,
-            tasks::task_manager::task_ptr& current_task) noexcept
+            current_task_type& current_task) noexcept
         : cleanup_compaction_task_impl(module, tasks::task_id::create_random_id(), 0, "table", std::move(keyspace), std::move(table), "", parent_id)
         , _db(db)
         , _ti(std::move(ti))
@@ -287,6 +297,7 @@ public:
     {}
 protected:
     virtual future<> run() override;
+    future<std::optional<double>> expected_total_workload() const override;
 };
 
 class offstrategy_compaction_task_impl : public compaction_task_impl {
@@ -300,9 +311,7 @@ public:
             std::string entity,
             tasks::task_id parent_id) noexcept
         : compaction_task_impl(module, id, sequence_number, std::move(scope), std::move(keyspace), std::move(table), std::move(entity), parent_id)
-    {
-        // FIXME: add progress units
-    }
+    {}
 
     virtual std::string type() const override {
         return "offstrategy compaction";
@@ -331,6 +340,7 @@ public:
     tasks::is_user_task is_user_task() const noexcept override;
 protected:
     virtual future<> run() override;
+    virtual future<std::optional<double>> expected_total_workload() const override;
 };
 
 class shard_offstrategy_keyspace_compaction_task_impl : public offstrategy_compaction_task_impl {
@@ -352,6 +362,7 @@ public:
     {}
 protected:
     virtual future<> run() override;
+    virtual future<std::optional<double>> expected_total_workload() const override;
 };
 
 class table_offstrategy_keyspace_compaction_task_impl : public offstrategy_compaction_task_impl {
@@ -359,7 +370,7 @@ private:
     replica::database& _db;
     table_info _ti;
     seastar::condition_variable& _cv;
-    tasks::task_manager::task_ptr& _current_task;
+    current_task_type& _current_task;
     bool& _needed;
 public:
     table_offstrategy_keyspace_compaction_task_impl(tasks::task_manager::module_ptr module,
@@ -369,7 +380,7 @@ public:
             replica::database& db,
             table_info ti,
             seastar::condition_variable& cv,
-            tasks::task_manager::task_ptr& current_task,
+            current_task_type& current_task,
             bool& needed) noexcept
         : offstrategy_compaction_task_impl(module, tasks::task_id::create_random_id(), 0, "table", std::move(keyspace), std::move(table), "", parent_id)
         , _db(db)
@@ -380,6 +391,7 @@ public:
     {}
 protected:
     virtual future<> run() override;
+    virtual future<std::optional<double>> expected_total_workload() const override;
 };
 
 class sstables_compaction_task_impl : public compaction_task_impl {
@@ -393,9 +405,7 @@ public:
             std::string entity,
             tasks::task_id parent_id) noexcept
         : compaction_task_impl(module, id, sequence_number, std::move(scope), std::move(keyspace), std::move(table), std::move(entity), parent_id)
-    {
-        // FIXME: add progress units
-    }
+    {}
 
     virtual std::string type() const override {
         return "sstables compaction";
@@ -428,6 +438,7 @@ public:
     tasks::is_user_task is_user_task() const noexcept override;
 protected:
     virtual future<> run() override;
+    virtual future<std::optional<double>> expected_total_workload() const override;
 };
 
 class shard_upgrade_sstables_compaction_task_impl : public sstables_compaction_task_impl {
@@ -453,6 +464,7 @@ public:
     }
 protected:
     virtual future<> run() override;
+    virtual future<std::optional<double>> expected_total_workload() const override;
 };
 
 class table_upgrade_sstables_compaction_task_impl : public sstables_compaction_task_impl {
@@ -460,7 +472,7 @@ private:
     replica::database& _db;
     table_info _ti;
     seastar::condition_variable& _cv;
-    tasks::task_manager::task_ptr& _current_task;
+    current_task_type& _current_task;
     bool _exclude_current_version;
 public:
     table_upgrade_sstables_compaction_task_impl(tasks::task_manager::module_ptr module,
@@ -470,7 +482,7 @@ public:
             replica::database& db,
             table_info ti,
             seastar::condition_variable& cv,
-            tasks::task_manager::task_ptr& current_task,
+            current_task_type& current_task,
             bool exclude_current_version) noexcept
         : sstables_compaction_task_impl(module, tasks::task_id::create_random_id(), 0, "table", std::move(keyspace), std::move(table), "", parent_id)
         , _db(db)
@@ -485,21 +497,22 @@ public:
     }
 protected:
     virtual future<> run() override;
+    virtual future<std::optional<double>> expected_total_workload() const override;
 };
 
 class scrub_sstables_compaction_task_impl : public sstables_compaction_task_impl {
 private:
     sharded<replica::database>& _db;
     std::vector<sstring> _column_families;
-    sstables::compaction_type_options::scrub _opts;
-    sstables::compaction_stats* _stats;
+    compaction_type_options::scrub _opts;
+    compaction_stats* _stats;
 public:
     scrub_sstables_compaction_task_impl(tasks::task_manager::module_ptr module,
             std::string keyspace,
             sharded<replica::database>& db,
             std::vector<sstring> column_families,
-            sstables::compaction_type_options::scrub opts,
-            sstables::compaction_stats* stats) noexcept
+            compaction_type_options::scrub opts,
+            compaction_stats* stats) noexcept
         : sstables_compaction_task_impl(module, tasks::task_id::create_random_id(), module->new_sequence_number(), "keyspace", std::move(keyspace), "", "", tasks::task_id::create_null_id())
         , _db(db)
         , _column_families(std::move(column_families))
@@ -514,22 +527,23 @@ public:
     tasks::is_user_task is_user_task() const noexcept override;
 protected:
     virtual future<> run() override;
+    virtual future<std::optional<double>> expected_total_workload() const override;
 };
 
 class shard_scrub_sstables_compaction_task_impl : public sstables_compaction_task_impl {
 private:
     replica::database& _db;
     std::vector<sstring> _column_families;
-    sstables::compaction_type_options::scrub _opts;
-    sstables::compaction_stats& _stats;
+    compaction_type_options::scrub _opts;
+    compaction_stats& _stats;
 public:
     shard_scrub_sstables_compaction_task_impl(tasks::task_manager::module_ptr module,
             std::string keyspace,
             tasks::task_id parent_id,
             replica::database& db,
             std::vector<sstring> column_families,
-            sstables::compaction_type_options::scrub opts,
-            sstables::compaction_stats& stats) noexcept
+            compaction_type_options::scrub opts,
+            compaction_stats& stats) noexcept
         : sstables_compaction_task_impl(module, tasks::task_id::create_random_id(), 0, "shard", std::move(keyspace), "", "", parent_id)
         , _db(db)
         , _column_families(std::move(column_families))
@@ -542,21 +556,22 @@ public:
     }
 protected:
     virtual future<> run() override;
+    virtual future<std::optional<double>> expected_total_workload() const override;
 };
 
 class table_scrub_sstables_compaction_task_impl : public sstables_compaction_task_impl {
 private:
     replica::database& _db;
-    sstables::compaction_type_options::scrub _opts;
-    sstables::compaction_stats& _stats;
+    compaction_type_options::scrub _opts;
+    compaction_stats& _stats;
 public:
     table_scrub_sstables_compaction_task_impl(tasks::task_manager::module_ptr module,
             std::string keyspace,
             std::string table,
             tasks::task_id parent_id,
             replica::database& db,
-            sstables::compaction_type_options::scrub opts,
-            sstables::compaction_stats& stats) noexcept
+            compaction_type_options::scrub opts,
+            compaction_stats& stats) noexcept
         : sstables_compaction_task_impl(module, tasks::task_id::create_random_id(), 0, "table", std::move(keyspace), std::move(table), "", parent_id)
         , _db(db)
         , _opts(opts)
@@ -568,6 +583,7 @@ public:
     }
 protected:
     virtual future<> run() override;
+    virtual future<std::optional<double>> expected_total_workload() const override;
 };
 
 class reshaping_compaction_task_impl : public compaction_task_impl {
@@ -581,9 +597,7 @@ public:
             std::string entity,
             tasks::task_id parent_id) noexcept
         : compaction_task_impl(module, id, sequence_number, std::move(scope), std::move(keyspace), std::move(table), std::move(entity), parent_id)
-    {
-        // FIXME: add progress units
-    }
+    {}
 
     virtual std::string type() const override {
         return "reshaping compaction";
@@ -596,8 +610,8 @@ class table_reshaping_compaction_task_impl : public reshaping_compaction_task_im
 private:
     sharded<sstables::sstable_directory>& _dir;
     sharded<replica::database>& _db;
-    sstables::reshape_mode _mode;
-    sstables::compaction_sstable_creator_fn _creator;
+    reshape_mode _mode;
+    compaction_sstable_creator_fn _creator;
     std::function<bool (const sstables::shared_sstable&)> _filter;
 public:
     table_reshaping_compaction_task_impl(tasks::task_manager::module_ptr module,
@@ -605,8 +619,8 @@ public:
             std::string table,
             sharded<sstables::sstable_directory>& dir,
             sharded<replica::database>& db,
-            sstables::reshape_mode mode,
-            sstables::compaction_sstable_creator_fn creator,
+            reshape_mode mode,
+            compaction_sstable_creator_fn creator,
             std::function<bool (const sstables::shared_sstable&)> filter) noexcept
         : reshaping_compaction_task_impl(module, tasks::task_id::create_random_id(), module->new_sequence_number(), "table", std::move(keyspace), std::move(table), "", tasks::task_id::create_null_id())
         , _dir(dir)
@@ -623,12 +637,12 @@ class shard_reshaping_compaction_task_impl : public reshaping_compaction_task_im
 private:
     sstables::sstable_directory& _dir;
     sharded<replica::database>& _db;
-    sstables::reshape_mode _mode;
-    sstables::compaction_sstable_creator_fn _creator;
+    reshape_mode _mode;
+    compaction_sstable_creator_fn _creator;
     std::function<bool (const sstables::shared_sstable&)> _filter;
     uint64_t& _total_shard_size;
 
-    future<> reshape_compaction_group(compaction::table_state& t, std::unordered_set<sstables::shared_sstable>& sstables_in_cg, replica::column_family& table, const tasks::task_info& info);
+    future<> reshape_compaction_group(compaction::compaction_group_view& t, std::unordered_set<sstables::shared_sstable>& sstables_in_cg, replica::column_family& table, const tasks::task_info& info);
 public:
     shard_reshaping_compaction_task_impl(tasks::task_manager::module_ptr module,
             std::string keyspace,
@@ -636,8 +650,8 @@ public:
             tasks::task_id parent_id,
             sstables::sstable_directory& dir,
             sharded<replica::database>& db,
-            sstables::reshape_mode mode,
-            sstables::compaction_sstable_creator_fn creator,
+            reshape_mode mode,
+            compaction_sstable_creator_fn creator,
             std::function<bool (const sstables::shared_sstable&)> filter,
             uint64_t& total_shard_size) noexcept
         : reshaping_compaction_task_impl(module, tasks::task_id::create_random_id(), 0, "shard", std::move(keyspace), std::move(table), "", parent_id)
@@ -664,9 +678,7 @@ public:
             std::string entity,
             tasks::task_id parent_id) noexcept
         : compaction_task_impl(module, id, sequence_number, std::move(scope), std::move(keyspace), std::move(table), std::move(entity), parent_id)
-    {
-        // FIXME: add progress units
-    }
+    {}
 
     virtual std::string type() const override {
         return "resharding compaction";
@@ -679,7 +691,7 @@ class table_resharding_compaction_task_impl : public resharding_compaction_task_
 private:
     sharded<sstables::sstable_directory>& _dir;
     sharded<replica::database>& _db;
-    sstables::compaction_sstable_creator_fn _creator;
+    compaction_sstable_creator_fn _creator;
     compaction::owned_ranges_ptr _owned_ranges_ptr;
 public:
     table_resharding_compaction_task_impl(tasks::task_manager::module_ptr module,
@@ -687,7 +699,7 @@ public:
             std::string table,
             sharded<sstables::sstable_directory>& dir,
             sharded<replica::database>& db,
-            sstables::compaction_sstable_creator_fn creator,
+            compaction_sstable_creator_fn creator,
             compaction::owned_ranges_ptr owned_ranges_ptr) noexcept
         : resharding_compaction_task_impl(module, tasks::task_id::create_random_id(), module->new_sequence_number(), "table", std::move(keyspace), std::move(table), "", tasks::task_id::create_null_id())
         , _dir(dir)
@@ -697,13 +709,14 @@ public:
     {}
 protected:
     virtual future<> run() override;
+    virtual future<std::optional<double>> expected_total_workload() const override;
 };
 
 class shard_resharding_compaction_task_impl : public resharding_compaction_task_impl {
 private:
     sharded<sstables::sstable_directory>& _dir;
     replica::database& _db;
-    sstables::compaction_sstable_creator_fn _creator;
+    compaction_sstable_creator_fn _creator;
     compaction::owned_ranges_ptr _local_owned_ranges_ptr;
     std::vector<replica::reshard_shard_descriptor>& _destinations;
 public:
@@ -713,18 +726,12 @@ public:
             tasks::task_id parent_id,
             sharded<sstables::sstable_directory>& dir,
             replica::database& db,
-            sstables::compaction_sstable_creator_fn creator,
+            compaction_sstable_creator_fn creator,
             compaction::owned_ranges_ptr local_owned_ranges_ptr,
-            std::vector<replica::reshard_shard_descriptor>& destinations) noexcept
-        : resharding_compaction_task_impl(module, tasks::task_id::create_random_id(), 0, "shard", std::move(keyspace), std::move(table), "", parent_id)
-        , _dir(dir)
-        , _db(db)
-        , _creator(std::move(creator))
-        , _local_owned_ranges_ptr(std::move(local_owned_ranges_ptr))
-        , _destinations(destinations)
-    {}
+            std::vector<replica::reshard_shard_descriptor>& destinations) noexcept;
 protected:
     virtual future<> run() override;
+    virtual future<std::optional<double>> expected_total_workload() const override;
 };
 
 class task_manager_module : public tasks::task_manager::module {
@@ -742,9 +749,7 @@ public:
             std::string entity,
             tasks::task_id parent_id) noexcept
         : compaction_task_impl(module, id, sequence_number, "compaction group", std::move(keyspace), std::move(table), std::move(entity), parent_id)
-    {
-        // FIXME: add progress units
-    }
+    {}
 
     virtual std::string type() const override {
         return "regular compaction";

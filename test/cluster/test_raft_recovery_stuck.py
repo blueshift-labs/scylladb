@@ -40,7 +40,7 @@ async def test_recover_stuck_raft_recovery(request, manager: ManagerClient):
     """
     cfg = {'enable_user_defined_functions': False,
            'force_gossip_topology_changes': True,
-           'enable_tablets': False}
+           'tablets_mode_for_new_keyspaces': 'disabled'}
     servers = [await manager.server_add(config=cfg) for _ in range(3)]
     srv1, *others = servers
 
@@ -93,8 +93,10 @@ async def test_recover_stuck_raft_recovery(request, manager: ManagerClient):
     logging.info("Wait until everyone sees everyone as alive")
     await manager.servers_see_each_other(servers)
 
+    await reconnect_driver(manager)
+
     logging.info(f"{others} restarted, waiting until driver reconnects to them")
-    hosts = await wait_for_cql_and_get_hosts(cql, others, time.time() + 60)
+    cql, hosts = await manager.get_ready_cql(others)
 
     logging.info(f"Checking if {hosts} are in recovery state")
     for host in hosts:
@@ -119,8 +121,10 @@ async def test_recover_stuck_raft_recovery(request, manager: ManagerClient):
     logging.info(f"Restarting {others}")
     await manager.rolling_restart(others)
 
+    await reconnect_driver(manager)
+
     logging.info(f"Cluster restarted, waiting until driver reconnects to {others}")
-    hosts = await wait_for_cql_and_get_hosts(cql, others, time.time() + 60)
+    cql, hosts = await manager.get_ready_cql(others)
 
     logging.info(f"Driver reconnected, hosts: {hosts}, waiting until upgrade finishes")
     await asyncio.gather(*(wait_until_upgrade_finishes(cql, h, time.time() + 60) for h in hosts))

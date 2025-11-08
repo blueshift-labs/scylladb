@@ -8,12 +8,15 @@
 #include "readers/mutation_fragment_v1_stream.hh"
 #include <fmt/core.h>
 
+struct incremental_repair_meta;
+
 class repair_reader {
 public:
     enum class read_strategy {
         local,
         multishard_split,
-        multishard_filter
+        multishard_filter,
+        incremental_repair
     };
 
 private:
@@ -28,7 +31,7 @@ private:
     // Only needed for local readers, the multishard reader takes care
     // of pinning tables on used shards.
     std::optional<utils::phased_barrier::operation> _local_read_op;
-    std::optional<evictable_reader_handle_v2> _reader_handle;
+    std::optional<evictable_reader_handle> _reader_handle;
     // Fragment stream of either local or multishard reader for the range
     mutation_fragment_v1_stream _reader;
     // Current partition read from disk
@@ -42,7 +45,8 @@ private:
         read_strategy strategy,
         const dht::sharder& remote_sharder,
         unsigned remote_shard,
-        gc_clock::time_point compaction_time);
+        gc_clock::time_point compaction_time,
+        incremental_repair_meta inc);
 
 public:
     repair_reader(
@@ -55,7 +59,8 @@ public:
         unsigned remote_shard,
         uint64_t seed,
         read_strategy strategy,
-        gc_clock::time_point compaction_time);
+        gc_clock::time_point compaction_time,
+        incremental_repair_meta inc);
 
     future<mutation_fragment_opt>
     read_mutation_fragment();
@@ -90,6 +95,9 @@ template <> struct fmt::formatter<repair_reader::read_strategy>  : fmt::formatte
                 break;
             case multishard_filter:
                 name = "multishard_filter";
+                break;
+            case incremental_repair:
+                name = "incremental_repair";
                 break;
         };
         return formatter<string_view>::format(name, ctx);

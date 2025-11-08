@@ -6,9 +6,10 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/core/do_with.hh>
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include "sstables/sstables.hh"
 #include "test/lib/scylla_test_case.hh"
+#include <seastar/testing/test_fixture.hh>
 #include "schema/schema.hh"
 #include "replica/database.hh"
 #include "compaction/compaction_manager.hh"
@@ -18,6 +19,7 @@
 #include "test/lib/sstable_utils.hh"
 #include "test/lib/test_services.hh"
 #include "test/lib/test_utils.hh"
+#include "test/lib/gcs_fixture.hh"
 #include "db/config.hh"
 
 using namespace sstables;
@@ -50,7 +52,7 @@ void run_sstable_resharding_test(sstables::test_env& env) {
     auto cf = env.make_table_for_tests(s);
     auto close_cf = deferred_stop(cf);
     auto sst_gen = env.make_sst_factory(s, version);
-    std::unordered_map<shard_id, std::vector<mutation>> muts;
+    std::unordered_map<shard_id, utils::chunked_vector<mutation>> muts;
     static constexpr auto keys_per_shard = 1000u;
 
     // create sst shared by all shards
@@ -95,8 +97,8 @@ void run_sstable_resharding_test(sstables::test_env& env) {
 
     auto erm = cf->get_effective_replication_map();
 
-    auto descriptor = sstables::compaction_descriptor({sst}, 0, std::numeric_limits<uint64_t>::max());
-    descriptor.options = sstables::compaction_type_options::make_reshard();
+    auto descriptor = compaction::compaction_descriptor({sst}, 0, std::numeric_limits<uint64_t>::max());
+    descriptor.options = compaction::compaction_type_options::make_reshard();
     descriptor.sharder = &cf->schema()->get_sharder();
     descriptor.creator = [&env, &cf, version] (shard_id shard) mutable {
         // we need generation calculated by instance of cf at requested shard,
@@ -107,9 +109,9 @@ void run_sstable_resharding_test(sstables::test_env& env) {
 
         return env.make_sstable(cf->schema(), gen, version);
     };
-    auto cdata = compaction_manager::create_compaction_data();
-    compaction_progress_monitor progress_monitor;
-    auto res = sstables::compact_sstables(std::move(descriptor), cdata, cf.as_table_state(), progress_monitor).get();
+    auto cdata = compaction::compaction_manager::create_compaction_data();
+    compaction::compaction_progress_monitor progress_monitor;
+    auto res = compaction::compact_sstables(std::move(descriptor), cdata, cf.as_compaction_group_view(), progress_monitor).get();
     sst->destroy().get();
 
     auto new_sstables = std::move(res.new_sstables);
@@ -127,7 +129,7 @@ void run_sstable_resharding_test(sstables::test_env& env) {
         BOOST_REQUIRE(processed_shards.insert(shard).second == true); // check resharding created one sstable per shard.
         assert_sstable_computes_correct_owners(env, new_sst).get();
 
-        auto rd = assert_that(new_sst->as_mutation_source().make_reader_v2(s, env.make_reader_permit()));
+        auto rd = assert_that(new_sst->as_mutation_source().make_mutation_reader(s, env.make_reader_permit()));
         BOOST_REQUIRE(muts[shard].size() == keys_per_shard);
         for (auto k : std::views::iota(0u, keys_per_shard)) {
             rd.produces(muts[shard][k]);
@@ -149,8 +151,15 @@ SEASTAR_TEST_CASE(sstable_resharding_over_s3_test, *boost::unit_test::preconditi
     return sstables::test_env::do_with_async([] (auto& env) {
         run_sstable_resharding_test(env);
     }, test_env_config{
-        .storage = make_test_object_storage_options(),
-        .use_uuid = true,
+        .storage = make_test_object_storage_options("S3"),
+    });
+}
+
+SEASTAR_FIXTURE_TEST_CASE(sstable_resharding_over_gs_test, gcs_fixture, *tests::check_run_test_decorator("ENABLE_GCP_STORAGE_TEST", true)) {
+    return sstables::test_env::do_with_async([] (auto& env) {
+        run_sstable_resharding_test(env);
+    }, test_env_config{
+        .storage = make_test_object_storage_options("GS"),
     });
 }
 
@@ -171,7 +180,7 @@ SEASTAR_TEST_CASE(sstable_is_shared_correctness) {
             auto sst_gen = env.make_sst_factory(s, version);
 
             const auto keys = tests::generate_partition_keys(smp::count * 10, s);
-            std::vector<mutation> muts;
+            utils::chunked_vector<mutation> muts;
             for (auto& k : keys) {
                 muts.push_back(get_mutation(s, k, 0));
             }
@@ -188,7 +197,7 @@ SEASTAR_TEST_CASE(sstable_is_shared_correctness) {
             auto single_sharded_s = get_schema(1, cfg->murmur3_partitioner_ignore_msb_bits());
             auto sst_gen = env.make_sst_factory(single_sharded_s, version);
 
-            std::vector<mutation> muts;
+            utils::chunked_vector<mutation> muts;
             for (shard_id shard : std::views::iota(0u, smp::count)) {
                 const auto keys = tests::generate_partition_keys(10, key_s, shard);
                 for (auto& k : keys) {

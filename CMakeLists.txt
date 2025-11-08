@@ -49,7 +49,7 @@ include(limit_jobs)
 set(CMAKE_CXX_STANDARD "23" CACHE INTERNAL "")
 set(CMAKE_CXX_EXTENSIONS ON CACHE INTERNAL "")
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF CACHE INTERNAL "")
-set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
 if(is_multi_config)
     find_package(Seastar)
@@ -90,13 +90,13 @@ if(is_multi_config)
     add_dependencies(Seastar::seastar_testing Seastar)
 else()
     set(Seastar_TESTING ON CACHE BOOL "" FORCE)
-    set(Seastar_API_LEVEL 7 CACHE STRING "" FORCE)
+    set(Seastar_API_LEVEL 9 CACHE STRING "" FORCE)
     set(Seastar_DEPRECATED_OSTREAM_FORMATTERS OFF CACHE BOOL "" FORCE)
     set(Seastar_APPS ON CACHE BOOL "" FORCE)
     set(Seastar_EXCLUDE_APPS_FROM_ALL ON CACHE BOOL "" FORCE)
     set(Seastar_EXCLUDE_TESTS_FROM_ALL ON CACHE BOOL "" FORCE)
     set(Seastar_IO_URING ON CACHE BOOL "" FORCE)
-    set(Seastar_SCHEDULING_GROUPS_COUNT 19 CACHE STRING "" FORCE)
+    set(Seastar_SCHEDULING_GROUPS_COUNT 21 CACHE STRING "" FORCE)
     set(Seastar_UNUSED_RESULT_ERROR ON CACHE BOOL "" FORCE)
     add_subdirectory(seastar)
     target_compile_definitions (seastar
@@ -163,14 +163,6 @@ file(MAKE_DIRECTORY "${scylla_gen_build_dir}")
 include(add_version_library)
 generate_scylla_version()
 
-add_library(scylla-zstd STATIC
-    zstd.cc)
-target_link_libraries(scylla-zstd
-  PRIVATE
-    db
-    Seastar::seastar
-    zstd::libzstd)
-
 add_library(scylla-main STATIC)
 target_sources(scylla-main
   PRIVATE
@@ -178,32 +170,23 @@ target_sources(scylla-main
     bytes.cc
     client_data.cc
     clocks-impl.cc
-    collection_mutation.cc
-    compress.cc
-    converting_mutation_partition_applier.cc
-    counters.cc
-    direct_failure_detector/failure_detector.cc
-    duration.cc
+    sstable_dict_autotrainer.cc
     exceptions/exceptions.cc
-    frozen_schema.cc
-    generic_server.cc
     debug.cc
     init.cc
-    keys.cc
-    multishard_mutation_query.cc
+    keys/keys.cc
     mutation_query.cc
     node_ops/task_manager_module.cc
     partition_slice_builder.cc
-    querier.cc
-    query.cc
+    query/query.cc
     query_ranges_to_vnodes.cc
-    query-result-set.cc
+    query/query-result-set.cc
     tombstone_gc_options.cc
     tombstone_gc.cc
     reader_concurrency_semaphore.cc
     reader_concurrency_semaphore_group.cc
-    schema_mutations.cc
     serializer.cc
+    service/direct_failure_detector/failure_detector.cc
     sstables_loader.cc
     table_helper.cc
     tasks/task_handler.cc
@@ -214,7 +197,6 @@ target_sources(scylla-main
     vint-serialization.cc)
 target_link_libraries(scylla-main
   PRIVATE
-    "$<LINK_LIBRARY:WHOLE_ARCHIVE,scylla-zstd>"
     db
     absl::headers
     absl::btree
@@ -280,7 +262,6 @@ add_subdirectory(mutation)
 add_subdirectory(mutation_writer)
 add_subdirectory(node_ops)
 add_subdirectory(readers)
-add_subdirectory(redis)
 add_subdirectory(replica)
 add_subdirectory(raft)
 add_subdirectory(repair)
@@ -295,6 +276,7 @@ add_subdirectory(tracing)
 add_subdirectory(transport)
 add_subdirectory(types)
 add_subdirectory(utils)
+add_subdirectory(vector_search)
 add_version_library(scylla_version
     release.cc)
 
@@ -324,7 +306,6 @@ set(scylla_libs
     mutation_writer
     raft
     readers
-    redis
     repair
     replica
     schema
@@ -337,7 +318,8 @@ set(scylla_libs
     tracing
     transport
     types
-    utils)
+    utils
+    vector_search)
 target_link_libraries(scylla PRIVATE
     ${scylla_libs})
 
@@ -371,3 +353,6 @@ endif()
 if(Scylla_BUILD_INSTRUMENTED)
   add_subdirectory(pgo)
 endif()
+
+add_executable(patchelf
+  tools/patchelf.cc)

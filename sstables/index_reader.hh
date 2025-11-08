@@ -7,7 +7,6 @@
  */
 
 #pragma once
-#include "utils/assert.hh"
 #include "sstables.hh"
 #include "consumer.hh"
 #include "downsampling.hh"
@@ -19,6 +18,7 @@
 #include "sstables/scanning_clustered_index_cursor.hh"
 #include "sstables/mx/bsearch_clustered_cursor.hh"
 #include "sstables/sstables_manager.hh"
+#include "abstract_index_reader.hh"
 
 namespace sstables {
 
@@ -394,13 +394,6 @@ public:
     }
 };
 
-// Stores information about open end RT marker
-// of the lower index bound
-struct open_rt_marker {
-    position_in_partition pos;
-    tombstone tomb;
-};
-
 // Contains information about index_reader position in the index file
 struct index_bound {
     index_bound() = default;
@@ -443,7 +436,7 @@ struct index_bound {
 // Upper cursor can only be advanced along with the lower cursor and not accessed from outside.
 //
 // If eof() then the lower bound cursor is positioned past all partitions in the sstable.
-class index_reader {
+class index_reader final : public abstract_index_reader {
     shared_sstable _sstable;
     reader_permit _permit;
     tracing::trace_state_ptr _trace_state;
@@ -455,12 +448,12 @@ class index_reader {
     bool _single_page_read;
     abort_source _abort;
 
-    std::unique_ptr<index_consume_entry_context<index_consumer>> make_context(uint64_t begin, uint64_t end, index_consumer& consumer) {
+    future<std::unique_ptr<index_consume_entry_context<index_consumer>>> make_context(uint64_t begin, uint64_t end, index_consumer& consumer) {
         auto index_file = make_tracked_index_file(*_sstable, _permit, _trace_state, _use_caching);
-        auto input = make_file_input_stream(index_file, begin, (_single_page_read ? end : _sstable->index_size()) - begin,
-                        get_file_input_stream_options());
+        auto input = input_stream<char>(co_await _sstable->get_storage().make_data_or_index_source(
+            *_sstable, component_type::Index, index_file, begin, (_single_page_read ? end : _sstable->index_size()) - begin, get_file_input_stream_options()));
         auto trust_pi = trust_promoted_index(_sstable->has_correct_promoted_index_entries());
-        return std::make_unique<index_consume_entry_context<index_consumer>>(*_sstable, _permit, consumer, trust_pi, std::move(input),
+        co_return std::make_unique<index_consume_entry_context<index_consumer>>(*_sstable, _permit, consumer, trust_pi, std::move(input),
                             begin, end - begin, _sstable->get_column_translation(), _abort, _trace_state);
     }
 
@@ -468,12 +461,12 @@ class index_reader {
         assert(!bound.context || !_single_page_read);
         if (!bound.context) {
             bound.consumer = std::make_unique<index_consumer>(_region, _sstable->get_schema());
-            bound.context = make_context(begin, end, *bound.consumer);
+            bound.context = co_await make_context(begin, end, *bound.consumer);
             bound.consumer->prepare(quantity);
-            return make_ready_future<>();
+            co_return;
         }
         bound.consumer->prepare(quantity);
-        return bound.context->fast_forward_to(begin, end);
+        co_return co_await bound.context->fast_forward_to(begin, end);
     }
 
 private:
@@ -507,7 +500,7 @@ private:
     // Must be called for non-decreasing summary_idx.
     future<> advance_to_page(index_bound& bound, uint64_t summary_idx) {
         sstlog.trace("index {}: advance_to_page({}), bound {}", fmt::ptr(this), summary_idx, fmt::ptr(&bound));
-        SCYLLA_ASSERT(!bound.current_list || bound.current_summary_idx <= summary_idx);
+        parse_assert(!bound.current_list || bound.current_summary_idx <= summary_idx, _sstable->index_filename());
         if (bound.current_list && bound.current_summary_idx == summary_idx) {
             sstlog.trace("index {}: same page", fmt::ptr(this));
             return make_ready_future<>();
@@ -607,7 +600,7 @@ private:
 
     // Valid if partition_data_ready(bound)
     index_entry& current_partition_entry(index_bound& bound) {
-        SCYLLA_ASSERT(bound.current_list);
+        parse_assert(bool(bound.current_list), _sstable->index_filename());
         return *bound.current_list->_entries[bound.current_index_idx];
     }
 
@@ -672,7 +665,7 @@ private:
         // is no G in that bucket so we read the following one to get the
         // position (see the advance_to_page() call below). After we've got it, it's time to
         // get J] position. Again, summary points us to the first bucket and we
-        // hit an SCYLLA_ASSERT since the reader is already at the second bucket and we
+        // hit an parse_assert since the reader is already at the second bucket and we
         // cannot go backward.
         // The solution is this condition above. If our lookup requires reading
         // the previous bucket we assume that the entry doesn't exist and return
@@ -719,14 +712,14 @@ public:
     // current partition.
     //
     // Must be called only when !eof().
-    future<> advance_upper_past(position_in_partition_view pos) {
+    future<> advance_upper_past(position_in_partition_view pos) override {
         sstlog.trace("index {}: advance_upper_past({})", fmt::ptr(this), pos);
 
         // We advance cursor within the current lower bound partition
         // So need to make sure first that it is read
         if (!partition_data_ready(_lower_bound)) {
             return read_partition_data().then([this, pos] {
-                SCYLLA_ASSERT(partition_data_ready());
+                parse_assert(partition_data_ready(), _sstable->index_filename());
                 return advance_upper_past(pos);
             });
         }
@@ -803,18 +796,18 @@ public:
 
     // Ensures that partition_data_ready() returns true.
     // Can be called only when !eof()
-    future<> read_partition_data() {
-        SCYLLA_ASSERT(!eof());
+    future<> read_partition_data() override {
+        parse_assert(!eof(), _sstable->index_filename());
         if (partition_data_ready(_lower_bound)) {
             return make_ready_future<>();
         }
         // The only case when _current_list may be missing is when the cursor is at the beginning
-        SCYLLA_ASSERT(_lower_bound.current_summary_idx == 0);
+        parse_assert(_lower_bound.current_summary_idx == 0, _sstable->index_filename());
         return advance_to_page(_lower_bound, 0);
     }
 
     // Advance index_reader bounds to the bounds of the supplied range
-    future<> advance_to(const dht::partition_range& range) {
+    future<> advance_to(const dht::partition_range& range) override {
         return seastar::when_all_succeed(
             advance_lower_to_start(range),
             advance_upper_to_end(range)).discard_result();
@@ -861,13 +854,13 @@ public:
     // Returns tombstone for the current partition if it was recorded in the sstable.
     // It may be unavailable for old sstables for which this information was not generated.
     // Can be called only when partition_data_ready().
-    std::optional<sstables::deletion_time> partition_tombstone() {
+    std::optional<sstables::deletion_time> partition_tombstone() override {
         return current_partition_entry(_lower_bound).get_deletion_time();
     }
 
     // Returns the key for current partition.
     // Can be called only when partition_data_ready().
-    partition_key get_partition_key() {
+    std::optional<partition_key> get_partition_key() override {
         return _alloc_section(_region, [this] {
             index_entry& e = current_partition_entry(_lower_bound);
             return e.get_key().to_partition_key(*_sstable->_schema);
@@ -888,8 +881,24 @@ public:
         return e.get_promoted_index_size();
     }
 
-    bool partition_data_ready() const {
+    bool partition_data_ready() const override {
         return partition_data_ready(_lower_bound);
+    }
+
+    // Advances some internals lower bound (the clustered cursor),
+    // in order to warm up some caches.
+    //
+    // Does not move the lower bound, but counts as a position-changing
+    // call for the "must be called for non-decreasing positions" conditions.
+    //
+    // Must be called only after advanced to some partition and !eof().
+    // Must be called for non-decreasing positions.
+    future<> prefetch_lower_bound(position_in_partition_view pos) override {
+        clustered_index_cursor *cur = current_clustered_cursor();
+        if (cur) {
+            return cur->advance_to(pos).discard_result();
+        }
+        return make_ready_future<>();
     }
 
     // Forwards the cursor to the given position in the current partition.
@@ -900,7 +909,7 @@ public:
     //
     // Must be called for non-decreasing positions.
     // Must be called only after advanced to some partition and !eof().
-    future<> advance_to(position_in_partition_view pos) {
+    future<> advance_to(position_in_partition_view pos) override {
         sstlog.trace("index {}: advance_to({}), current data_file_pos={}",
                  fmt::ptr(this), pos, _lower_bound.data_file_position);
 
@@ -912,7 +921,7 @@ public:
         if (!partition_data_ready()) {
             return read_partition_data().then([this, pos] {
                 sstlog.trace("index {}: page done", fmt::ptr(this));
-                SCYLLA_ASSERT(partition_data_ready(_lower_bound));
+                parse_assert(partition_data_ready(_lower_bound), _sstable->index_filename());
                 return advance_to(pos);
             });
         }
@@ -943,9 +952,17 @@ public:
         });
     }
 
+    future<> advance_past_definitely_present_partition(const dht::decorated_key& dk) override {
+        return advance_to(_lower_bound, dht::ring_position_view::for_after_key(dk));
+    }
+
+    future<> advance_to_definitely_present_partition(const dht::decorated_key& dk) override {
+        return advance_to(_lower_bound, dht::ring_position_view(dk, dht::ring_position_view::after_key::no));
+    }
+
     // Like advance_to(dht::ring_position_view), but returns information whether the key was found
     // If upper_bound is provided, the upper bound within position is looked up
-    future<bool> advance_lower_and_check_if_present(dht::ring_position_view key) {
+    future<bool> advance_lower_and_check_if_present(dht::ring_position_view key) override {
         utils::get_local_injector().inject("advance_lower_and_check_if_present", [] { throw std::runtime_error("advance_lower_and_check_if_present"); });
         return advance_to(_lower_bound, key).then([this, key] {
             if (eof()) {
@@ -960,11 +977,14 @@ public:
             });
         });
     }
+    future<bool> advance_lower_and_check_if_present(dht::ring_position_view key, const utils::hashed_key&) override {
+        return advance_lower_and_check_if_present(key);
+    }
 
     // Advances the upper bound to the partition immediately following the partition of the lower bound.
     //
     // Precondition: the sstable version is >= mc.
-    future<> advance_reverse_to_next_partition() {
+    future<> advance_reverse_to_next_partition() override {
         return advance_reverse(position_in_partition_view::after_all_clustered_rows());
     }
 
@@ -974,7 +994,7 @@ public:
     // Supports advancing backwards (i.e. `pos` can be smaller than the previous upper bound position).
     //
     // Precondition: the sstable version is >= mc.
-    future<> advance_reverse(position_in_partition_view pos) {
+    future<> advance_reverse(position_in_partition_view pos) override {
         if (eof()) {
             return make_ready_future<>();
         }
@@ -993,7 +1013,7 @@ public:
         // so need to make sure first that the lower bound partition data is in memory.
         if (!partition_data_ready(_lower_bound)) {
             return read_partition_data().then([this, pos] {
-                SCYLLA_ASSERT(partition_data_ready());
+                parse_assert(partition_data_ready(), _sstable->index_filename());
                 return advance_reverse(pos);
             });
         }
@@ -1037,8 +1057,8 @@ public:
     // in the current partition or nullopt if there are no blocks in the current partition.
     //
     // Preconditions: sstable version >= mc, partition_data_ready().
-    future<std::optional<uint64_t>> last_block_offset() {
-        SCYLLA_ASSERT(partition_data_ready());
+    future<std::optional<uint64_t>> last_block_offset() override {
+        parse_assert(partition_data_ready(), _sstable->index_filename());
 
         auto cur = current_clustered_cursor();
         if (!cur) {
@@ -1059,24 +1079,13 @@ public:
 
     // Moves the cursor to the beginning of next partition.
     // Can be called only when !eof().
-    future<> advance_to_next_partition() {
+    future<> advance_to_next_partition() override {
         return advance_to_next_partition(_lower_bound);
     }
 
-    // Positions the cursor on the first partition which is not smaller than pos (like std::lower_bound).
-    // Must be called for non-decreasing positions.
-    future<> advance_to(dht::ring_position_view pos) {
-        return advance_to(_lower_bound, pos);
-    }
-
-    struct data_file_positions_range {
-        uint64_t start;
-        std::optional<uint64_t> end;
-    };
-
     // Returns positions in the data file of the cursor.
     // End position may be unset
-    data_file_positions_range data_file_positions() const {
+    data_file_positions_range data_file_positions() const override {
         data_file_positions_range result;
         result.start = _lower_bound.data_file_position;
         if (_upper_bound) {
@@ -1086,25 +1095,25 @@ public:
     }
 
     // Returns the kind of sstable element the cursor is pointing at.
-    indexable_element element_kind() const {
+    indexable_element element_kind() const override {
         return _lower_bound.element;
     }
 
-    std::optional<open_rt_marker> end_open_marker() const {
+    std::optional<open_rt_marker> end_open_marker() const override {
         return _lower_bound.end_open_marker;
     }
 
-    std::optional<open_rt_marker> reverse_end_open_marker() const {
+    std::optional<open_rt_marker> reverse_end_open_marker() const override {
         return _upper_bound->end_open_marker;
     }
 
-    bool eof() const {
+    bool eof() const override {
         return bound_eof(_lower_bound);
     }
 
     const shared_sstable& sstable() const { return _sstable; }
 
-    future<> close() noexcept {
+    future<> close() noexcept override {
         // index_bound::close must not fail
         auto close_lb = close(_lower_bound);
         auto close_ub = _upper_bound ? close(*_upper_bound) : make_ready_future<>();

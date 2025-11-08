@@ -219,44 +219,17 @@ using uexpression = uninitialized<expression>;
         return token->getText();
     }
 
+    error_sink_fn get_error_sink() {
+        return [this] (const std::string& msg) { add_recognition_error(msg); };
+    }
+
     std::map<sstring, sstring> convert_property_map(const collection_constructor& map) {
-        if (map.elements.empty()) {
-            return std::map<sstring, sstring>{};
-        }
-        std::map<sstring, sstring> res;
-        for (auto&& entry : map.elements) {
-            auto entry_tuple = expr::as_if<tuple_constructor>(&entry);
-            // Because the parser tries to be smart and recover on error (to
-            // allow displaying more than one error I suppose), we have default-constructed
-            // entries in map.elements. Just skip those, a proper error will be thrown in the end.
-            if (!entry_tuple || entry_tuple->elements.size() != 2) {
-                break;
-            }
-            auto left = expr::as_if<untyped_constant>(&entry_tuple->elements[0]);
-            if (!left) {
-                sstring msg = fmt::format("Invalid property name: {}", entry_tuple->elements[0]);
-                if (expr::is<bind_variable>(entry_tuple->elements[0])) {
-                    msg += " (bind variables are not supported in DDL queries)";
-                }
-                add_recognition_error(msg);
-                break;
-            }
-            auto right = expr::as_if<untyped_constant>(&entry_tuple->elements[1]);
-            if (!right) {
-                sstring msg = fmt::format("Invalid property value: {} for property: {}", entry_tuple->elements[0], entry_tuple->elements[1]);
-                if (expr::is<bind_variable>(entry_tuple->elements[1])) {
-                    msg += " (bind variables are not supported in DDL queries)";
-                }
-                add_recognition_error(msg);
-                break;
-            }
-            if (!res.emplace(left->raw_text, right->raw_text).second) {
-                sstring msg = fmt::format("Multiple definition for property {}", left->raw_text);
-                add_recognition_error(msg);
-                break;
-            }
-        }
-        return res;
+        return cql3::expr::convert_property_map(map, get_error_sink());
+    }
+
+    property_definitions::extended_map_type
+    convert_extended_property_map(const collection_constructor& map) {
+        return cql3::expr::convert_extended_property_map(map, get_error_sink());
     }
 
     sstring to_lower(std::string_view s) {
@@ -413,6 +386,7 @@ selectStatement returns [std::unique_ptr<raw::select_statement> expr]
         bool bypass_cache = false;
         auto attrs = std::make_unique<cql3::attributes::raw>();
         expression wclause = conjunction{};
+        bool is_ann_ordering = false;
     }
     : K_SELECT (
                 ( K_JSON { statement_subtype = raw::select_statement::parameters::statement_subtype::JSON; } )?
@@ -425,7 +399,7 @@ selectStatement returns [std::unique_ptr<raw::select_statement> expr]
              )
       ( K_WHERE w=whereClause { wclause = std::move(w); } )?
       ( K_GROUP K_BY gbcolumns=listOfIdentifiers)?
-      ( K_ORDER K_BY orderByClause[orderings] ( ',' orderByClause[orderings] )* )?
+      ( K_ORDER K_BY orderByClause[orderings, is_ann_ordering] ( ',' orderByClause[orderings, is_ann_ordering] )* )?
       ( K_PER K_PARTITION K_LIMIT rows=intValue { per_partition_limit = std::move(rows); } )?
       ( K_LIMIT rows=intValue { limit = std::move(rows); } )?
       ( K_ALLOW K_FILTERING  { allow_filtering = true; } )?
@@ -484,11 +458,37 @@ whereClause returns [uexpression clause]
         { clause = conjunction{std::move(terms)}; }
     ;
 
-orderByClause[raw::select_statement::parameters::orderings_type& orderings]
+orderByClause[raw::select_statement::parameters::orderings_type& orderings, bool& is_ann_ordering]
     @init{
         raw::select_statement::ordering ordering = raw::select_statement::ordering::ascending;
+        std::optional<expression> ann_ordering;
     }
-    : c=cident (K_ASC | K_DESC { ordering = raw::select_statement::ordering::descending; })? { orderings.emplace_back(c, ordering); }
+    : c=cident (K_ANN K_OF t=term {ann_ordering=std::move(t);})? (K_ASC | K_DESC { ordering = raw::select_statement::ordering::descending; })?
+    {
+        if (!ann_ordering) {
+            if (is_ann_ordering) {
+                throw exceptions::invalid_request_exception(
+                    "ANN ordering does not support any other ordering");
+            }
+            orderings.emplace_back(c, ordering);
+        } else {
+            if (ordering != raw::select_statement::ordering::ascending) {
+                throw exceptions::invalid_request_exception(
+                    "Descending ANN ordering is not supported");
+            }
+            if (!orderings.empty()) {
+                if (is_ann_ordering) {
+                    throw exceptions::invalid_request_exception(
+                        "Cannot specify more than one ANN ordering");
+                } else {
+                    throw exceptions::invalid_request_exception(
+                        "ANN ordering does not support any other ordering");
+                }
+            }
+            is_ann_ordering = true;
+            orderings.emplace_back(c, ann_ordering.value());
+        }
+    }
     ;
 
 jsonValue returns [uexpression value]
@@ -841,7 +841,7 @@ createKeyspaceStatement returns [std::unique_ptr<cql3::statements::create_keyspa
         bool if_not_exists = false;
     }
     : K_CREATE K_KEYSPACE (K_IF K_NOT K_EXISTS { if_not_exists = true; } )? ks=keyspaceName
-      K_WITH properties[*attrs] { $expr = std::make_unique<cql3::statements::create_keyspace_statement>(ks, attrs, if_not_exists); }
+      ( K_WITH properties[*attrs] )? { $expr = std::make_unique<cql3::statements::create_keyspace_statement>(ks, attrs, if_not_exists); }
     ;
 
 /**
@@ -1197,7 +1197,7 @@ listPermissionsStatement returns [std::unique_ptr<list_permissions_statement> st
     ;
 
 permission returns [auth::permission perm = auth::permission{}]
-    : p=(K_CREATE | K_ALTER | K_DROP | K_SELECT | K_MODIFY | K_AUTHORIZE | K_DESCRIBE | K_EXECUTE)
+    : p=(K_CREATE | K_ALTER | K_DROP | K_SELECT | K_MODIFY | K_AUTHORIZE | K_DESCRIBE | K_EXECUTE | K_VECTOR_SEARCH_INDEXING)
     { $perm = auth::permissions::from_string($p.text); }
     ;
 
@@ -1807,7 +1807,7 @@ properties[cql3::statements::property_definitions& props]
 
 property[cql3::statements::property_definitions& props]
     : k=ident '=' simple=propertyValue { try { $props.add_property(k->to_string(), simple); } catch (exceptions::syntax_exception e) { add_recognition_error(e.what()); } }
-    | k=ident '=' map=mapLiteral { try { $props.add_property(k->to_string(), convert_property_map(map)); } catch (exceptions::syntax_exception e) { add_recognition_error(e.what()); } }
+    | k=ident '=' map=mapLiteral { try { $props.add_property(k->to_string(), convert_extended_property_map(map)); } catch (exceptions::syntax_exception e) { add_recognition_error(e.what()); } }
     ;
 
 propertyValue returns [sstring str]
@@ -2243,6 +2243,7 @@ K_ORDER:       O R D E R;
 K_BY:          B Y;
 K_ASC:         A S C;
 K_DESC:        D E S C;
+K_ANN:         A N N;
 K_ALLOW:       A L L O W;
 K_FILTERING:   F I L T E R I N G;
 K_IF:          I F;
@@ -2369,6 +2370,8 @@ K_PRUNE:       P R U N E;
 K_EXECUTE:     E X E C U T E;
 
 K_MUTATION_FRAGMENTS:    M U T A T I O N '_' F R A G M E N T S;
+
+K_VECTOR_SEARCH_INDEXING: V E C T O R '_' S E A R C H '_' I N D E X I N G;
 
 // Case-insensitive alpha characters
 fragment A: ('a'|'A');

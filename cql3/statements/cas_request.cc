@@ -44,7 +44,7 @@ std::optional<mutation> cas_request::apply_updates(api::timestamp_type ts) const
     for (const cas_row_update& op: _updates) {
         update_parameters params(_schema, op.options, ts, op.statement.get_time_to_live(op.options), _rows);
 
-        std::vector<mutation> statement_mutations = op.statement.apply_updates(_key, op.ranges, params, op.json_cache);
+        auto statement_mutations = op.statement.apply_updates(_key, op.ranges, params, op.json_cache);
         // Append all mutations (in fact only one) to the consolidated one.
         for (mutation& m : statement_mutations) {
             if (mutation_set.has_value() == false) {
@@ -113,7 +113,7 @@ bool cas_request::applies_to() const {
 }
 
 std::optional<mutation> cas_request::apply(foreign_ptr<lw_shared_ptr<query::result>> qr,
-        const query::partition_slice& slice, api::timestamp_type ts) {
+        const query::partition_slice& slice, api::timestamp_type ts, cdc::per_request_options&) {
     _rows = update_parameters::build_prefetch_data(_schema, *qr, slice);
     if (applies_to()) {
         return apply_updates(ts);

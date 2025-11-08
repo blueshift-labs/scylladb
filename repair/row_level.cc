@@ -9,6 +9,8 @@
 #include <exception>
 #include <fmt/ranges.h>
 #include <seastar/util/defer.hh>
+#include "dht/auto_refreshing_sharder.hh"
+#include "db/view/view_building_worker.hh"
 #include "gms/endpoint_state.hh"
 #include "repair/repair.hh"
 #include "message/messaging_service.hh"
@@ -50,7 +52,7 @@
 #include "service/storage_proxy.hh"
 #include "db/batchlog_manager.hh"
 #include "idl/repair.dist.hh"
-#include "readers/empty_v2.hh"
+#include "readers/empty.hh"
 #include "readers/evictable.hh"
 #include "readers/queue.hh"
 #include "readers/filtering.hh"
@@ -60,8 +62,12 @@
 #include "repair/row.hh"
 #include "repair/writer.hh"
 #include "repair/reader.hh"
+#include "repair/incremental.hh"
 #include "compaction/compaction_manager.hh"
 #include "utils/xx_hasher.hh"
+#include "utils/error_injection.hh"
+#include "locator/tablets.hh"
+#include "gms/feature_service.hh"
 
 extern logging::logger rlogger;
 
@@ -188,6 +194,9 @@ struct row_level_repair_metrics {
     uint64_t row_from_disk_bytes{0};
     uint64_t tx_hashes_nr{0};
     uint64_t rx_hashes_nr{0};
+    uint64_t inc_sst_skipped_bytes{0};
+    uint64_t inc_sst_read_bytes{0};
+    uint64_t tablet_time_ms{0};
     row_level_repair_metrics() {
         namespace sm = seastar::metrics;
         _metrics.add_group("repair", {
@@ -207,6 +216,12 @@ struct row_level_repair_metrics {
                             sm::description("Total number of rows read from disk on this shard.")),
             sm::make_counter("row_from_disk_bytes", row_from_disk_bytes,
                             sm::description("Total bytes of rows read from disk on this shard.")),
+            sm::make_counter("inc_sst_skipped_bytes", inc_sst_skipped_bytes,
+                            sm::description("Total number of bytes skipped from sstables for incremental repair on this shard.")),
+            sm::make_counter("inc_sst_read_bytes", inc_sst_read_bytes,
+                            sm::description("Total number of bytes read from sstables for incremental repair on this shard.")),
+            sm::make_counter("tablet_time_ms", tablet_time_ms,
+                            sm::description("Time spent on tablet repair on this shard in milliseconds.")),
         });
     }
 };
@@ -271,7 +286,8 @@ mutation_reader repair_reader::make_reader(
     read_strategy strategy,
     const dht::sharder& remote_sharder,
     unsigned remote_shard,
-    gc_clock::time_point compaction_time) {
+    gc_clock::time_point compaction_time,
+    incremental_repair_meta inc) {
     switch (strategy) {
         case read_strategy::local: {
             auto ms = mutation_source([&cf, compaction_time] (
@@ -285,7 +301,7 @@ mutation_reader repair_reader::make_reader(
                 return cf.make_streaming_reader(std::move(s), std::move(permit), pr, ps, fwd_mr, compaction_time);
             });
             mutation_reader rd(nullptr);
-            std::tie(rd, _reader_handle) = make_manually_paused_evictable_reader_v2(
+            std::tie(rd, _reader_handle) = make_manually_paused_evictable_reader(
                 std::move(ms),
                 _schema,
                 _permit,
@@ -318,6 +334,9 @@ mutation_reader repair_reader::make_reader(
                     return remote_sharder.shard_for_reads(k.token()) == remote_shard;
                 });
         }
+        case read_strategy::incremental_repair: {
+            return cf.make_streaming_reader(_schema, _permit, _range, inc.sst_set, gc_clock::now());
+        }
         default:
             on_internal_error(rlogger,
                 format("make_reader: unexpected read_strategy {}", static_cast<int>(strategy)));
@@ -334,14 +353,15 @@ repair_reader::repair_reader(
     unsigned remote_shard,
     uint64_t seed,
     read_strategy strategy,
-    gc_clock::time_point compaction_time)
+    gc_clock::time_point compaction_time,
+    incremental_repair_meta inc)
     : _schema(s)
     , _permit(std::move(permit))
     , _range(dht::to_partition_range(range))
     , _sharder(remote_sharder, range, remote_shard)
     , _seed(seed)
     , _local_read_op(strategy == read_strategy::local ? std::optional(cf.read_in_progress()) : std::nullopt)
-    , _reader(make_reader(db, cf, strategy, remote_sharder, remote_shard, compaction_time))
+    , _reader(make_reader(db, cf, strategy, remote_sharder, remote_shard, compaction_time, inc))
 { }
 
 future<mutation_fragment_opt>
@@ -365,7 +385,7 @@ repair_reader::read_mutation_fragment() {
 future<> repair_reader::on_end_of_stream() noexcept {
     co_await _reader.close();
     _permit.release_base_resources();
-    _reader = mutation_fragment_v1_stream(make_empty_flat_reader_v2(_schema, _permit));
+    _reader = mutation_fragment_v1_stream(make_empty_mutation_reader(_schema, _permit));
     _reader_handle.reset();
 }
 
@@ -397,29 +417,35 @@ void repair_reader::pause() {
 
 class repair_writer_impl : public repair_writer::impl {
     schema_ptr _schema;
+    std::optional<int64_t> _repaired_at;
     reader_permit _permit;
     std::optional<future<>> _writer_done;
     mutation_fragment_queue _mq;
     sharded<replica::database>& _db;
     db::view::view_builder& _view_builder;
+    sharded<db::view::view_building_worker>& _view_building_worker;
     streaming::stream_reason _reason;
     mutation_reader _queue_reader;
     service::frozen_topology_guard _topo_guard;
 public:
     repair_writer_impl(
         schema_ptr schema,
+        std::optional<int64_t> repaired_at,
         reader_permit permit,
         sharded<replica::database>& db,
         db::view::view_builder& view_builder,
+        sharded<db::view::view_building_worker>& view_building_worker,
         streaming::stream_reason reason,
         mutation_fragment_queue queue,
         mutation_reader queue_reader,
         service::frozen_topology_guard topo_guard)
         : _schema(std::move(schema))
+        , _repaired_at(repaired_at)
         , _permit(std::move(permit))
         , _mq(std::move(queue))
         , _db(db)
         , _view_builder(view_builder)
+        , _view_building_worker(view_building_worker)
         , _reason(reason)
         , _queue_reader(std::move(queue_reader))
         , _topo_guard(topo_guard)
@@ -463,9 +489,9 @@ future<> repair_writer::write_start_and_mf(lw_shared_ptr<const decorated_key_wit
 };
 
 class queue_reader_handle_adapter : public mutation_fragment_queue::impl {
-    queue_reader_handle_v2 _handle;
+    queue_reader_handle _handle;
 public:
-    queue_reader_handle_adapter(queue_reader_handle_v2 handle)
+    queue_reader_handle_adapter(queue_reader_handle handle)
         : _handle(std::move(handle))
     {}
 
@@ -482,8 +508,41 @@ public:
     }
 };
 
-mutation_fragment_queue make_mutation_fragment_queue(schema_ptr s, reader_permit permit, queue_reader_handle_v2 handle) {
+mutation_fragment_queue make_mutation_fragment_queue(schema_ptr s, reader_permit permit, queue_reader_handle handle) {
     return mutation_fragment_queue(std::move(s), std::move(permit), seastar::make_shared<queue_reader_handle_adapter>(std::move(handle)));
+}
+
+struct sharder_helper {
+    struct tablet_sharder_keepalive {
+        std::unique_ptr<dht::auto_refreshing_sharder> sharder_ptr;
+        service::topology_guard topo_guard;
+    };
+    using sharder_keepalive = std::variant<tablet_sharder_keepalive, locator::effective_replication_map_ptr>;
+
+    sharder_keepalive keepalive;
+    const dht::sharder& sharder;
+
+    sharder_helper(sharder_keepalive s_keepalive, const dht::sharder& s)
+        : keepalive(std::move(s_keepalive))
+        , sharder(s)
+    {}
+};
+
+sharder_helper get_sharder_helper(replica::table& t, const schema& s, service::frozen_topology_guard frozen_topo_guard) {
+    if (frozen_topo_guard == service::default_session_id) {
+        // The sharder is valid only when the erm is valid. Keep a reference of the erm to keep the sharder valid.
+        auto erm = t.get_effective_replication_map();
+        auto& sharder = erm->get_sharder(s);
+        sharder_helper::sharder_keepalive keepalive = std::move(erm);
+        return sharder_helper{std::move(keepalive), sharder};
+    } else {
+        sharder_helper::tablet_sharder_keepalive keepalive{
+            .sharder_ptr = std::make_unique<dht::auto_refreshing_sharder>(t.shared_from_this()),
+            .topo_guard = frozen_topo_guard
+        };
+        auto& sharder = *keepalive.sharder_ptr;
+        return sharder_helper{std::move(keepalive), sharder};
+    }
 }
 
 void repair_writer_impl::create_writer(lw_shared_ptr<repair_writer> w) {
@@ -492,15 +551,15 @@ void repair_writer_impl::create_writer(lw_shared_ptr<repair_writer> w) {
     }
     replica::table& t = _db.local().find_column_family(_schema->id());
     rlogger.debug("repair_writer: keyspace={}, table={}, estimated_partitions={}", w->schema()->ks_name(), w->schema()->cf_name(), w->get_estimated_partitions());
-    // The sharder is valid only when the erm is valid. Keep a reference of the erm to keep the sharder valid.
-    auto erm = t.get_effective_replication_map();
-    auto& sharder = erm->get_sharder(*(w->schema()));
-    _writer_done = mutation_writer::distribute_reader_and_consume_on_shards(_schema, sharder, std::move(_queue_reader),
-            streaming::make_streaming_consumer(sstables::repair_origin, _db, _view_builder, w->get_estimated_partitions(), _reason, is_offstrategy_supported(_reason), _topo_guard),
-    t.stream_in_progress()).then([w, erm] (uint64_t partitions) {
+    auto sharder = get_sharder_helper(t, *(w->schema()), _topo_guard);
+    _writer_done = mutation_writer::distribute_reader_and_consume_on_shards(_schema, sharder.sharder, std::move(_queue_reader),
+            streaming::make_streaming_consumer(sstables::repair_origin, _db, _view_builder, _view_building_worker, w->get_estimated_partitions(), _reason, is_offstrategy_supported(_reason),
+                _topo_guard, _repaired_at, w->get_sstable_list_to_mark_as_repaired()),
+    t.stream_in_progress()).then([w] (uint64_t partitions) {
         rlogger.debug("repair_writer: keyspace={}, table={}, managed to write partitions={} to sstable",
             w->schema()->ks_name(), w->schema()->cf_name(), partitions);
-    }).handle_exception([w, erm] (std::exception_ptr ep) {
+        return utils::get_local_injector().inject("repair_writer_impl_create_writer_wait", utils::wait_for_message(200s));
+    }).handle_exception([w, keepalive = std::move(sharder.keepalive)] (std::exception_ptr ep) {
         rlogger.warn("repair_writer: keyspace={}, table={}, multishard_writer failed: {}",
                 w->schema()->ks_name(), w->schema()->cf_name(), ep);
         w->queue().abort(ep);
@@ -510,14 +569,16 @@ void repair_writer_impl::create_writer(lw_shared_ptr<repair_writer> w) {
 
 lw_shared_ptr<repair_writer> make_repair_writer(
             schema_ptr schema,
+            std::optional<int64_t> repaired_at,
             reader_permit permit,
             streaming::stream_reason reason,
             sharded<replica::database>& db,
             db::view::view_builder& view_builder,
+            sharded<db::view::view_building_worker>& view_building_worker,
             service::frozen_topology_guard topo_guard) {
-    auto [queue_reader, queue_handle] = make_queue_reader_v2(schema, permit);
+    auto [queue_reader, queue_handle] = make_queue_reader(schema, permit);
     auto queue = make_mutation_fragment_queue(schema, permit, std::move(queue_handle));
-    auto i = std::make_unique<repair_writer_impl>(schema, permit, db, view_builder, reason, std::move(queue), std::move(queue_reader), topo_guard);
+    auto i = std::make_unique<repair_writer_impl>(schema, repaired_at, permit, db, view_builder, view_building_worker, reason, std::move(queue), std::move(queue_reader), topo_guard);
     return make_lw_shared<repair_writer>(schema, permit, std::move(i));
 }
 
@@ -605,10 +666,17 @@ future<std::list<repair_row>> to_repair_rows_list(repair_rows_on_wire rows, sche
         for (auto it = rows.begin(); it != rows.end(); it = rows.erase(it)) {
             auto x = std::move(*it);
 
-            dht::decorated_key dk = dht::decorate_key(*s, x.get_key());
-            if (!(dk_ptr && dk_ptr->dk.equal(*s, dk))) {
-                dk_ptr = make_lw_shared<const decorated_key_with_hash>(*s, dk, seed);
+            if (dk_ptr && x.use_last_partition_key()) {
+                // Use previous partition key when an empty partition is received
+            } else {
+                dht::decorated_key dk = dht::decorate_key(*s, x.get_key());
+                if (!(dk_ptr && dk_ptr->dk.equal(*s, dk))) {
+                    dk_ptr = make_lw_shared<const decorated_key_with_hash>(*s, dk, seed);
+                    // Reset last_mf only when new partition is seen
+                    last_mf = {};
+                }
             }
+
             auto& mutation_fragments = x.get_mutation_fragments();
             if (is_master) {
                 for (auto fmfit = mutation_fragments.begin(); fmfit != mutation_fragments.end(); fmfit = mutation_fragments.erase(fmfit)) {
@@ -627,7 +695,6 @@ future<std::list<repair_row>> to_repair_rows_list(repair_rows_on_wire rows, sche
                     co_await coroutine::maybe_yield();
                 }
             } else {
-                last_mf = {};
                 for (auto fmfit = mutation_fragments.begin(); fmfit != mutation_fragments.end(); fmfit = mutation_fragments.erase(fmfit)) {
                     auto fmf = std::move(*fmfit);
 
@@ -702,6 +769,8 @@ private:
     size_t _nr_peer_nodes= 1;
     repair_stats _stats;
     std::optional<repair_reader> _repair_reader;
+    std::optional<int64_t> _repaired_at;
+    locator::tablet_repair_incremental_mode _incremental_mode;
     lw_shared_ptr<repair_writer> _repair_writer;
     // Contains rows read from disk
     std::list<repair_row> _row_buf;
@@ -716,7 +785,7 @@ private:
     // Contains the hashes of rows in the _working_row_buffor for all peer nodes
     std::vector<repair_hash_set> _peer_row_hash_sets;
     // Gate used to make sure pending operation of meta data is done
-    seastar::gate _gate;
+    seastar::named_gate _gate;
     sink_source_for_get_full_row_hashes _sink_source_for_get_full_row_hashes;
     sink_source_for_get_row_diff _sink_source_for_get_row_diff;
     sink_source_for_put_row_diff _sink_source_for_put_row_diff;
@@ -734,6 +803,18 @@ private:
     bool _small_table_optimization_tm_calculated = false;
     service::frozen_topology_guard _frozen_topology_guard;
     service::topology_guard _topology_guard;
+    const bool _is_eligible_to_repair_rejection;
+private:
+    incremental_repair_meta _incremental_repair_meta;
+public:
+    bool is_incremental_repair() {
+        return _repaired_at.has_value();
+    }
+    // The tablet_repair_incremental_mode::full mode turns on incremental
+    // repair and selects all sstables for repair.
+    bool is_incremental_repair_using_all_sstables() {
+        return is_incremental_repair() && _incremental_mode == locator::tablet_repair_incremental_mode::full;
+    }
 public:
     std::vector<repair_node_state>& all_nodes() {
         return _all_node_states;
@@ -791,7 +872,9 @@ public:
             std::vector<std::optional<shard_id>> all_live_peer_shards,
             row_level_repair* row_level_repair_ptr,
             gc_clock::time_point compaction_time,
-            service::frozen_topology_guard topo_guard)
+            service::frozen_topology_guard topo_guard,
+            std::optional<int64_t> repaired_at,
+            locator::tablet_repair_incremental_mode incremental_mode)
             : _rs(rs)
             , _db(rs.get_db())
             , _messaging(rs.get_messaging())
@@ -809,7 +892,10 @@ public:
             , _remote_sharder(make_remote_sharder())
             , _same_sharding_config(is_same_sharding_config(cf))
             , _nr_peer_nodes(nr_peer_nodes)
-            , _repair_writer(make_repair_writer(_schema, _permit, _reason, _db, rs.get_view_builder(), topo_guard))
+            , _repaired_at(repaired_at)
+            , _incremental_mode(incremental_mode)
+            , _repair_writer(make_repair_writer(_schema, _repaired_at, _permit, _reason, _db, rs.get_view_builder(), rs.get_view_building_worker(), topo_guard))
+            , _gate(format("repair_meta[{}]", repair_meta_id))
             , _sink_source_for_get_full_row_hashes(_repair_meta_id, _nr_peer_nodes,
                     [&rs] (uint32_t repair_meta_id, std::optional<shard_id> dst_cpu_id_opt, locator::host_id addr) {
                         auto dst_cpu_id = dst_cpu_id_opt.value_or(repair_unspecified_shard);
@@ -834,7 +920,14 @@ public:
             , _is_tablet(cf.uses_tablets())
             , _frozen_topology_guard(topo_guard)
             , _topology_guard(_frozen_topology_guard)
+            , _is_eligible_to_repair_rejection(cf.is_eligible_to_write_rejection_on_critical_disk_utilization())
             {
+
+            if (is_incremental_repair()) {
+                rlogger.info("Enable incremental repair for table={}.{} range={}",
+                    _schema->ks_name(), _schema->cf_name(), _range);
+            }
+
             if (master) {
                 add_to_repair_meta_for_masters(*this);
             } else {
@@ -851,7 +944,7 @@ public:
             // become evictable normally).
             // Prevent this by marking the permit as evictable ASAP.
             // FIXME: provide a better API for this, this is very clunky
-            _fake_inactive_read_handle = _db.local().get_reader_concurrency_semaphore().register_inactive_read(make_empty_flat_reader_v2(_schema, _permit));
+            _fake_inactive_read_handle = _db.local().get_reader_concurrency_semaphore().register_inactive_read(make_empty_mutation_reader(_schema, _permit));
     }
 
     // follower constructor
@@ -870,9 +963,11 @@ public:
             shard_config master_node_shard_config,
             host_id_vector_replica_set all_live_peer_nodes,
             gc_clock::time_point compaction_time,
-            service::frozen_topology_guard topo_guard)
+            service::frozen_topology_guard topo_guard,
+            std::optional<int64_t> repaired_at,
+            locator::tablet_repair_incremental_mode incremental_mode)
         : repair_meta(rs, cf, std::move(s), std::move(permit), std::move(range), algo, max_row_buf_size, seed, master, repair_meta_id, reason,
-                std::move(master_node_shard_config), std::move(all_live_peer_nodes), 1, {std::nullopt}, nullptr, compaction_time, topo_guard)
+                std::move(master_node_shard_config), std::move(all_live_peer_nodes), 1, {std::nullopt}, nullptr, compaction_time, topo_guard, repaired_at, incremental_mode)
     {
     }
 
@@ -974,13 +1069,7 @@ private:
 
     future<uint64_t> do_estimate_partitions_on_local_shard() {
         auto& cf = _db.local().find_column_family(_schema->id());
-        lw_shared_ptr<const sstable_list> sstables = cf.get_sstables();
-        uint64_t partition_count = 0;
-        for (const sstables::shared_sstable& sst : *sstables) {
-            partition_count += sst->estimated_keys_for_range(_range);
-            co_await coroutine::maybe_yield();
-        }
-        co_return partition_count;
+        return cf.estimated_partitions_in_range(_range);
     }
 
     future<uint64_t> get_estimated_partitions() {
@@ -1071,6 +1160,52 @@ private:
         cur_rows.push_back(std::move(r));
     }
 
+
+    future<> prepare_sstables_for_incremental_repair() {
+        auto& table = _db.local().find_column_family(_schema->id());
+        table_id tid = table.schema()->id();
+        auto erm = table.get_effective_replication_map();
+        auto& tmap = erm->get_token_metadata_ptr()->tablets().get_tablet_map(tid);
+        auto last_token = _range.end() ? _range.end()->value() : dht::maximum_token();
+        auto id = tmap.get_tablet_id(last_token);
+        auto range = tmap.get_token_range(id);
+        if (range != _range) {
+            on_internal_error(rlogger, format("Repair range={} does not match tablet range={}", _range, range));
+        }
+        bool full = is_incremental_repair_using_all_sstables();
+        auto& tinfo = tmap.get_tablet_info(id);
+        auto sstables_repaired_at = tinfo.sstables_repaired_at;
+        auto reenablers_and_holders = co_await table.get_compaction_reenablers_and_lock_holders_for_repair(_db.local(), _frozen_topology_guard, _range);
+        for (auto& lock_holder : reenablers_and_holders.lock_holders) {
+            _rs._repair_compaction_locks[_frozen_topology_guard].push_back(std::move(lock_holder));
+        }
+        auto sstables = co_await table.take_storage_snapshot(_range);
+        _incremental_repair_meta.sst_set = make_lw_shared<sstables::sstable_set>(sstables::make_partitioned_sstable_set(_schema, _range));
+        _incremental_repair_meta.sstables_repaired_at = sstables_repaired_at;
+        for (auto& snap : sstables) {
+            co_await coroutine::maybe_yield();
+            auto& sst = snap.sst;
+            auto bytes_on_disk = sst->bytes_on_disk();
+            if (!full && repair::is_repaired(sstables_repaired_at, sst)) {
+                rlogger.info("Skipped adding sst={} repaired_at={} sstables_repaired_at={} being_repaired={} session_id={} for incremental repair",
+                    sst->toc_filename(), sst->get_stats_metadata().repaired_at, sstables_repaired_at, sst->being_repaired, _frozen_topology_guard);
+                _metrics.inc_sst_skipped_bytes += bytes_on_disk;
+            } else {
+                sst->mark_as_being_repaired(_frozen_topology_guard);
+                rlogger.info("Added sst={} repaired_at={} sstables_repaired_at={} being_repaired={} session_id={} for incremental repair",
+                    sst->toc_filename(), sst->get_stats_metadata().repaired_at, sstables_repaired_at, sst->being_repaired, _frozen_topology_guard);
+                _incremental_repair_meta.sst_set->insert(sst);
+                _metrics.inc_sst_read_bytes += bytes_on_disk;
+            }
+        }
+        // Note: It is safe to re-enable compaction again because all
+        // sstables particiating the repair have been marked as
+        // being_repaired which will be ignored by the new unrepaired
+        // compaction.
+        reenablers_and_holders.cres.clear();
+        rlogger.info("Re-enabled compaction for range={} for incremental repair", _range);
+    }
+
     // Read rows from sstable until the size of rows exceeds _max_row_buf_size  - current_size
     // This reads rows from where the reader left last time into _row_buf
     // _current_sync_boundary or _last_sync_boundary have no effect on the reader neither.
@@ -1084,6 +1219,9 @@ private:
             // We are about to create a real evictable reader, so drop the fake
             // reader (evicted or not), we don't need it anymore.
             _db.local().get_reader_concurrency_semaphore().unregister_inactive_read(std::move(_fake_inactive_read_handle));
+            if (is_incremental_repair()) {
+                co_await prepare_sstables_for_incremental_repair();
+            }
             _repair_reader.emplace(_db,
                 _db.local().find_column_family(_schema->id()),
                 _schema,
@@ -1093,6 +1231,10 @@ private:
                 _master_node_shard_config.shard,
                 _seed,
                 std::invoke([this]() {
+                    if (is_incremental_repair()) {
+                        return repair_reader::read_strategy::incremental_repair;
+                    }
+
                     if (_repair_master || _same_sharding_config || _is_tablet) {
                         rlogger.debug("repair_reader: meta_id={}, _repair_master={}, _same_sharding_config={},"
                                       "read_strategy {} is chosen",
@@ -1139,7 +1281,8 @@ private:
                         read_strategy);
                     return read_strategy;
                 }),
-                _compaction_time);
+                _compaction_time,
+                _incremental_repair_meta);
         }
         try {
             while (cur_size < _max_row_buf_size) {
@@ -1408,28 +1551,70 @@ private:
         co_await do_apply_rows(std::move(row_diff), update_working_row_buf::no);
     }
 
+    struct fragments_limiter {
+        sstring ks;
+        sstring cf;
+        size_t max_fragments_size;
+        size_t max_fragments_nr;
+        size_t fragments_size = 0;
+        size_t fragments_nr = 0;
+        // Max fragments size and number are allowed in a single repair_row_on_wire
+        // which is sent as a rpc stream message
+        static constexpr size_t _max_fragments_size = 240 * 1024;
+        static constexpr size_t _max_fragments_nr = 32 * 1024;
+        fragments_limiter(sstring keyspace, sstring table)
+            : ks(keyspace)
+            , cf(table) {
+            max_fragments_size = _max_fragments_size;
+            max_fragments_nr = _max_fragments_nr;
+            auto inject_max_fragments_size = utils::get_local_injector().inject_parameter<uint32_t>("row_level_repair_max_fragments_size");
+            if (inject_max_fragments_size) {
+                max_fragments_size = *inject_max_fragments_size;
+                rlogger.info("Set inject_max_fragments_size {} for table={}.{}", max_fragments_size, ks, cf);
+            }
+            auto inject_max_fragments_nr = utils::get_local_injector().inject_parameter<uint32_t>("row_level_repair_max_fragments_nr");
+            if (inject_max_fragments_nr) {
+                max_fragments_nr = *inject_max_fragments_nr;
+                rlogger.info("Set inject_max_fragments_nr {} for table={}.{}", max_fragments_nr, ks, cf);
+            }
+        }
+        void reset(size_t size) {
+            fragments_size = size;
+            fragments_nr = 1;
+        };
+        void add(size_t size) {
+            fragments_size += size;
+            ++fragments_nr;
+        }
+        bool no_split(size_t size) {
+            return (fragments_size + size) < max_fragments_size && (fragments_nr + 1) < max_fragments_nr;
+        }
+    };
+
     future<repair_rows_on_wire> to_repair_rows_on_wire(std::list<repair_row> row_list) {
         lw_shared_ptr<const decorated_key_with_hash> last_dk_with_hash;
         repair_rows_on_wire rows;
         size_t row_bytes = co_await get_repair_rows_size(row_list);
         _metrics.tx_row_nr += row_list.size();
         _metrics.tx_row_bytes += row_bytes;
-        for (repair_row& r : row_list) {
+        fragments_limiter limiter(_schema->ks_name(), _schema->cf_name());
+        auto msg_split_feature = bool(_db.local().features().repair_msg_split);
+        while (!row_list.empty()) {
+            repair_row r = std::move(row_list.front());
+            row_list.pop_front();
             const auto& dk_with_hash = r.get_dk_with_hash();
-            // No need to search from the beginning of the rows. Look at the end of repair_rows_on_wire is enough.
-            if (rows.empty()) {
-                auto pk = dk_with_hash->dk.key();
-                last_dk_with_hash = dk_with_hash;
-                rows.push_back(repair_row_on_wire(std::move(pk), {std::move(r.get_frozen_mutation())}));
+            auto mf = std::move(r.get_frozen_mutation());
+            const auto size = mf.representation().size();
+            bool same_pk = !rows.empty() && last_dk_with_hash && dk_with_hash->dk.tri_compare(*_schema, last_dk_with_hash->dk) == 0;
+
+            if (same_pk && (!msg_split_feature || limiter.no_split(size))) {
+                limiter.add(size);
+                rows.back().push_mutation_fragment(std::move(mf));
             } else {
-                auto& row = rows.back();
-                if (last_dk_with_hash && dk_with_hash->dk.tri_compare(*_schema, last_dk_with_hash->dk) == 0) {
-                    row.push_mutation_fragment(std::move(r.get_frozen_mutation()));
-                } else {
-                    auto pk = dk_with_hash->dk.key();
-                    last_dk_with_hash = dk_with_hash;
-                    rows.push_back(repair_row_on_wire(std::move(pk), {std::move(r.get_frozen_mutation())}));
-                }
+                last_dk_with_hash = dk_with_hash;
+                limiter.reset(size);
+                auto r = same_pk && msg_split_feature ? repair_row_on_wire({std::move(mf)}) : repair_row_on_wire(dk_with_hash->dk.key(), {std::move(mf)});
+                rows.push_back(std::move(r));
             }
             co_await coroutine::maybe_yield();
         }
@@ -1558,7 +1743,7 @@ public:
             co_await ser::repair_rpc_verbs::send_repair_row_level_start(&_messaging, remote_node,
                 _repair_meta_id, ks_name, cf_name, std::move(range), _algo, _max_row_buf_size, _seed,
                 _master_node_shard_config.shard, _master_node_shard_config.shard_count, _master_node_shard_config.ignore_msb,
-                remote_partitioner_name, std::move(schema_version), reason, compaction_time, dst_cpu_id, _frozen_topology_guard);
+                remote_partitioner_name, std::move(schema_version), reason, compaction_time, dst_cpu_id, _frozen_topology_guard, _repaired_at, _incremental_mode);
         if (resp && resp->status == repair_row_level_start_status::no_such_column_family) {
             throw replica::no_such_column_family(ks_name, cf_name);
         } else {
@@ -1571,7 +1756,7 @@ public:
     repair_row_level_start_handler(repair_service& repair, locator::host_id from_id, uint32_t src_cpu_id, uint32_t repair_meta_id, sstring ks_name, sstring cf_name,
             dht::token_range range, row_level_diff_detect_algorithm algo, uint64_t max_row_buf_size,
             uint64_t seed, shard_config master_node_shard_config, table_schema_version schema_version, streaming::stream_reason reason,
-            gc_clock::time_point compaction_time, abort_source& as, service::frozen_topology_guard topo_guard) {
+            gc_clock::time_point compaction_time, abort_source& as, service::frozen_topology_guard topo_guard, std::optional<int64_t> repaired_at, locator::tablet_repair_incremental_mode incremental_mode) {
         rlogger.debug(">>> Started Row Level Repair (Follower): local={}, peers={}, repair_meta_id={}, keyspace={}, cf={}, schema_version={}, range={}, seed={}, max_row_buf_siz={}",
                 repair.my_host_id(), from_id, repair_meta_id, ks_name, cf_name, schema_version, range, seed, max_row_buf_size);
         try {
@@ -1580,7 +1765,7 @@ public:
             if (mm.use_raft()) {
                 co_await mm.get_group0_barrier().trigger(mm.get_abort_source());
             }
-            co_await repair.insert_repair_meta(from_id, src_cpu_id, repair_meta_id, std::move(range), algo, max_row_buf_size, seed, std::move(master_node_shard_config), std::move(schema_version), reason, compaction_time, as, topo_guard);
+            co_await repair.insert_repair_meta(from_id, src_cpu_id, repair_meta_id, std::move(range), algo, max_row_buf_size, seed, std::move(master_node_shard_config), std::move(schema_version), reason, compaction_time, as, topo_guard, repaired_at, incremental_mode);
             co_return repair_row_level_start_response{repair_row_level_start_status::ok};
         } catch (replica::no_such_column_family&) {
             co_return repair_row_level_start_response{repair_row_level_start_status::no_such_column_family};
@@ -1588,23 +1773,27 @@ public:
     }
 
     // RPC API
-    future<> repair_row_level_stop(locator::host_id remote_node, sstring ks_name, sstring cf_name, dht::token_range range, shard_id dst_cpu_id) {
+    future<> repair_row_level_stop(locator::host_id remote_node, sstring ks_name, sstring cf_name, dht::token_range range, shard_id dst_cpu_id, bool mark_as_repaired) {
         if (remote_node == myhostid()) {
-            co_return co_await stop();
+            co_await stop();
+            if (mark_as_repaired) {
+                co_await mark_sstable_as_repaired();
+            }
+            co_return;
         }
         stats().rpc_call_nr++;
         co_return co_await ser::repair_rpc_verbs::send_repair_row_level_stop(&_messaging, remote_node,
-                _repair_meta_id, std::move(ks_name), std::move(cf_name), std::move(range), dst_cpu_id);
+                _repair_meta_id, std::move(ks_name), std::move(cf_name), std::move(range), dst_cpu_id, mark_as_repaired);
     }
 
     // RPC handler
     static future<>
-    repair_row_level_stop_handler(repair_service& rs, locator::host_id from, uint32_t repair_meta_id, sstring ks_name, sstring cf_name, dht::token_range range) {
+    repair_row_level_stop_handler(repair_service& rs, locator::host_id from, uint32_t repair_meta_id, sstring ks_name, sstring cf_name, dht::token_range range, bool mark_as_repaired) {
         rlogger.debug("<<< Finished Row Level Repair (Follower): local={}, peers={}, repair_meta_id={}, keyspace={}, cf={}, range={}",
                 rs.my_host_id(), from, repair_meta_id, ks_name, cf_name, range);
         auto rm = rs.get_repair_meta(from, repair_meta_id);
         rm->set_repair_state_for_local_node(repair_state::row_level_stop_started);
-        co_await rs.remove_repair_meta(from, repair_meta_id, std::move(ks_name), std::move(cf_name), std::move(range));
+        co_await rs.remove_repair_meta(from, repair_meta_id, std::move(ks_name), std::move(cf_name), std::move(range), mark_as_repaired);
         rm->set_repair_state_for_local_node(repair_state::row_level_stop_finished);
     }
 
@@ -1930,10 +2119,41 @@ public:
 
     // RPC handler
     future<> put_row_diff_handler(repair_rows_on_wire rows) {
+        if (_rs.is_disabled() && _is_eligible_to_repair_rejection) {
+            co_await coroutine::return_exception(std::runtime_error("Repair service is disabled"));
+        }
+
         auto gate_held = _gate.hold();
         auto& cf = _db.local().find_column_family(_schema->id());
         cf.update_off_strategy_trigger();
         co_await apply_rows_on_follower(std::move(rows));
+    }
+
+public:
+    future<> mark_sstable_as_repaired() {
+        auto sstables = _repair_writer->get_sstable_list_to_mark_as_repaired();
+        if (_incremental_repair_meta.sst_set || sstables) {
+            co_await seastar::async([&] {
+                auto do_mark_sstable_as_repaired = [&] (const sstables::shared_sstable& sst, const sstring& type) {
+                    auto filename = sst->toc_filename();
+                    auto name = sst->component_basename(component_type::Data);
+                    int64_t repaired_at = _incremental_repair_meta.sstables_repaired_at + 1;
+                    sst->update_repaired_at(repaired_at);
+                    rlogger.info("Marking filename={} name={} repaired_at={} being_repaired={} type={} for incremental repair",
+                            filename, name, repaired_at, sst->being_repaired, type);
+                };
+                _incremental_repair_meta.sst_set->for_each_sstable([&] (const sstables::shared_sstable& sst) {
+                    seastar::thread::maybe_yield();
+                    do_mark_sstable_as_repaired(sst, "existing");
+                });
+                if (sstables) {
+                    for (auto& sst : *sstables) {
+                        seastar::thread::maybe_yield();
+                        do_mark_sstable_as_repaired(sst, "repair_produced");
+                    }
+                }
+            });
+        }
     }
 };
 
@@ -2301,7 +2521,7 @@ future<repair_update_system_table_response> repair_service::repair_update_system
         throw std::runtime_error(format("repair[{}]: range {} is not in the format of (start, end]", req.repair_uuid, req.range));
     }
     co_await db.invoke_on_all([&req] (replica::database& local_db) {
-        auto& gc_state = local_db.get_compaction_manager().get_tombstone_gc_state();
+        auto& gc_state = local_db.get_compaction_manager().get_shared_tombstone_gc_state();
         return gc_state.update_repair_time(req.table_uuid, req.range, req.repair_time);
     });
     db::system_keyspace::repair_history_entry ent;
@@ -2332,6 +2552,7 @@ future<repair_flush_hints_batchlog_response> repair_service::repair_flush_hints_
     auto cache_time = std::chrono::milliseconds(get_db().local().get_config().repair_hints_batchlog_flush_cache_time_in_ms());
     auto cache_disabled = cache_time == std::chrono::milliseconds(0);
     auto flush_time = now;
+    db::all_batches_replayed all_replayed = db::all_batches_replayed::yes;
     if (cache_disabled || (now - _flush_hints_batchlog_time > cache_time)) {
         // Empty targets meants all nodes
         db::hints::sync_point sync_point = co_await _sp.local().create_hint_sync_point(std::vector<locator::host_id>{});
@@ -2348,7 +2569,7 @@ future<repair_flush_hints_batchlog_response> repair_service::repair_flush_hints_
                     rlogger.info("repair[{}]: Finished to flush hints for repair_flush_hints_batchlog_request from node={}", req.repair_uuid, from);
                     co_return;
                 },
-                [this, now, cache_disabled, &flush_time, &cache_time, &from, &req] () -> future<>  {
+                [this, now, cache_disabled, &flush_time, &cache_time, &from, &req, &all_replayed] () -> future<>  {
                     rlogger.info("repair[{}]: Started to flush batchlog for repair_flush_hints_batchlog_request from node={}", req.repair_uuid, from);
                     auto last_replay = _bm.local().get_last_replay();
                     bool issue_flush = false;
@@ -2375,12 +2596,15 @@ future<repair_flush_hints_batchlog_response> repair_service::repair_flush_hints_
                         }
                     }
                     if (issue_flush) {
-                        co_await _bm.local().do_batch_log_replay(db::batchlog_manager::post_replay_cleanup::no);
+                        all_replayed = co_await _bm.local().do_batch_log_replay(db::batchlog_manager::post_replay_cleanup::no);
                         utils::get_local_injector().set_parameter("repair_flush_hints_batchlog_handler", "issue_flush", fmt::to_string(flush_time));
                     }
                     rlogger.info("repair[{}]: Finished to flush batchlog for repair_flush_hints_batchlog_request from node={}, flushed={}", req.repair_uuid, from, issue_flush);
                 }
             );
+            if (!all_replayed) {
+                throw std::runtime_error("Not all batchlog entries were replayed");
+            }
         } catch (...) {
             rlogger.warn("repair[{}]: Failed to process repair_flush_hints_batchlog_request from node={}: {}",
                     req.repair_uuid, from, std::current_exception());
@@ -2531,29 +2755,31 @@ future<> repair_service::init_ms_handlers() {
             sstring cf_name, dht::token_range range, row_level_diff_detect_algorithm algo, uint64_t max_row_buf_size, uint64_t seed,
             unsigned remote_shard, unsigned remote_shard_count, unsigned remote_ignore_msb, sstring remote_partitioner_name, table_schema_version schema_version,
             rpc::optional<streaming::stream_reason> reason, rpc::optional<gc_clock::time_point> compaction_time, rpc::optional<shard_id> dst_cpu_id_opt,
-            rpc::optional<service::frozen_topology_guard> topo_guard) {
+            rpc::optional<service::frozen_topology_guard> topo_guard, rpc::optional<std::optional<int64_t>> repaired_at,
+            rpc::optional<locator::tablet_repair_incremental_mode> incremental_mode) {
         auto src_cpu_id = cinfo.retrieve_auxiliary<uint32_t>("src_cpu_id");
         auto shard = get_dst_shard_id(src_cpu_id, dst_cpu_id_opt);
         auto from_id = cinfo.retrieve_auxiliary<locator::host_id>("host_id");
         return container().invoke_on(shard, [from_id, src_cpu_id, repair_meta_id, ks_name, cf_name,
                 range, algo, max_row_buf_size, seed, remote_shard, remote_shard_count, remote_ignore_msb, schema_version, reason, compaction_time, this,
-                topo_guard = topo_guard.value_or(service::default_session_id)] (repair_service& local_repair) mutable {
+                topo_guard = topo_guard.value_or(service::default_session_id), repaired_at = repaired_at.value_or(std::nullopt), incremental_mode = incremental_mode.value_or(locator::tablet_repair_incremental_mode::disabled)] (repair_service& local_repair) mutable {
             streaming::stream_reason r = reason ? *reason : streaming::stream_reason::repair;
             const gc_clock::time_point ct = compaction_time ? *compaction_time : gc_clock::now();
             return repair_meta::repair_row_level_start_handler(local_repair, from_id, src_cpu_id, repair_meta_id, std::move(ks_name),
                     std::move(cf_name), std::move(range), algo, max_row_buf_size, seed,
                     shard_config{remote_shard, remote_shard_count, remote_ignore_msb},
-                    schema_version, r, ct, _repair_module->abort_source(), topo_guard);
+                    schema_version, r, ct, _repair_module->abort_source(), topo_guard, repaired_at, incremental_mode);
         });
     });
     ser::repair_rpc_verbs::register_repair_row_level_stop(&ms, [this] (const rpc::client_info& cinfo, uint32_t repair_meta_id,
-            sstring ks_name, sstring cf_name, dht::token_range range, rpc::optional<shard_id> dst_cpu_id_opt) {
+            sstring ks_name, sstring cf_name, dht::token_range range, rpc::optional<shard_id> dst_cpu_id_opt, rpc::optional<bool> mark_as_repaired_opt) {
         auto src_cpu_id = cinfo.retrieve_auxiliary<uint32_t>("src_cpu_id");
         auto shard = get_dst_shard_id(src_cpu_id, dst_cpu_id_opt);
         auto from = cinfo.retrieve_auxiliary<locator::host_id>("host_id");
-        return container().invoke_on(shard, [from, repair_meta_id, ks_name, cf_name, range] (repair_service& local_repair) mutable {
+        bool mark_as_repaired = mark_as_repaired_opt.value_or(false);
+        return container().invoke_on(shard, [from, repair_meta_id, ks_name, cf_name, range, mark_as_repaired] (repair_service& local_repair) mutable {
             return repair_meta::repair_row_level_stop_handler(local_repair, from, repair_meta_id,
-                    std::move(ks_name), std::move(cf_name), std::move(range));
+                    std::move(ks_name), std::move(cf_name), std::move(range), mark_as_repaired);
         });
     });
     ser::repair_rpc_verbs::register_repair_get_estimated_partitions(&ms, [this] (const rpc::client_info& cinfo, uint32_t repair_meta_id, rpc::optional<shard_id> dst_cpu_id_opt) {
@@ -2584,6 +2810,27 @@ future<> repair_service::init_ms_handlers() {
         auto from = cinfo.retrieve_auxiliary<gms::inet_address>("baddr");
         return repair_flush_hints_batchlog_handler(from, std::move(req));
     });
+
+    ser::repair_rpc_verbs::register_repair_update_compaction_ctrl(&ms, [this] (const rpc::client_info& cinfo, locator::global_tablet_id gid, service::frozen_topology_guard topo_guard) -> future<> {
+        co_await container().invoke_on_all([gid, topo_guard] (repair_service& local_repair) mutable -> future<> {
+            auto& table = local_repair.get_db().local().find_column_family(gid.table);
+            auto erm = table.get_effective_replication_map();
+            auto& tmap = erm->get_token_metadata_ptr()->tablets().get_tablet_map(gid.table);
+            auto range = tmap.get_token_range(gid.tablet);
+            co_await table.clear_being_repaired_for_range(range);
+            auto removed = local_repair._repair_compaction_locks.erase(topo_guard);
+            rlogger.info("Got repair_update_compaction_ctrl gid={} session_id={} removed={}", gid, topo_guard, removed);
+        });
+    });
+
+    ser::repair_rpc_verbs::register_repair_update_repaired_at_for_merge(&ms, [this] (const rpc::client_info& cinfo, table_id table) -> future<> {
+        rlogger.debug("Got repair_update_repaired_at_for_merge table={}", table);
+        co_await container().invoke_on_all([table] (repair_service& local_repair) mutable -> future<> {
+            auto& t = local_repair.get_db().local().find_column_family(table);
+            co_await t.update_repaired_at_for_merge();
+        });
+    });
+
 
     return make_ready_future<>();
 }
@@ -2728,7 +2975,12 @@ private:
 
     size_t get_max_row_buf_size(row_level_diff_detect_algorithm algo) {
         // Max buffer size per repair round
-        return is_rpc_stream_supported(algo) ?  repair::task_manager_module::max_repair_memory_per_range : 256 * 1024;
+        size_t size = is_rpc_stream_supported(algo) ? repair::task_manager_module::max_repair_memory_per_range : 256 * 1024;
+        if (_small_table_optimization) {
+            // For small table optimization, we reduce the buffer size to reduce memory consumption.
+            size /= _all_live_peer_nodes.size();
+        }
+        return size;
     }
 
     // Step A: Negotiate sync boundary to use
@@ -3014,7 +3266,7 @@ private:
 
         // The tablet repair time for tombstone gc will be updated when the
         // system.tablet.repair_time is updated.
-        if (_is_tablet && _shard_task.sched_by_scheduler) {
+        if (_is_tablet && _shard_task.sched_info.sched_by_scheduler) {
             rlogger.debug("repair[{}]: Skipped to update system.repair_history for tablet repair scheduled by scheduler total_rf={} repaired_replicas={} local={} peers={}",
                     _shard_task.global_repair_id.uuid(), _shard_task.get_total_rf(), repaired_replicas, my_address, _all_live_peer_nodes);
             co_return;
@@ -3062,7 +3314,7 @@ public:
 
             auto& mem_sem = _shard_task.rs.memory_sem();
             auto max = _shard_task.rs.max_repair_memory();
-            auto wanted = (_all_live_peer_nodes.size() + 1) * repair::task_manager_module::max_repair_memory_per_range;
+            auto wanted = (_all_live_peer_nodes.size() + 1) * max_row_buf_size;
             wanted = std::min(max, wanted);
             rlogger.trace("repair[{}]: Started to get memory budget, wanted={}, available={}, max_repair_memory={}",
                     _shard_task.global_repair_id.uuid(), wanted, mem_sem.current(), max);
@@ -3073,6 +3325,21 @@ public:
             auto permit = _shard_task.db.local().obtain_reader_permit(_shard_task.db.local().find_column_family(_table_id), "repair-meta", db::no_timeout, {}).get();
 
             auto compaction_time = gc_clock::now();
+
+            std::optional<int64_t> repaired_at;
+            bool enable_incremental_repair = _shard_task.db.local().features().tablet_incremental_repair && _is_tablet &&
+                                              _shard_task.sched_info.incremental_mode != locator::tablet_repair_incremental_mode::disabled &&
+                                             _shard_task.sched_info.sched_by_scheduler &&
+                                             !_shard_task.sched_info.for_tablet_rebuild;
+            if (enable_incremental_repair) {
+                auto& table = _shard_task.db.local().find_column_family(_table_id);
+                auto erm = table.get_effective_replication_map();
+                auto& tmap = erm->get_token_metadata_ptr()->tablets().get_tablet_map(_table_id);
+                auto last_token = _range.end() ? _range.end()->value() : dht::maximum_token();
+                auto& tinfo = tmap.get_tablet_info(last_token);
+                auto sstables_repaired_at = tinfo.sstables_repaired_at;
+                repaired_at = sstables_repaired_at + 1;
+            }
 
             repair_meta master(_shard_task.rs,
                     _shard_task.db.local().find_column_family(_table_id),
@@ -3091,7 +3358,9 @@ public:
                     _all_live_peer_shards,
                     this,
                     compaction_time,
-                    _topo_guard);
+                    _topo_guard,
+                    repaired_at,
+                    _shard_task.sched_info.incremental_mode);
             auto auto_stop_master = defer([&master] {
                 try {
                     master.stop().get();
@@ -3176,10 +3445,15 @@ public:
                 ex = std::current_exception();
             }
 
+            bool mark_as_repaired = false;
+            if (master.is_incremental_repair() && !_failed) {
+                mark_as_repaired = true;
+            }
+
             parallel_for_each(nodes_to_stop, coroutine::lambda([&] (repair_node_state& ns) -> future<> {
                 auto node = ns.node;
                 master.set_repair_state(repair_state::row_level_stop_started, node);
-                co_await master.repair_row_level_stop(node, _shard_task.get_keyspace(), _cf_name, _range, ns.shard);
+                co_await master.repair_row_level_stop(node, _shard_task.get_keyspace(), _cf_name, _range, ns.shard, mark_as_repaired);
                 master.set_repair_state(repair_state::row_level_stop_finished, node);
             })).get();
 
@@ -3206,7 +3480,16 @@ future<> repair_cf_range_row_level(repair::shard_repair_task_impl& shard_task,
         service::frozen_topology_guard topo_guard) {
     auto start_time = flush_time;
     auto repair = row_level_repair(shard_task, std::move(cf_name), std::move(table_id), std::move(range), all_peer_nodes, small_table_optimization, start_time, topo_guard);
-    co_return co_await repair.run();
+    bool is_tablet = shard_task.db.local().find_column_family(table_id).uses_tablets();
+    bool is_tablet_rebuild = shard_task.sched_info.for_tablet_rebuild;
+    auto t = std::chrono::steady_clock::now();
+    auto update_time = seastar::defer([&] {
+        if (is_tablet && !is_tablet_rebuild) {
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t);
+            _metrics.tablet_time_ms += duration.count();
+        }
+    });
+    co_await repair.run();
 }
 
 class row_level_repair_gossip_helper : public gms::i_endpoint_state_change_subscriber {
@@ -3249,13 +3532,14 @@ public:
 };
 
 repair_service::repair_service(sharded<service::topology_state_machine>& tsm,
-        distributed<gms::gossiper>& gossiper,
+        sharded<gms::gossiper>& gossiper,
         netw::messaging_service& ms,
         sharded<replica::database>& db,
         sharded<service::storage_proxy>& sp,
         sharded<db::batchlog_manager>& bm,
         sharded<db::system_keyspace>& sys_ks,
         db::view::view_builder& vb,
+        sharded<db::view::view_building_worker>& vbw,
         tasks::task_manager& tm,
         service::migration_manager& mm,
         size_t max_repair_memory)
@@ -3267,6 +3551,7 @@ repair_service::repair_service(sharded<service::topology_state_machine>& tsm,
     , _bm(bm)
     , _sys_ks(sys_ks)
     , _view_builder(vb)
+    , _view_building_worker(vbw)
     , _repair_module(seastar::make_shared<repair::task_manager_module>(tm, *this, max_repair_memory))
     , _mm(mm)
     , _node_ops_metrics(_repair_module)
@@ -3280,9 +3565,20 @@ repair_service::repair_service(sharded<service::topology_state_machine>& tsm,
     }
 }
 
-future<> repair_service::start() {
+future<> repair_service::start(utils::disk_space_monitor* dsm) {
+    if (dsm && (this_shard_id() == 0)) {
+        _out_of_space_subscription = dsm->subscribe(_db.local().get_config().critical_disk_utilization_level, [this] (auto threshold_reached) {
+            if (threshold_reached) {
+                return container().invoke_on_all([] (repair_service& rs) { return rs.drain(); });
+            }
+            return container().invoke_on_all([] (repair_service& rs) { rs.enable(); });
+        });
+    }
+
     _load_history_done = load_history();
     co_await init_ms_handlers();
+
+    _state = state::running;
 }
 
 future<> repair_service::stop() {
@@ -3297,15 +3593,40 @@ future<> repair_service::stop() {
         rlogger.debug("Unregistering gossiper helper");
         co_await _gossiper.local().unregister_(_gossip_helper);
     }
-    _stopped = true;
+    _state = state::stopped;
     rlogger.info("Stopped repair_service");
   } catch (...) {
     on_fatal_internal_error(rlogger, format("Failed stopping repair_service: {}", std::current_exception()));
   }
 }
 
+void repair_service::enable() {
+    SCYLLA_ASSERT(_state == state::none || _state == state::running);
+    rlogger.info("Asked to enable");
+
+    if (_state == state::none) {
+        _state = state::running;
+        SCYLLA_ASSERT(_disabled_state_count == 0);
+    } else if (_disabled_state_count > 0 && --_disabled_state_count > 0) {
+        rlogger.debug("Repair service is still disabled, requires {} more call(s) to enable()", _disabled_state_count);
+        return;
+    }
+
+    rlogger.info("Enabled");
+}
+
+future<> repair_service::drain() {
+    rlogger.info("Asked to drain");
+    ++_disabled_state_count;
+    // Abort ongoing repairs
+    co_await abort_all();
+    rlogger.info("Drained");
+}
+
 repair_service::~repair_service() {
-    SCYLLA_ASSERT(_stopped);
+    // Assert that repair service was explicitly stopped, if started.
+    // Otherwise, fiber(s) will be alive after the object is stopped.
+    SCYLLA_ASSERT(_state == state::none || _state == state::stopped);
 }
 
 static shard_id repair_id_to_shard(tasks::task_id& repair_id) {
@@ -3364,7 +3685,7 @@ future<> repair_service::load_history() {
                     entry.ks, entry.cf, entry.table_uuid, entry.ts, range);
             try {
                 co_await get_db().invoke_on_all([table_uuid = entry.table_uuid, range, repair_time] (replica::database& local_db) {
-                    auto& gc_state = local_db.get_compaction_manager().get_tombstone_gc_state();
+                    auto& gc_state = local_db.get_compaction_manager().get_shared_tombstone_gc_state();
                     gc_state.update_repair_time(table_uuid, range, repair_time);
                 });
             } catch (...) {
@@ -3404,7 +3725,9 @@ repair_service::insert_repair_meta(
         streaming::stream_reason reason,
         gc_clock::time_point compaction_time,
         abort_source& as,
-        service::frozen_topology_guard topo_guard) {
+        service::frozen_topology_guard topo_guard,
+        std::optional<int64_t> repaired_at,
+        locator::tablet_repair_incremental_mode incremental_mode) {
     schema_ptr s = co_await get_migration_manager().get_schema_for_write(schema_version, from_id, src_cpu_id, get_messaging(), as);
     auto& db = get_db();
     reader_permit permit = co_await db.local().obtain_reader_permit(db.local().find_column_family(s->id()), "repair-meta", db::no_timeout, {});
@@ -3423,7 +3746,9 @@ repair_service::insert_repair_meta(
             std::move(master_node_shard_config),
             host_id_vector_replica_set{from_id},
             compaction_time,
-            topo_guard);
+            topo_guard,
+            repaired_at,
+            incremental_mode);
     rm->set_repair_state_for_local_node(repair_state::row_level_start_started);
     bool insertion = repair_meta_map().emplace(id, rm).second;
     if (!insertion) {
@@ -3440,7 +3765,8 @@ repair_service::remove_repair_meta(const locator::host_id& from,
         uint32_t repair_meta_id,
         sstring ks_name,
         sstring cf_name,
-        dht::token_range range) {
+        dht::token_range range,
+        bool mark_as_repaired) {
     node_repair_meta_id id{from, repair_meta_id};
     auto it = repair_meta_map().find(id);
     if (it == repair_meta_map().end()) {
@@ -3451,6 +3777,9 @@ repair_service::remove_repair_meta(const locator::host_id& from,
         repair_meta_map().erase(it);
         rlogger.debug("remove_repair_meta: Stop repair_meta_id {} for node {} started", id.repair_meta_id, id.ip);
         co_await rm->stop();
+        if (mark_as_repaired) {
+            co_await rm->mark_sstable_as_repaired();
+        }
         rlogger.debug("remove_repair_meta: Stop repair_meta_id {} for node {} finished", id.repair_meta_id, id.ip);
     }
 }

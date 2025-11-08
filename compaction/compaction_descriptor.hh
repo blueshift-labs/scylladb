@@ -17,10 +17,10 @@
 #include "compaction_fwd.hh"
 #include "mutation_writer/token_group_based_splitting_writer.hh"
 
-namespace sstables {
+namespace compaction {
 
 enum class compaction_type {
-    Compaction = 0,
+    Compaction = 0, // Used only for regular compactions
     Cleanup = 1,
     Validation = 2, // Origin uses this for a compaction that is used exclusively for repair
     Scrub = 3,
@@ -29,25 +29,28 @@ enum class compaction_type {
     Upgrade = 6,
     Reshape = 7,
     Split = 8,
+    Major = 9,
 };
 
 struct compaction_completion_desc {
     // Old, existing SSTables that should be deleted and removed from the SSTable set.
-    std::vector<shared_sstable> old_sstables;
+    std::vector<sstables::shared_sstable> old_sstables;
     // New, fresh SSTables that should be added to SSTable set, replacing the old ones.
-    std::vector<shared_sstable> new_sstables;
+    std::vector<sstables::shared_sstable> new_sstables;
     // Set of compacted partition ranges that should be invalidated in the cache.
     dht::partition_range_vector ranges_for_cache_invalidation;
 };
 
 // creates a new SSTable for a given shard
-using compaction_sstable_creator_fn = std::function<shared_sstable(shard_id shard)>;
+using compaction_sstable_creator_fn = std::function<sstables::shared_sstable(shard_id shard)>;
 // Replaces old sstable(s) by new one(s) which contain all non-expired data.
 using compaction_sstable_replacer_fn = std::function<void(compaction_completion_desc)>;
 
 class compaction_type_options {
 public:
     struct regular {
+    };
+    struct major {
     };
     struct cleanup {
     };
@@ -74,6 +77,11 @@ public:
         // Should invalid sstables be moved into quarantine.
         // Only applies to validate-mode.
         quarantine_invalid_sstables quarantine_sstables = quarantine_invalid_sstables::yes;
+
+        using drop_unfixable_sstables = bool_class<class drop_unfixable_sstables_tag>;
+        // Drop sstables that cannot be fixed.
+        // Only applies to segregate-mode.
+        drop_unfixable_sstables drop_unfixable = drop_unfixable_sstables::no;
     };
     struct reshard {
     };
@@ -83,7 +91,7 @@ public:
         mutation_writer::classify_by_token_group classifier;
     };
 private:
-    using options_variant = std::variant<regular, cleanup, upgrade, scrub, reshard, reshape, split>;
+    using options_variant = std::variant<regular, cleanup, upgrade, scrub, reshard, reshape, split, major>;
 
 private:
     options_variant _options;
@@ -105,6 +113,10 @@ public:
         return compaction_type_options(regular{});
     }
 
+    static compaction_type_options make_major() {
+        return compaction_type_options(major{});
+    }
+
     static compaction_type_options make_cleanup() {
         return compaction_type_options(cleanup{});
     }
@@ -113,8 +125,8 @@ public:
         return compaction_type_options(upgrade{});
     }
 
-    static compaction_type_options make_scrub(scrub::mode mode, scrub::quarantine_invalid_sstables quarantine_sstables = scrub::quarantine_invalid_sstables::yes) {
-        return compaction_type_options(scrub{.operation_mode = mode, .quarantine_sstables = quarantine_sstables});
+    static compaction_type_options make_scrub(scrub::mode mode, scrub::quarantine_invalid_sstables quarantine_sstables = scrub::quarantine_invalid_sstables::yes, scrub::drop_unfixable_sstables drop_unfixable_sstables = scrub::drop_unfixable_sstables::no) {
+        return compaction_type_options(scrub{.operation_mode = mode, .quarantine_sstables = quarantine_sstables, .drop_unfixable = drop_unfixable_sstables});
     }
 
     static compaction_type_options make_split(mutation_writer::classify_by_token_group classifier) {
@@ -169,7 +181,7 @@ struct compaction_descriptor {
     compaction_sstable_replacer_fn replacer;
 
     // Denotes if this compaction task is comprised solely of completely expired SSTables
-    sstables::has_only_fully_expired has_only_fully_expired = has_only_fully_expired::no;
+    has_only_fully_expired has_only_fully_expired = has_only_fully_expired::no;
 
     // If set to true, gc will check only the compacting sstables to collect tombstones.
     // If set to false, gc will check the memtables, commit log and other uncompacting
@@ -189,7 +201,7 @@ struct compaction_descriptor {
     explicit compaction_descriptor(std::vector<sstables::shared_sstable> sstables,
                                    int level = default_level,
                                    uint64_t max_sstable_bytes = default_max_sstable_bytes,
-                                   run_id run_identifier = run_id::create_random_id(),
+                                   sstables::run_id run_identifier = sstables::run_id::create_random_id(),
                                    compaction_type_options options = compaction_type_options::make_regular(),
                                    compaction::owned_ranges_ptr owned_ranges_ = {})
         : sstables(std::move(sstables))
@@ -200,12 +212,12 @@ struct compaction_descriptor {
         , owned_ranges(std::move(owned_ranges_))
     {}
 
-    explicit compaction_descriptor(sstables::has_only_fully_expired has_only_fully_expired,
+    explicit compaction_descriptor(::compaction::has_only_fully_expired has_only_fully_expired,
                                    std::vector<sstables::shared_sstable> sstables)
         : sstables(std::move(sstables))
         , level(default_level)
         , max_sstable_bytes(default_max_sstable_bytes)
-        , run_identifier(run_id::create_random_id())
+        , run_identifier(sstables::run_id::create_random_id())
         , options(compaction_type_options::make_regular())
         , has_only_fully_expired(has_only_fully_expired)
     {}
@@ -221,14 +233,14 @@ struct compaction_descriptor {
 }
 
 template <>
-struct fmt::formatter<sstables::compaction_type> : fmt::formatter<string_view> {
-    auto format(sstables::compaction_type, fmt::format_context& ctx) const -> decltype(ctx.out());
+struct fmt::formatter<compaction::compaction_type> : fmt::formatter<string_view> {
+    auto format(compaction::compaction_type, fmt::format_context& ctx) const -> decltype(ctx.out());
 };
 template <>
-struct fmt::formatter<sstables::compaction_type_options::scrub::mode> : fmt::formatter<string_view> {
-    auto format(sstables::compaction_type_options::scrub::mode, fmt::format_context& ctx) const -> decltype(ctx.out());
+struct fmt::formatter<compaction::compaction_type_options::scrub::mode> : fmt::formatter<string_view> {
+    auto format(compaction::compaction_type_options::scrub::mode, fmt::format_context& ctx) const -> decltype(ctx.out());
 };
 template <>
-struct fmt::formatter<sstables::compaction_type_options::scrub::quarantine_mode> : fmt::formatter<string_view> {
-    auto format(sstables::compaction_type_options::scrub::quarantine_mode, fmt::format_context& ctx) const -> decltype(ctx.out());
+struct fmt::formatter<compaction::compaction_type_options::scrub::quarantine_mode> : fmt::formatter<string_view> {
+    auto format(compaction::compaction_type_options::scrub::quarantine_mode, fmt::format_context& ctx) const -> decltype(ctx.out());
 };

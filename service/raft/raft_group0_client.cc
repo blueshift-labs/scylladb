@@ -10,11 +10,12 @@
 
 #include <optional>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/when_any.hh>
 #include "raft_group0_client.hh"
 #include "raft_group_registry.hh"
 
-#include "frozen_schema.hh"
-#include "schema_mutations.hh"
+#include "schema/frozen_schema.hh"
+#include "schema/schema_mutations.hh"
 #include "service/broadcast_tables/experimental/lang.hh"
 #include "idl/experimental/broadcast_tables_lang.dist.hh"
 #include "idl/experimental/broadcast_tables_lang.dist.impl.hh"
@@ -255,8 +256,26 @@ future<group0_guard> raft_group0_client::start_operation(seastar::abort_source& 
         throw exceptions::configuration_exception{"cannot start group0 operation in the maintenance mode"};
     }
 
-    auto [upgrade_lock_holder, upgrade_state] = co_await get_group0_upgrade_state();
+    std::pair<rwlock::holder, group0_upgrade_state> upgrade_lock_and_state = co_await get_group0_upgrade_state();
+    auto [upgrade_lock_holder, upgrade_state] = std::move(upgrade_lock_and_state);
     switch (upgrade_state) {
+        case group0_upgrade_state::synchronize:
+            logger.info("start_operation: waiting until local node leaves synchronize state to start a group 0 operation");
+            upgrade_lock_holder.release();
+            co_await when_any(wait_until_group0_upgraded(as), sleep_abortable(std::chrono::seconds{10}, as));
+            // Checks whether above wait returned due to sleep timeout, which confirms the upgrade procedure stuck case.
+            // Returns the corresponding runtime error in such cases.
+            upgrade_lock_and_state = co_await get_group0_upgrade_state();
+            upgrade_lock_holder = std::move(upgrade_lock_and_state.first);
+            upgrade_state = std::move(upgrade_lock_and_state.second);
+            upgrade_lock_holder.release();
+            if (upgrade_state != group0_upgrade_state::use_post_raft_procedures) {
+                throw std::runtime_error{
+                    "Cannot perform schema or topology changes during this time; the cluster is currently upgrading to use Raft for schema operations."
+                    " If this error keeps happening, check the logs of your nodes to learn the state of upgrade. The upgrade procedure may get stuck"
+                    " if there was a node failure."};
+            }
+            [[fallthrough]];
         case group0_upgrade_state::use_post_raft_procedures: {
             auto operation_holder = co_await get_units(_operation_mutex, 1, as);
             co_await _raft_gr.group0_with_timeouts().read_barrier(&as, timeout);
@@ -281,12 +300,6 @@ future<group0_guard> raft_group0_client::start_operation(seastar::abort_source& 
             };
        }
 
-        case group0_upgrade_state::synchronize:
-            throw std::runtime_error{
-                "Cannot perform schema or topology changes during this time; the cluster is currently upgrading to use Raft for schema operations."
-                " If this error keeps happening, check the logs of your nodes to learn the state of upgrade. The upgrade procedure may get stuck"
-                " if there was a node failure."};
-
         case group0_upgrade_state::recovery:
             logger.warn("starting operation in RECOVERY mode (using old procedures)");
             [[fallthrough]];
@@ -304,7 +317,9 @@ future<group0_guard> raft_group0_client::start_operation(seastar::abort_source& 
     }
 }
 
-void raft_group0_client::validate_change(const topology_change& change) {
+template<typename Command>
+requires std::same_as<Command, topology_change> || std::same_as<Command, mixed_change>
+void raft_group0_client::validate_change(const Command& change) {
     replica::validate_tablet_metadata_change(_token_metadata.get()->tablets(), change.mutations);
 }
 
@@ -502,6 +517,9 @@ void raft_group0_client::set_query_result(utils::UUID query_id, service::broadca
     }
 }
 
+template void raft_group0_client::validate_change(const topology_change& change);
+template void raft_group0_client::validate_change(const mixed_change& change);
+
 template group0_command raft_group0_client::prepare_command(schema_change change, group0_guard& guard, std::string_view description);
 template group0_command raft_group0_client::prepare_command(topology_change change, group0_guard& guard, std::string_view description);
 template group0_command raft_group0_client::prepare_command(write_mutations change, group0_guard& guard, std::string_view description);
@@ -540,7 +558,7 @@ void group0_batch::add_mutation(mutation m, std::string_view description) {
     }
 }
 
-void group0_batch::add_mutations(std::vector<mutation> ms, std::string_view description) {
+void group0_batch::add_mutations(utils::chunked_vector<mutation> ms, std::string_view description) {
     _muts.insert(_muts.end(),
             std::make_move_iterator(ms.begin()),
             std::make_move_iterator(ms.end()));
@@ -559,7 +577,7 @@ void group0_batch::add_generator(generator_func f, std::string_view description)
 static future<> add_write_mutations_entry(
         ::service::raft_group0_client& group0_client,
         std::string_view description,
-        std::vector<canonical_mutation> muts,
+        utils::chunked_vector<canonical_mutation> muts,
         ::service::group0_guard group0_guard,
         seastar::abort_source& as,
         std::optional<::service::raft_timeout> timeout) {
@@ -596,7 +614,7 @@ future<> group0_batch::commit(::service::raft_group0_client& group0_client, seas
     // common case, don't bother with generators as we would have only 1-2 mutations,
     // when producer expects substantial number or size of mutations it should use generator
     if (_generators.size() == 0) {
-        std::vector<canonical_mutation> cmuts = {_muts.begin(), _muts.end()};
+        utils::chunked_vector<canonical_mutation> cmuts = {_muts.begin(), _muts.end()};
         co_return co_await add_write_mutations_entry(group0_client, description, std::move(cmuts), std::move(*_guard), as, timeout);
     }
     // raft doesn't support streaming so we need to materialize all mutations in memory
@@ -604,12 +622,12 @@ future<> group0_batch::commit(::service::raft_group0_client& group0_client, seas
     if (_muts.empty()) {
         co_return;
     }
-    std::vector<canonical_mutation> cmuts = {_muts.begin(), _muts.end()};
+    utils::chunked_vector<canonical_mutation> cmuts = {_muts.begin(), _muts.end()};
     _muts.clear();
     co_await add_write_mutations_entry(group0_client, description, std::move(cmuts), std::move(*_guard), as, timeout);
 }
 
-future<std::pair<std::vector<mutation>, ::service::group0_guard>> group0_batch::extract() && {
+future<std::pair<utils::chunked_vector<mutation>, ::service::group0_guard>> group0_batch::extract() && {
     co_await materialize_mutations();
     co_return std::make_pair(std::move(_muts), std::move(*_guard));
 }

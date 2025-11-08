@@ -11,10 +11,11 @@ import logging
 import time
 import pytest
 
+from test.pylib.internal_types import ServerInfo
 from test.pylib.manager_client import ManagerClient
 from test.pylib.util import wait_for, wait_for_cql_and_get_hosts
 from test.cluster.conftest import skip_mode
-from test.cluster.util import disable_schema_agreement_wait, new_test_keyspace, new_test_table
+from test.cluster.util import delete_discovery_state_and_group0_id, delete_raft_group_data, disable_schema_agreement_wait, new_test_keyspace, new_test_table, reconnect_driver
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,7 @@ def get_expected_tombstone_gc_mode(rf, tablets):
 @pytest.mark.parametrize("rf", [1, 2])
 @pytest.mark.parametrize("tablets", [True, False])
 async def test_default_tombstone_gc(manager: ManagerClient, rf: int, tablets: bool):
-    _ = [await manager.server_add() for _ in range(2)]
+    _ = await manager.servers_add(2, auto_rack_dc="dc1")
     cql = manager.get_cql()
     tablets_enabled = "true" if tablets else "false"
     async with new_test_keyspace(manager, f"with replication = {{ 'class': 'NetworkTopologyStrategy', 'replication_factor': {rf}}} and tablets = {{ 'enabled': {tablets_enabled} }}") as keyspace:
@@ -44,7 +45,7 @@ async def test_default_tombstone_gc(manager: ManagerClient, rf: int, tablets: bo
 @pytest.mark.parametrize("rf", [1, 2])
 @pytest.mark.parametrize("tablets", [True, False])
 async def test_default_tombstone_gc_does_not_override(manager: ManagerClient, rf: int, tablets: bool):
-    _ = [await manager.server_add() for _ in range(2)]
+    _ = await manager.servers_add(2, auto_rack_dc="dc1")
     cql = manager.get_cql()
     tablets_enabled = "true" if tablets else "false"
     async with new_test_keyspace(manager, f"with replication = {{ 'class': 'NetworkTopologyStrategy', 'replication_factor': {rf}}} and tablets = {{ 'enabled': {tablets_enabled} }}") as keyspace:
@@ -83,6 +84,19 @@ async def test_group0_tombstone_gc(manager: ManagerClient):
             - tombstones exist from the previous test
         Assert:
             - the tombstones are cleaned up eventually
+
+    Test #4:
+        Regression test for https://github.com/scylladb/scylladb/issues/26534
+
+        Arrange:
+            - kill one of the nodes
+        Act:
+            - create new group0 tombstones by updating the schema (create/alter/delete random tables),
+            - perform the Raft-based recovery procedure, which creates a new group0
+        Assert:
+            - (4a) the tombstones are not cleaned up after both live nodes join the new group0 even though the killed
+              node doesn't belong to it,
+            - (4b) the tombstones are cleaned up after removing the killed node
     """
     cmdline = [
         # disabling caches as the tombstones still remain in the cache even after the compaction
@@ -92,7 +106,10 @@ async def test_group0_tombstone_gc(manager: ManagerClient):
     cfg = {
         'group0_tombstone_gc_refresh_interval_in_ms': 1000,  # this is 1 hour by default
     }
-    servers = [await manager.server_add(cmdline=cmdline, config=cfg) for _ in range(3)]
+    servers = await manager.servers_add(3, cmdline=cmdline, config=cfg, property_file=[
+        {"dc": "dc1", "rack": "r1"},
+        {"dc": "dc1", "rack": "r2"},
+        {"dc": "dc1", "rack": "r2"}])
 
     cql = manager.get_cql()
     hosts = [(await wait_for_cql_and_get_hosts(cql, [s], time.time() + 60))[0]
@@ -104,7 +121,7 @@ async def test_group0_tombstone_gc(manager: ManagerClient):
     async def alter_system_schema(keyspace=None, table_count=3):
         if not keyspace:
             async with new_test_keyspace(manager, "with replication = { 'class': 'NetworkTopologyStrategy', 'replication_factor': 2}", host=host_primary) as keyspace:
-                alter_system_schema(keyspace, table_count)
+                await alter_system_schema(keyspace, table_count)
                 return
 
         for _ in range(table_count):
@@ -199,6 +216,55 @@ async def test_group0_tombstone_gc(manager: ManagerClient):
 
             # test #3: the tombstones are cleaned up after the node is started again
             await verify_tombstone_gc(tombstone_mark)
+
+            first_group0_id = (await cql.run_async(
+                "SELECT value FROM system.scylla_local WHERE key = 'raft_group0_id'"))[0].value
+
+            # Kill one server.
+            await manager.server_stop(down_server.server_id)
+            servers.pop()
+
+            await alter_system_schema(keyspace)
+            tombstone_mark = datetime.now(timezone.utc)
+
+            # Start the Raft-based recovery procedure.
+            await manager.rolling_restart(servers, wait_for_cql=False)
+
+            # TODO: do not reconnect the driver (here and below) once scylladb/python-driver#295 is fixed.
+            # It doesn't go well with disable_schema_agreement_wait above.
+            cql = await reconnect_driver(manager)
+            cql.cluster.max_schema_agreement_wait = 0
+            hosts = [(await wait_for_cql_and_get_hosts(cql, [s], time.time() + 60))[0]
+                     for s in servers]
+
+            for h in hosts:
+                await delete_discovery_state_and_group0_id(cql, h)
+
+            recovery_leader_id = await manager.get_host_id(servers[0].server_id)
+
+            async def set_recovery_leader(srv: ServerInfo):
+                await manager.server_update_config(srv.server_id, 'recovery_leader', recovery_leader_id)
+
+            await manager.rolling_restart(servers, with_down=set_recovery_leader, wait_for_cql=False)
+
+            cql = await reconnect_driver(manager)
+            cql.cluster.max_schema_agreement_wait = 0
+            await wait_for_cql_and_get_hosts(cql, servers, time.time() + 60)
+
+            # test #4a: the tombstones are not cleaned up after both live nodes join the new group0
+            with pytest.raises(AssertionError, match="Deadline exceeded"):
+                await verify_tombstone_gc(tombstone_mark, timeout=5)
+
+            await manager.remove_node(servers[0].server_id, down_server.server_id)
+
+            # test #4b: the tombstones are cleaned up after removing the killed node
+            await verify_tombstone_gc(tombstone_mark)
+
+            # Finish the Raft-based recovery procedure. We leave the cluster in a clean state for future tests.
+            for srv in servers:
+                await manager.server_remove_config_option(srv.server_id, 'recovery_leader')
+            for h in hosts:
+                await delete_raft_group_data(first_group0_id, cql, h)
 
 
 @pytest.mark.asyncio

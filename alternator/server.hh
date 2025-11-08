@@ -9,6 +9,7 @@
 #pragma once
 
 #include "alternator/executor.hh"
+#include "utils/scoped_item_list.hh"
 #include <seastar/core/future.hh>
 #include <seastar/core/condition-variable.hh>
 #include <seastar/http/httpd.hh>
@@ -20,12 +21,18 @@
 #include "utils/updateable_value.hh"
 #include <seastar/core/units.hh>
 
+struct client_data;
+
 namespace alternator {
 
 using chunked_content = rjson::chunked_content;
 
 class server : public peering_sharded_service<server> {
-    static constexpr size_t content_length_limit = 16*MB;
+    // The maximum size of a request body that Alternator will accept,
+    // in bytes. This is a safety measure to prevent Alternator from
+    // running out of memory when a client sends a very large request.
+    // DynamoDB also has the same limit set to 16 MB.
+    static constexpr size_t request_content_length_limit = 16*MB;
     using alternator_callback = std::function<future<executor::request_return_type>(executor&, executor::client_state&,
             tracing::trace_state_ptr, service_permit, rjson::value, std::unique_ptr<http::request>)>;
     using alternator_callbacks_map = std::unordered_map<std::string_view, alternator_callback>;
@@ -40,8 +47,10 @@ class server : public peering_sharded_service<server> {
 
     key_cache _key_cache;
     utils::updateable_value<bool> _enforce_authorization;
+    utils::updateable_value<bool> _warn_authorization;
+    utils::updateable_value<uint64_t> _max_users_query_size_in_trace_output;
     utils::small_vector<std::reference_wrapper<seastar::httpd::http_server>, 2> _enabled_servers;
-    gate _pending_requests;
+    named_gate _pending_requests;
     // In some places we will need a CQL updateable_timeout_config object even
     // though it isn't really relevant for Alternator which defines its own
     // timeouts separately. We can create this object only once.
@@ -74,12 +83,31 @@ class server : public peering_sharded_service<server> {
     };
     json_parser _json_parser;
 
+    // The server maintains a list of ongoing requests, that are being handled
+    // by handle_api_request(). It uses this list in get_client_data(), which
+    // is called when reading the "system.clients" virtual table.
+    struct ongoing_request {
+        socket_address _client_address;
+        sstring _user_agent;
+        sstring _username;
+        scheduling_group _scheduling_group;
+        bool _is_https;
+        client_data make_client_data() const;
+    };
+    utils::scoped_item_list<ongoing_request> _ongoing_requests;
+
 public:
     server(executor& executor, service::storage_proxy& proxy, gms::gossiper& gossiper, auth::service& service, qos::service_level_controller& sl_controller);
 
     future<> init(net::inet_address addr, std::optional<uint16_t> port, std::optional<uint16_t> https_port, std::optional<tls::credentials_builder> creds,
-            utils::updateable_value<bool> enforce_authorization, semaphore* memory_limiter, utils::updateable_value<uint32_t> max_concurrent_requests);
+            utils::updateable_value<bool> enforce_authorization, utils::updateable_value<bool> warn_authorization, utils::updateable_value<uint64_t> max_users_query_size_in_trace_output,
+            semaphore* memory_limiter, utils::updateable_value<uint32_t> max_concurrent_requests);
     future<> stop();
+    // get_client_data() is called (on each shard separately) when the virtual
+    // table "system.clients" is read. It is expected to generate a list of
+    // clients connected to this server (on this shard). This function is
+    // called by alternator::controller::get_client_data().
+    future<utils::chunked_vector<client_data>> get_client_data();
 private:
     void set_routes(seastar::httpd::routes& r);
     // If verification succeeds, returns the authenticated user's username

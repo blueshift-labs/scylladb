@@ -20,7 +20,6 @@ import logging
 import os
 import pathlib
 import random
-import re
 import shlex
 import shutil
 import signal
@@ -101,32 +100,6 @@ def configure_cpusets():
         CS_CPUSET.set(None)
     config_logger.info(f"Choosing cpusets for nodes: {NODE_CPUSETS.get()}")
     config_logger.info(f"Choosing cpuset for load generators: {CS_CPUSET.get()}")
-
-JAVA_HOME: ContextVar[Optional[str]] = ContextVar('JAVA_HOME')
-
-async def configure_java() -> None:
-    """
-    cassandra-stress can only deal with Java 11
-    """
-    version_output = (await bash("java -version", stderr=asyncio.subprocess.PIPE))[2]
-    assert isinstance(version_output, bytes)
-    version_first_line = version_output.decode().split(sep='\n')[0]
-    config_logger.info(f"First line of java -version: {version_first_line}")
-    version = 11
-    if re.search(rf'version.*{version}\.[0-9]+\.[0-9]+', version_first_line):
-        config_logger.info(f"Default Java version recognized as Java {version}. Proceeding with the default.")
-        JAVA_HOME.set(None)
-        return
-
-    config_logger.info(f"Default Java version is not recognized as Java {version}.")
-    if os.path.exists(java_path := f'/usr/lib/jvm/java-{version}'):
-        config_logger.warning(f"{java_path} found. Choosing it as JAVA_HOME.")
-        JAVA_HOME.set(java_path)
-        return
-
-    error = f"Failed to find a suitable Java version. Java {version} is required."
-    config_logger.error(error)
-    raise RuntimeError(error)
 
 ################################################################################
 # Child process utilities
@@ -413,6 +386,8 @@ async def start_node(executable: PathLike, cluster_workdir: PathLike, addr: str,
         f"--cas-contention-timeout-in-ms=60000",
         f"--alternator-port=8000",
         f"--alternator-write-isolation=only_rmw_uses_lwt",
+        f"--authenticator=PasswordAuthenticator",
+        f"--authorizer=CassandraAuthorizer",
     ] + list(extra_opts)
     return await run(['bash', '-c', fr"""exec {shlex.join(command)} >{q(logfile)} 2>&1"""], cwd=cluster_workdir)
 
@@ -534,14 +509,14 @@ async def with_cluster(executable: PathLike, workdir: PathLike, cpusets: Optiona
 
 def cs_command(cmd: list[str], n: int, node: str, cl: str, pop: Optional[str] = None, warmup: bool = False, rate: str = "threads=200", schema: Optional[str] = None) -> list[str]:
     """Strings together a cassandra-stress command from given options."""
-    return (["env", f"JAVA_HOME={JAVA_HOME.get()}"] if JAVA_HOME.get() else []) + [
-        "../tools/java/tools/bin/cassandra-stress",
+    return [
+        "cassandra-stress",
         *cmd,
         f"n={n}",
         f"cl={cl}",
     ] + (["no-warmup"] if not warmup else []) + [
     ] + (["-pop", pop] if pop else []) + [
-        "-mode", "native", "cql3", "protocolVersion=4",
+        "-mode", "native", "cql3", "protocolVersion=4", "user=cassandra", "password=cassandra",
         "-node", node,
         "-rate", rate,
     ] + (["-schema", schema] if schema else []) + [
@@ -686,6 +661,33 @@ async def train_decommission(executable: PathLike, workdir: PathLike) -> None:
 trainers["decommission"] = ("decommission_dataset", train_decommission)
 populators["decommission_dataset"] = populate_decommission
 
+# AUTH CONNECTIONS STRESS ==================================================
+
+async def populate_auth_conns(executable: PathLike, workdir: PathLike) -> None:
+    # Create roles, table and permissions via CQL script.
+    async with with_cs_populate(executable=executable, workdir=workdir) as server:
+        await bash(fr"python3 ./exec_cql.py --file conf/auth.cql --host {server}")
+
+async def train_auth_conns(executable: PathLike, workdir: PathLike) -> None:
+    # Repeatedly connect as the reader user and perform simple reads to stress
+    # authentication, authorization and connection setup paths.
+    async with with_cluster(executable=executable, workdir=workdir) as (addrs, procs):
+        await asyncio.sleep(5) # FIXME: artificial gossip sleep, get rid of it.
+        # Run 30k connection requests.
+        await run_checked([
+            "python3", "./auth_conns_stress.py",
+            "--host", addrs[0],
+            "--user", "reader_role",
+            "--password", "password1",
+            "--processes", "30",
+            "--threads", "10",
+            "--iterations", "100"
+        ], cpuset=CS_CPUSET.get())
+    await merge_profraw(workdir)
+
+trainers["auth_conns"] = ("auth_conns_dataset", train_auth_conns)
+populators["auth_conns_dataset"] = populate_auth_conns
+
 # LWT ==================================================
 
 async def populate_lwt(executable: PathLike, workdir: PathLike) -> None:
@@ -717,7 +719,7 @@ populators["si_dataset"] = populate_si
 
 async def populate_counters(executable: PathLike, workdir: PathLike) -> None:
     async with with_cs_populate(executable=executable, workdir=workdir) as server:
-        await bash(fr"../tools/java/bin/cqlsh -f conf/counters.yaml {server}")
+        await bash(fr"python3 ./exec_cql.py --file conf/counters.cql --host {server}")
         # Sleeps added in reaction to schema disagreement errors.
         # FIXME: get rid of this sleep and find a sane way to wait for schema
         # agreement.
@@ -729,10 +731,7 @@ async def train_counters(executable: PathLike, workdir: PathLike) -> None:
         await cs(cmd=["counter_write"], n=50000, pop=f"dist=UNIFORM(1..1000000)", cl="local_quorum", node=server, schema="keyspace=counters")
         await cs(cmd=["counter_read"], n=50000, pop=f"dist=UNIFORM(1..1000000)", cl="local_quorum", node=server, schema="keyspace=counters")
 
-# This workload depends on cqlsh, so it's commented out until we merge
-# python3 support in cqlsh (which, at the moment of writing, is supposed
-# to be imminent).
-#trainers["counters"] = ("counters_dataset", train_counters)
+trainers["counters"] = ("counters_dataset", train_counters)
 populators["counters_dataset"] = populate_counters
 
 # REPAIR ==================================================
@@ -751,8 +750,7 @@ async def train_repair(executable: PathLike, workdir: PathLike) -> None:
     await bash(fr"rm -rf {workdir}/{addr}/data/ks/*")
     async with with_cluster(executable=executable, workdir=workdir) as (addrs, procs):
         await asyncio.sleep(5) # FIXME: artificial gossip sleep, get rid of it.
-        repair_id = (await query(["curl", "--silent", "-X", "POST", fr"http://{addr}:10000/storage_service/repair_async/ks"])).decode()
-        await query(["curl", "--silent", fr"http://{addr}:10000/storage_service/repair_status/?id={repair_id}"])
+        await query(["curl", "--silent", "-X", "POST", fr"http://{addr}:10000/storage_service/tablets/repair?ks=ks&await_completion=true"])
     await merge_profraw(workdir)
 
 trainers["repair"] = ("repair_dataset", train_repair)
@@ -817,7 +815,6 @@ async def train_full(executable: PathLike, output_profile_file: PathLike, datase
     training_logger.info(f"Starting training of executable {executable}. Exhaustive logs can be found in {LOGDIR.get()}/")
 
     configure_cpusets()
-    await configure_java()
 
     assert executable_exists(executable)
 

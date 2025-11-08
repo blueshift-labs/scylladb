@@ -13,8 +13,8 @@
 #include "partition_snapshot_reader.hh"
 #include "partition_builder.hh"
 #include "mutation/mutation_partition_view.hh"
-#include "readers/empty_v2.hh"
-#include "readers/forwardable_v2.hh"
+#include "readers/empty.hh"
+#include "readers/forwardable.hh"
 #include "sstables/types.hh"
 
 namespace replica {
@@ -121,17 +121,21 @@ void memtable::memtable_encoding_stats_collector::update(const ::schema& s, cons
 memtable::memtable(schema_ptr schema, dirty_memory_manager& dmm,
     memtable_table_shared_data& table_shared_data,
     replica::table_stats& table_stats,
-    memtable_list* memtable_list, seastar::scheduling_group compaction_scheduling_group)
+    memtable_list* memtable_list,
+    seastar::scheduling_group compaction_scheduling_group,
+    shared_tombstone_gc_state* shared_gc_state)
         : dirty_memory_manager_logalloc::size_tracked_region()
         , _dirty_mgr(dmm)
-        , _cleaner(*this, no_cache_tracker, table_stats.memtable_app_stats, compaction_scheduling_group,
-                   [this] (size_t freed) { remove_flushed_memory(freed); })
+        , _cleaner(*this, no_cache_tracker, table_stats.memtable_app_stats, compaction_scheduling_group)
         , _memtable_list(memtable_list)
         , _schema(std::move(schema))
         , _table_shared_data(table_shared_data)
         , partitions(dht::raw_token_less_comparator{})
         , _table_stats(table_stats) {
-    logalloc::region::listen(&dmm.region_group());
+    if (shared_gc_state) {
+        _tombstone_gc_snapshot.emplace(shared_gc_state->snapshot());
+    }
+    logalloc::region::listen(this);
 }
 
 static thread_local dirty_memory_manager mgr_for_tests;
@@ -149,23 +153,17 @@ memtable::~memtable() {
     logalloc::region::unlisten();
 }
 
-uint64_t memtable::dirty_size() const {
-    return occupancy().total_space();
-}
-
 void memtable::evict_entry(memtable_entry& e, mutation_cleaner& cleaner) noexcept {
     e.partition().evict(cleaner);
     nr_partitions--;
 }
 
 void memtable::clear() noexcept {
-    auto dirty_before = dirty_size();
     with_allocator(allocator(), [this] {
         partitions.clear_and_dispose([this] (memtable_entry* e) noexcept {
             evict_entry(*e, _cleaner);
         });
     });
-    remove_flushed_memory(dirty_before - dirty_size());
 }
 
 future<> memtable::clear_gently() noexcept {
@@ -176,7 +174,6 @@ future<> memtable::clear_gently() noexcept {
             auto p = std::move(partitions);
             nr_partitions = 0;
             while (!p.empty()) {
-                auto dirty_before = dirty_size();
                 with_allocator(alloc, [&] () noexcept {
                     while (!p.empty()) {
                         if (p.begin()->clear_gently() == stop_iteration::no) {
@@ -188,7 +185,6 @@ future<> memtable::clear_gently() noexcept {
                         }
                     }
                 });
-                remove_flushed_memory(dirty_before - dirty_size());
                 seastar::thread::yield();
             }
 
@@ -283,6 +279,11 @@ memtable::slice(const dht::partition_range& range) const {
 }
 
 class iterator_reader {
+    // DO NOT RELEASE the memtable! Keep a reference to it, so it stays in
+    // memtable_list::_flushed_memtables_with_active_reads and so that it keeps
+    // blocking tombstone GC of tombstone in the cache, which cover data that
+    // used to be in this memtable, and which will possibly be produced by this
+    // reader later on.
     lw_shared_ptr<memtable> _memtable;
     schema_ptr _schema;
     const dht::partition_range* _range;
@@ -380,8 +381,7 @@ protected:
                                     const query::partition_slice& slice,
                                     streamed_mutation::forwarding fwd,
                                     mutation_reader::forwarding fwd_mr) {
-        auto ret = _memtable->_underlying->make_reader_v2(_schema, std::move(permit), delegate, slice, nullptr, fwd, fwd_mr);
-        _memtable = {};
+        auto ret = _memtable->_underlying->make_mutation_reader(_schema, std::move(permit), delegate, slice, nullptr, fwd, fwd_mr);
         _last = {};
         return ret;
     }
@@ -525,13 +525,16 @@ public:
 
 void memtable::add_flushed_memory(uint64_t delta) {
     _flushed_memory += delta;
-    _dirty_mgr.account_potentially_cleaned_up_memory(this, delta);
+    if (_flushed_memory > 0) {
+        _dirty_mgr.account_potentially_cleaned_up_memory(this, std::min<int64_t>(delta, _flushed_memory));
+    }
 }
 
 void memtable::remove_flushed_memory(uint64_t delta) {
-    delta = std::min(_flushed_memory, delta);
+    if (_flushed_memory > 0) {
+        _dirty_mgr.revert_potentially_cleaned_up_memory(this, std::min<int64_t>(delta, _flushed_memory));
+    }
     _flushed_memory -= delta;
-    _dirty_mgr.revert_potentially_cleaned_up_memory(this, delta);
 }
 
 void memtable::on_detach_from_region_group() noexcept {
@@ -540,8 +543,11 @@ void memtable::on_detach_from_region_group() noexcept {
 }
 
 void memtable::revert_flushed_memory() noexcept {
-    _dirty_mgr.revert_potentially_cleaned_up_memory(this, _flushed_memory);
+    if (_flushed_memory > 0) {
+        _dirty_mgr.revert_potentially_cleaned_up_memory(this, _flushed_memory);
+    }
     _flushed_memory = 0;
+    _total_memory_low_watermark_during_flush = _total_memory;
 }
 
 class flush_memory_accounter {
@@ -554,7 +560,7 @@ public:
         : _mt(mt)
 	{}
     ~flush_memory_accounter() {
-        SCYLLA_ASSERT(_mt._flushed_memory <= _mt.occupancy().total_space());
+        SCYLLA_ASSERT(_mt._flushed_memory <= static_cast<int64_t>(_mt.occupancy().total_space()));
     }
     uint64_t compute_size(memtable_entry& e, partition_snapshot& snp) {
         return e.size_in_allocator_without_rows(_mt.allocator())
@@ -706,7 +712,7 @@ partition_snapshot_ptr memtable_entry::snapshot(memtable& mtbl) {
 }
 
 mutation_reader_opt
-memtable::make_flat_reader_opt(schema_ptr query_schema,
+memtable::make_mutation_reader_opt(schema_ptr query_schema,
                       reader_permit permit,
                       const dht::partition_range& range,
                       const query::partition_slice& slice,
@@ -747,6 +753,7 @@ memtable::make_flat_reader_opt(schema_ptr query_schema,
 mutation_reader
 memtable::make_flush_reader(schema_ptr s, reader_permit permit) {
     if (!_merged_into_cache) {
+        revert_flushed_memory();
         return make_mutation_reader<flush_reader>(std::move(s), std::move(permit), shared_from_this());
     } else {
         auto& full_slice = s->full_slice();
@@ -766,7 +773,7 @@ memtable::update(db::rp_handle&& h) {
 
 future<>
 memtable::apply(memtable& mt, reader_permit permit) {
-    if (auto reader_opt = mt.make_flat_reader_opt(_schema, std::move(permit), query::full_partition_range, _schema->full_slice())) {
+    if (auto reader_opt = mt.make_mutation_reader_opt(_schema, std::move(permit), query::full_partition_range, _schema->full_slice())) {
         return with_closeable(std::move(*reader_opt), [this] (auto&& rd) mutable {
             return consume_partitions(rd, [self = this->shared_from_this()] (mutation&& m) {
                 self->apply(m);
@@ -816,7 +823,7 @@ mutation_source memtable::as_data_source() {
             tracing::trace_state_ptr trace_state,
             streamed_mutation::forwarding fwd,
             mutation_reader::forwarding fwd_mr) {
-        return mt->make_flat_reader(std::move(s), std::move(permit), range, slice, std::move(trace_state), fwd, fwd_mr);
+        return mt->make_mutation_reader(std::move(s), std::move(permit), range, slice, std::move(trace_state), fwd, fwd_mr);
     });
 }
 
@@ -832,6 +839,10 @@ stop_iteration memtable_entry::clear_gently() noexcept {
 
 void memtable::mark_flushed(mutation_source underlying) noexcept {
     _underlying = std::move(underlying);
+}
+
+bool memtable::is_merging_to_cache() const noexcept {
+    return _merging_into_cache;
 }
 
 bool memtable::is_flushed() const noexcept {
@@ -870,4 +881,36 @@ auto fmt::formatter<replica::memtable>::format(replica::memtable& mt,
                                         fmt::format_context& ctx) const -> decltype(ctx.out()) {
     logalloc::reclaim_lock rl(mt);
     return fmt::format_to(ctx.out(), "{{memtable: [{}]}}", fmt::join(mt.partitions, ",\n"));
+}
+
+void replica::memtable::increase_usage(logalloc::region* r, ssize_t delta) {
+    SCYLLA_ASSERT(delta >= 0);
+    _dirty_mgr.region_group().increase_usage(r);
+    _dirty_mgr.region_group().update_unspooled(delta);
+    _total_memory += delta;
+}
+
+void replica::memtable::decrease_evictable_usage(logalloc::region* r) {
+    _dirty_mgr.region_group().decrease_usage(r);
+}
+
+void replica::memtable::decrease_usage(logalloc::region* r, ssize_t delta) {
+    SCYLLA_ASSERT(delta <= 0);
+    _dirty_mgr.region_group().decrease_usage(r);
+    _dirty_mgr.region_group().update_unspooled(delta);
+    _total_memory += delta;
+    if (_total_memory < _total_memory_low_watermark_during_flush) {
+        remove_flushed_memory(_total_memory_low_watermark_during_flush - _total_memory);
+        _total_memory_low_watermark_during_flush = _total_memory;
+    }
+}
+
+void replica::memtable::add(logalloc::region* r) {
+    _dirty_mgr.region_group().add(r);
+}
+void replica::memtable::del(logalloc::region* r) {
+    _dirty_mgr.region_group().del(r);
+}
+void replica::memtable::moved(logalloc::region* old_address, logalloc::region* new_address) {
+    _dirty_mgr.region_group().moved(old_address, new_address);
 }

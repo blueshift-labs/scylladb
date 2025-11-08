@@ -14,7 +14,14 @@
 #include "index/secondary_index.hh"
 #include "exceptions/exceptions.hh"
 
-void cql3::statements::index_prop_defs::validate() {
+static void check_system_option_specified(const index_options_map& options, const sstring& option_name) {
+    if (options.count(option_name)) {
+        throw exceptions::invalid_request_exception(
+                fmt::format("Cannot specify {} as a CUSTOM option", option_name));
+    }
+}
+
+void cql3::statements::index_prop_defs::validate() const {
     static std::set<sstring> keywords({ sstring(KW_OPTIONS) });
 
     property_definitions::validate(keywords);
@@ -22,40 +29,28 @@ void cql3::statements::index_prop_defs::validate() {
     if (is_custom && !custom_class) {
         throw exceptions::invalid_request_exception("CUSTOM index requires specifying the index class");
     }
-
-    if (!is_custom && custom_class) {
-        throw exceptions::invalid_request_exception("Cannot specify index class for a non-CUSTOM index");
-    }
-    if (!is_custom && !_properties.empty()) {
+    
+    if (!custom_class && !_properties.empty()) {
         throw exceptions::invalid_request_exception("Cannot specify options for a non-CUSTOM index");
     }
-    if (get_raw_options().count(
-            db::index::secondary_index::custom_index_option_name)) {
-        throw exceptions::invalid_request_exception(
-                format("Cannot specify {} as a CUSTOM option",
-                        db::index::secondary_index::custom_index_option_name));
-    }
+    auto options = get_raw_options();
+    check_system_option_specified(options, db::index::secondary_index::custom_class_option_name);
+    check_system_option_specified(options, db::index::secondary_index::index_version_option_name);
 
-    // Currently, Scylla does not support *any* class of custom index
-    // implementation. If in the future we do (e.g., SASI, or something
-    // new), we'll need to check for valid values here.
-    if (is_custom && custom_class) {
-        throw exceptions::invalid_request_exception(
-                format("Unsupported CUSTOM INDEX class {}. Note that currently, Scylla does not support SASI or any other CUSTOM INDEX class.",
-                        *custom_class));
-
-    }
 }
 
 index_options_map
-cql3::statements::index_prop_defs::get_raw_options() {
+cql3::statements::index_prop_defs::get_raw_options() const {
     auto options = get_map(KW_OPTIONS);
     return !options ? std::unordered_map<sstring, sstring>() : std::unordered_map<sstring, sstring>(options->begin(), options->end());
 }
 
 index_options_map
-cql3::statements::index_prop_defs::get_options() {
+cql3::statements::index_prop_defs::get_options() const {
     auto options = get_raw_options();
-    options.emplace(db::index::secondary_index::custom_index_option_name, *custom_class);
+    options.emplace(db::index::secondary_index::custom_class_option_name, *custom_class);
+    if (index_version.has_value()) {
+        options.emplace(db::index::secondary_index::index_version_option_name, index_version->to_sstring());
+    }
     return options;
 }

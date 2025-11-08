@@ -144,11 +144,23 @@ unfreeze_gently(const frozen_mutation& fm, schema_ptr schema) {
     co_return m;
 }
 
-future<std::vector<mutation>> unfreeze_gently(std::span<frozen_mutation> muts) {
-    std::vector<mutation> result;
+future<utils::chunked_vector<mutation>> unfreeze_gently(const utils::chunked_vector<frozen_mutation>& muts) {
+    utils::chunked_vector<mutation> result;
     result.reserve(muts.size());
     for (auto& fm : muts) {
         result.push_back(co_await unfreeze_gently(fm, local_schema_registry().get(fm.schema_version())));
     }
     co_return result;
+}
+
+future<>
+unfreeze_and_split_gently(const frozen_mutation& fm, schema_ptr schema, size_t max_rows, std::function<future<>(mutation)> process_mutation) {
+    check_schema_version(fm.schema_version(), *schema);
+    partition_split_builder b(schema, fm.key(), max_rows, std::move(process_mutation));
+    try {
+        co_await fm.partition().accept_gently(*schema, b);
+    } catch (...) {
+        std::throw_with_nested(std::runtime_error(format(
+                "frozen_mutation::unfreeze_gently(): failed unfreezing mutation {} of {}.{}", fm.key(), schema->ks_name(), schema->cf_name())));
+    }
 }

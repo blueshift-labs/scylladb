@@ -30,13 +30,18 @@
 #include "db/per_partition_rate_limit_extension.hh"
 #include "db/paxos_grace_seconds_extension.hh"
 #include "db/tags/extension.hh"
+#include "db/object_storage_endpoint_param.hh"
 #include "config.hh"
 #include "extensions.hh"
+#include "sstables/compressor.hh"
 #include "utils/log.hh"
 #include "service/tablet_allocator_fwd.hh"
 #include "utils/config_file_impl.hh"
+#include "exceptions/exceptions.hh"
 #include <seastar/core/metrics_api.hh>
 #include <seastar/core/relabel_config.hh>
+
+static logging::logger cfglogger("config");
 #include <seastar/util/file.hh>
 
 namespace utils {
@@ -76,6 +81,22 @@ hinted_handoff_enabled_to_json(const db::config::hinted_handoff_enabled_type& h)
     return value_to_json(h.to_configuration_string());
 }
 
+static
+json::json_return_type
+object_storage_endpoints_to_json(const std::vector<db::object_storage_endpoint_param> &endpoints) {
+    std::unordered_map<sstring, sstring> m;
+    for (auto& e : endpoints) {
+        m[e.key()] = e.to_json_string();
+    }
+    return value_to_json(m);
+}
+
+static
+json::json_return_type
+uuid_to_json(const db::config::UUID& uuid) {
+    return value_to_json(format("{}", uuid));
+}
+
 // Convert a value that can be printed with fmt::format, or a vector of
 // such values, to JSON. An example is enum_option<T>, because enum_option<T>
 // has a specialization for fmt::formatter.
@@ -99,6 +120,12 @@ static
 json::json_return_type
 error_injection_list_to_json(const std::vector<db::config::error_injection_at_startup>& eil) {
     return value_to_json("error_injection_list");
+}
+
+static
+json::json_return_type
+compression_parameters_to_json(const compression_parameters& cp) {
+    return value_to_json(cp.get_options());
 }
 
 template <>
@@ -246,6 +273,13 @@ const config_type& config_type_for<enum_option<db::tri_mode_restriction_t>>() {
 }
 
 template <>
+const config_type& config_type_for<enum_option<db::tablets_mode_t>>() {
+    static config_type ct(
+        "tablets mode", printable_to_json<enum_option<db::tablets_mode_t>>);
+    return ct;
+}
+
+template <>
 const config_type& config_type_for<db::config::hinted_handoff_enabled_type>() {
     static config_type ct("hinted handoff enabled", hinted_handoff_enabled_to_json);
     return ct;
@@ -258,16 +292,34 @@ const config_type& config_type_for<std::vector<db::config::error_injection_at_st
 }
 
 template <>
-const config_type& config_type_for<enum_option<utils::dict_training_loop::when>>() {
+const config_type& config_type_for<enum_option<netw::dict_training_loop::when>>() {
     static config_type ct(
-        "dictionary training conditions", printable_to_json<enum_option<utils::dict_training_loop::when>>);
+        "dictionary training conditions", printable_to_json<enum_option<netw::dict_training_loop::when>>);
     return ct;
 }
 
 template <>
-const config_type& config_type_for<utils::advanced_rpc_compressor::tracker::algo_config>() {
+const config_type& config_type_for<netw::advanced_rpc_compressor::tracker::algo_config>() {
     static config_type ct(
-        "advanced rpc compressor config", printable_vector_to_json<enum_option<compression_algorithm>>);
+        "advanced rpc compressor config", printable_vector_to_json<enum_option<netw::compression_algorithm>>);
+    return ct;
+}
+
+template <>
+const config_type& config_type_for<std::vector<db::object_storage_endpoint_param>>() {
+    static config_type ct("object storage endpoint configuration", object_storage_endpoints_to_json);
+    return ct;
+}
+
+template <>
+const config_type& config_type_for<db::config::UUID>() {
+    static config_type ct("UUID", uuid_to_json);
+    return ct;
+}
+
+template <>
+const config_type& config_type_for<compression_parameters>() {
+    static config_type ct("compression parameters", compression_parameters_to_json);
     return ct;
 }
 
@@ -379,6 +431,23 @@ public:
     }
 };
 
+template <>
+class convert<enum_option<db::tablets_mode_t>> {
+public:
+    static bool decode(const Node& node, enum_option<db::tablets_mode_t>& rhs) {
+        std::string name;
+        if (!convert<std::string>::decode(node, name)) {
+            return false;
+        }
+        try {
+            std::istringstream(name) >> rhs;
+        } catch (boost::program_options::invalid_option_value&) {
+            return false;
+        }
+        return true;
+    }
+};
+
 template<>
 struct convert<db::config::error_injection_at_startup> {
     static bool decode(const Node& node, db::config::error_injection_at_startup& rhs) {
@@ -406,9 +475,9 @@ struct convert<db::config::error_injection_at_startup> {
 
 
 template <>
-class convert<enum_option<utils::dict_training_loop::when>> {
+class convert<enum_option<netw::dict_training_loop::when>> {
 public:
-    static bool decode(const Node& node, enum_option<utils::dict_training_loop::when>& rhs) {
+    static bool decode(const Node& node, enum_option<netw::dict_training_loop::when>& rhs) {
         std::string name;
         if (!convert<std::string>::decode(node, name)) {
             return false;
@@ -423,9 +492,9 @@ public:
 };
 
 template <>
-class convert<enum_option<utils::compression_algorithm>> {
+class convert<enum_option<netw::compression_algorithm>> {
 public:
-    static bool decode(const Node& node, enum_option<utils::compression_algorithm>& rhs) {
+    static bool decode(const Node& node, enum_option<netw::compression_algorithm>& rhs) {
         std::string name;
         if (!convert<std::string>::decode(node, name)) {
             return false;
@@ -436,6 +505,58 @@ public:
             return false;
         }
         return true;
+    }
+};
+
+template<>
+struct convert<db::object_storage_endpoint_param> {
+    static bool decode(const Node& node, db::object_storage_endpoint_param& ep) {
+        ep = db::object_storage_endpoint_param::decode(node);
+        return true;
+    }
+};
+
+template<>
+struct convert<utils::UUID> {
+    static bool decode(const Node& node, utils::UUID& uuid) {
+        std::string uuid_string;
+        if (!convert<std::string>::decode(node, uuid_string)) {
+            return false;
+        }
+        try {
+            std::istringstream(uuid_string) >> uuid;
+        } catch (boost::program_options::invalid_option_value&) {
+            return false;
+        }
+        return true;
+    }
+};
+
+template<>
+struct convert<compression_parameters> {
+    static bool decode(const Node& node, compression_parameters& cp) {
+        if (!node.IsMap()) {
+            return false;
+        }
+
+        std::map<sstring, sstring> options;
+        for (const auto& kv : node) {
+            options[kv.first.as<sstring>()] = kv.second.as<sstring>();
+        }
+
+        try {
+            cp = compression_parameters(options);
+            return true;
+        } catch (const exceptions::syntax_exception& e) {
+            cfglogger.error("Invalid compression parameters syntax: {}", e.what());
+            return false;
+        } catch (const exceptions::configuration_exception& e) {
+            cfglogger.error("Invalid compression parameters configuration: {}", e.what());
+            return false;
+        } catch (const std::runtime_error& e) {
+            cfglogger.error("Error parsing compression parameters: {}", e.what());
+            return false;
+        }
     }
 };
 
@@ -652,7 +773,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "Related information: Enabling incremental backups")
     , snapshot_before_compaction(this, "snapshot_before_compaction", value_status::Unused, false,
         "Enable or disable taking a snapshot before each compaction. This option is useful to back up data when there is a data format change. Be careful using this option because Cassandra does not clean up older snapshots automatically.\n"
-        "\n"
+        "\n"  
         "Related information: Configuring compaction")
     /**
     * @Group Common fault detection setting
@@ -767,7 +888,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , inter_dc_stream_throughput_outbound_megabits_per_sec(this, "inter_dc_stream_throughput_outbound_megabits_per_sec", value_status::Unused, 0,
         "Throttles all streaming file transfer between the data centers. This setting allows throttles streaming throughput betweens data centers in addition to throttling all network stream traffic as configured with stream_throughput_outbound_megabits_per_sec.")
     , stream_io_throughput_mb_per_sec(this, "stream_io_throughput_mb_per_sec", liveness::LiveUpdate, value_status::Used, 0,
-        "Throttles streaming I/O to the specified total throughput (in MiBs/s) across the entire system. Streaming I/O includes the one performed by repair and both RBNO and legacy topology operations such as adding or removing a node. Setting the value to 0 disables stream throttling.")
+        "Throttles streaming I/O to the specified total throughput (in MiBs/s) across the entire system. Streaming I/O includes the one performed by repair and both RBNO and legacy topology operations such as adding or removing a node. Setting the value to 0 disables stream throttling. It is recommended to set the value for this parameter to be 75% of network bandwidth")
     , stream_plan_ranges_fraction(this, "stream_plan_ranges_fraction", liveness::LiveUpdate, value_status::Used, 0.1,
         "Specify the fraction of ranges to stream in a single stream plan. Value is between 0 and 1.")
     , enable_file_stream(this, "enable_file_stream", liveness::LiveUpdate, value_status::Used, true, "Set true to use file based stream for tablet instead of mutation based stream")
@@ -890,6 +1011,10 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "The default timeout for other, miscellaneous operations.\n"
         "\n"
         "Related information: About hinted handoff writes")
+    , request_timeout_on_shutdown_in_seconds(this, "request_timeout_on_shutdown_in_seconds", value_status::Used, 30,
+        "Timeout for CQL server requests on shutdown. After this timeout the server will shutdown all connections.")
+    , group0_raft_op_timeout_in_ms(this, "group0_raft_op_timeout_in_ms", liveness::LiveUpdate, value_status::Used, 60000,
+            "The time in milliseconds that group0 allows a Raft operation to complete.")
     /**
     * @Group Inter-node settings
     */
@@ -930,11 +1055,11 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , internode_compression_checksumming(this, "internode_compression_checksumming", liveness::LiveUpdate, value_status::Used, true,
         "Computes and checks checksums for compressed RPC frames. This is a paranoid precaution against corruption bugs in the compression protocol.")
     , internode_compression_algorithms(this, "internode_compression_algorithms", liveness::LiveUpdate, value_status::Used,
-            { utils::compression_algorithm::type::ZSTD, utils::compression_algorithm::type::LZ4, },
+            { netw::compression_algorithm::type::ZSTD, netw::compression_algorithm::type::LZ4, },
         "Specifies RPC compression algorithms supported by this node. ")
     , internode_compression_enable_advanced(this, "internode_compression_enable_advanced", liveness::MustRestart, value_status::Used, false,
         "Enables the new implementation of RPC compression. If disabled, Scylla will fall back to the old implementation.")
-    , rpc_dict_training_when(this, "rpc_dict_training_when", liveness::LiveUpdate, value_status::Used, utils::dict_training_loop::when::type::NEVER,
+    , rpc_dict_training_when(this, "rpc_dict_training_when", liveness::LiveUpdate, value_status::Used, netw::dict_training_loop::when::type::NEVER,
         "Specifies when RPC compression dictionary training is performed by this node.\n"
         "* `never` disables it unconditionally.\n"
         "* `when_leader` enables it only whenever the node is the Raft leader.\n"
@@ -994,7 +1119,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , start_rpc(this, "start_rpc", value_status::Unused, false,
         "Starts the Thrift RPC server")
     , rpc_keepalive(this, "rpc_keepalive", value_status::Used, true,
-        "Enable or disable keepalive on client connections (CQL native, Redis and the maintenance socket).")
+        "Enable or disable keepalive on client connections (CQL native and the maintenance socket).")
     , cache_hit_rate_read_balancing(this, "cache_hit_rate_read_balancing", value_status::Used, true,
         "This boolean controls whether the replicas for read query will be chosen based on cache hit ratio.")
     /**
@@ -1122,6 +1247,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "\n"
         "* priority_string: GnuTLS priority string controlling TLS algorithms used/allowed.\n"
         "* enable_session_tickets: (Default: false) Enables or disables TLS1.3 session tickets.")
+    , alternator_force_read_before_write(this, "alternator_force_read_before_write", liveness::LiveUpdate, value_status::Used, false, "Forces Alternator to perform Read Before Write. Used for better DynamoDB compatibility in WCU calculation")
     , ssl_storage_port(this, "ssl_storage_port", value_status::Used, 7001,
         "The SSL port for encrypted communication. Unused unless enabled in encryption_options.")
     , enable_in_memory_data_store(this, "enable_in_memory_data_store", value_status::Used, false, "Enable in memory mode (system tables are always persisted).")
@@ -1176,7 +1302,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , sstable_summary_ratio(this, "sstable_summary_ratio", value_status::Used, 0.0005, "Enforces that 1 byte of summary is written for every N (2000 by default)"
         "bytes written to data file. Value must be between 0 and 1.")
     , components_memory_reclaim_threshold(this, "components_memory_reclaim_threshold", liveness::LiveUpdate, value_status::Used, .2, "Ratio of available memory for all in-memory components of SSTables in a shard beyond which the memory will be reclaimed from components until it falls back under the threshold. Currently, this limit is only enforced for bloom filters.")
-    , large_memory_allocation_warning_threshold(this, "large_memory_allocation_warning_threshold", value_status::Used, size_t(1) << 20, "Warn about memory allocations above this size; set to zero to disable.")
+    , large_memory_allocation_warning_threshold(this, "large_memory_allocation_warning_threshold", value_status::Used, (size_t(128) << 10) + 1, "Warn about memory allocations above this size; set to zero to disable.")
     , enable_deprecated_partitioners(this, "enable_deprecated_partitioners", value_status::Used, false, "Enable the byteordered and random partitioners. These partitioners are deprecated and will be removed in a future version.")
     , enable_keyspace_column_family_metrics(this, "enable_keyspace_column_family_metrics", value_status::Used, false, "Enable per keyspace and per column family metrics reporting.")
     , enable_node_aggregated_table_metrics(this, "enable_node_aggregated_table_metrics", value_status::Used, true, "Enable aggregated per node, per keyspace and per table metrics reporting, applicable if enable_keyspace_column_family_metrics is false.")
@@ -1184,13 +1310,41 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         " Performance is affected to some extent as a result. Useful to help debugging problems that may arise at another layers.")
     , enable_sstable_key_validation(this, "enable_sstable_key_validation", value_status::Used, ENABLE_SSTABLE_KEY_VALIDATION, "Enable validation of partition and clustering keys monotonicity"
         " Performance is affected to some extent as a result. Useful to help debugging problems that may arise at another layers.")
-    , cpu_scheduler(this, "cpu_scheduler", value_status::Used, true, "Enable cpu scheduling.")
+    , cpu_scheduler(this, "cpu_scheduler", value_status::Unused, true, "Enable cpu scheduling.")
     , view_building(this, "view_building", value_status::Used, true, "Enable view building; should only be set to false when the node is experience issues due to view building.")
     , enable_sstables_mc_format(this, "enable_sstables_mc_format", value_status::Unused, true, "Enable SSTables 'mc' format to be used as the default file format.  Deprecated, please use \"sstable_format\" instead.")
     , enable_sstables_md_format(this, "enable_sstables_md_format", value_status::Unused, true, "Enable SSTables 'md' format to be used as the default file format.  Deprecated, please use \"sstable_format\" instead.")
-    , sstable_format(this, "sstable_format", value_status::Used, "me", "Default sstable file format", {"md", "me"})
+    , sstable_format(this, "sstable_format", liveness::LiveUpdate, value_status::Used, "me", "Default sstable file format", {"md", "me", "ms"})
+    , sstable_compression_user_table_options(this, "sstable_compression_user_table_options", value_status::Used, compression_parameters{compression_parameters::algorithm::lz4_with_dicts},
+        "Server-global user table compression options. If enabled, all user tables"
+        "will be compressed using the provided options, unless overridden"
+        "by compression options in the table schema. The available options are:\n"
+        "* sstable_compression: The compression algorithm to use. Supported values: LZ4Compressor, LZ4WithDictsCompressor (default), SnappyCompressor, DeflateCompressor, ZstdCompressor, ZstdWithDictsCompressor, '' (empty string; disables compression).\n"
+        "* chunk_length_in_kb: (Default: 4) The size of chunks to compress in kilobytes. Allowed values are powers of two between 1 and 128.\n"
+        "* crc_check_chance: (Default: 1.0) Not implemented (option value is ignored).\n"
+        "* compression_level: (Default: 3) Compression level for ZstdCompressor and ZstdWithDictsCompressor. Higher levels provide better compression ratios at the cost of speed. Allowed values are integers between 1 and 22.")
+    , sstable_compression_dictionaries_allow_in_ddl(this, "sstable_compression_dictionaries_allow_in_ddl", liveness::LiveUpdate, value_status::Deprecated, true,
+        "Allows for configuring tables to use SSTable compression with shared dictionaries. "
+        "If the option is disabled, Scylla will reject CREATE and ALTER statements which try to set dictionary-based sstable compressors.\n"
+        "This is only enforced when this node validates a new DDL statement; disabling the option won't disable dictionary-based compression "
+        "on tables which already have it configured, and won't do anything to existing sstables.\n"
+        "To affect existing tables, you can ALTER them to a non-dictionary compressor, or disable dictionary compression "
+        "for the whole node through `sstable_compression_dictionaries_enable_writing`.")
+    , sstable_compression_dictionaries_enable_writing(this, "sstable_compression_dictionaries_enable_writing", liveness::LiveUpdate, value_status::Used, true,
+        "Enables SSTable compression with shared dictionaries (for tables which opt in). If set to false, this node won't write any new SSTables using dictionary compression.\n"
+        "Option meant not for regular usage, but for unforeseen problems that call for disabling dictionaries without modifying table schema.")
+    , sstable_compression_dictionaries_memory_budget_fraction(this, "sstable_compression_dictionaries_memory_budget_fraction", liveness::LiveUpdate, value_status::Used, 0.01,
+        "Fall back to compression without dictionaries if RAM usage by dictionaries is greater or equal to this fraction of the shard's memory.")
+    , sstable_compression_dictionaries_retrain_period_in_seconds(this, "sstable_compression_dictionaries_retrain_period_in_seconds", liveness::LiveUpdate, value_status::Used, 86400,
+        "Minimum age of the current compression dictionary before another dictionary for this table is trained.")
+    , sstable_compression_dictionaries_autotrainer_tick_period_in_seconds(this, "sstable_compression_dictionaries_autotrainer_tick_period_in_seconds", liveness::LiveUpdate, value_status::Used, 900,
+        "The period with which automatic dictionary training is attempted.")
+    , sstable_compression_dictionaries_min_training_dataset_bytes(this, "sstable_compression_dictionaries_min_training_dataset_bytes", liveness::LiveUpdate, value_status::Used, 1*1024*1024*1024,
+        "The minimum size a table has to reach before dictionaries will be trained for it.")
+    , sstable_compression_dictionaries_min_training_improvement_factor(this, "sstable_compression_dictionaries_min_training_improvement_factor", liveness::LiveUpdate, value_status::Used, 0.95,
+        "New dictionaries will be only published if the estimated compression ratio is smaller than current ratio multiplied by this factor.")
     , uuid_sstable_identifiers_enabled(this,
-            "uuid_sstable_identifiers_enabled", liveness::LiveUpdate, value_status::Used, true, "If set to true, each newly created sstable will have a UUID "
+            "uuid_sstable_identifiers_enabled", value_status::Unused, true, "If set to true, each newly created sstable will have a UUID "
             "based generation identifier, and such files are not readable by previous Scylla versions.")
     , table_digest_insensitive_to_expiry(this, "table_digest_insensitive_to_expiry", liveness::MustRestart, value_status::Used, true,
             "When enabled, per-table schema digest calculation ignores empty partitions.")
@@ -1241,6 +1395,8 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "Time period in seconds after which unused schema versions will be evicted from the local schema registry cache. Default is 1 second.")
     , max_concurrent_requests_per_shard(this, "max_concurrent_requests_per_shard", liveness::LiveUpdate, value_status::Used, std::numeric_limits<uint32_t>::max(),
         "Maximum number of concurrent requests a single shard can handle before it starts shedding extra load. By default, no requests will be shed.")
+    , uninitialized_connections_semaphore_cpu_concurrency(this, "uninitialized_connections_semaphore_cpu_concurrency", liveness::LiveUpdate, value_status::Used, 8,
+        "Maximum number of new concurrent connections from drivers that a single shard can be processing before it starts throttling incoming connections. This limit applies only to new connections excluding the ones blocked on network IO; connections that are ready to serve requests are not affected. By default the limit is 8.")
     , cdc_dont_rewrite_streams(this, "cdc_dont_rewrite_streams", value_status::Used, false,
             "Disable rewriting streams from cdc_streams_descriptions to cdc_streams_descriptions_v2. Should not be necessary, but the procedure is expensive and prone to failures; this config option is left as a backdoor in case some user requires manual intervention.")
     , strict_allow_filtering(this, "strict_allow_filtering", liveness::LiveUpdate, value_status::Used, strict_allow_filtering_default(), "Match Cassandra in requiring ALLOW FILTERING on slow queries. Can be true, false, or warn. When false, Scylla accepts some slow queries even without ALLOW FILTERING that Cassandra rejects. Warn is same as false, but with warning.")
@@ -1264,10 +1420,13 @@ db::config::config(std::shared_ptr<db::extensions> exts)
             "Use on a new, parallel algorithm for performing aggregate queries.")
     , cql_duplicate_bind_variable_names_refer_to_same_variable(this, "cql_duplicate_bind_variable_names_refer_to_same_variable", liveness::LiveUpdate, value_status::Used, true,
             "A bind variable that appears twice in a CQL query refers to a single variable (if false, no name matching is performed).")
+    , select_internal_page_size(this, "select_internal_page_size", liveness::LiveUpdate, value_status::Used, 10000,
+            "SELECT statements with aggregation or GROUP BYs or a secondary index may use this page size for their internal reading data, not the page size specified in the query options.")
     , alternator_port(this, "alternator_port", value_status::Used, 0, "Alternator API port.")
     , alternator_https_port(this, "alternator_https_port", value_status::Used, 0, "Alternator API HTTPS port.")
     , alternator_address(this, "alternator_address", value_status::Used, "0.0.0.0", "Alternator API listening address.")
-    , alternator_enforce_authorization(this, "alternator_enforce_authorization", value_status::Used, false, "Enforce checking the authorization header for every request in Alternator.")
+    , alternator_enforce_authorization(this, "alternator_enforce_authorization", liveness::LiveUpdate, value_status::Used, false, "Enforce checking the authorization header for every request in Alternator.")
+    , alternator_warn_authorization(this, "alternator_warn_authorization", liveness::LiveUpdate, value_status::Used, false, "Count and log warnings about failed authentication or authorization")
     , alternator_write_isolation(this, "alternator_write_isolation", value_status::Used, "", "Default write isolation policy for Alternator.")
     , alternator_streams_time_window_s(this, "alternator_streams_time_window_s", value_status::Used, 10, "CDC query confidence window for alternator streams.")
     , alternator_timeout_in_ms(this, "alternator_timeout_in_ms", liveness::LiveUpdate, value_status::Used, 10000,
@@ -1282,22 +1441,17 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "the same endpoint used in the request. The string 'disabled' "
         "disables the DescribeEndpoints operation. Any other string is the "
         "fixed value that will be returned by DescribeEndpoints operations.")
+    // alternator_max_items_in_batch_write matches DynamoDB behaviour of size limit, but with different value - for DynamoDB it's 25
+    // (see DynamoDB's documentation for BatchWriteItem command)
+    , alternator_max_items_in_batch_write(this, "alternator_max_items_in_batch_write", value_status::Used, 100, "Maximum amount of items in single BatchItemWrite call.")
+    , alternator_allow_system_table_write(this, "alternator_allow_system_table_write", liveness::LiveUpdate, value_status::Used,
+        false,
+        "Allow writing to system tables using the .scylla.alternator.system prefix")
+    , alternator_max_expression_cache_entries_per_shard(this, "alternator_max_expression_cache_entries_per_shard", liveness::LiveUpdate, value_status::Used, 2000, "Maximum number of cached parsed request expressions, per shard.")
+    , alternator_max_users_query_size_in_trace_output(this, "alternator_max_users_query_size_in_trace_output", liveness::LiveUpdate, value_status::Used, uint64_t(4096),
+            "Maximum size of user's command in trace output (`alternator_op` entry). Larger traces will be truncated and have `<truncated>` message appended - which doesn't count to the maximum limit.")
+    , vector_store_primary_uri(this, "vector_store_primary_uri", liveness::LiveUpdate, value_status::Used, "", "A comma-separated list of vector store node URIs. If not set, vector search is disabled.")
     , abort_on_ebadf(this, "abort_on_ebadf", value_status::Used, true, "Abort the server on incorrect file descriptor access. Throws exception when disabled.")
-    , redis_port(this, "redis_port", value_status::Used, 0, "Port on which the REDIS transport listens for clients.")
-    , redis_ssl_port(this, "redis_ssl_port", value_status::Used, 0, "Port on which the REDIS TLS native transport listens for clients.")
-    , redis_read_consistency_level(this, "redis_read_consistency_level", value_status::Used, "LOCAL_QUORUM", "Consistency level for read operations for redis.")
-    , redis_write_consistency_level(this, "redis_write_consistency_level", value_status::Used, "LOCAL_QUORUM", "Consistency level for write operations for redis.")
-    , redis_database_count(this, "redis_database_count", value_status::Used, 16, "Database count for the redis. You can use the default settings (16).")
-    , redis_keyspace_replication_strategy_options(this, "redis_keyspace_replication_strategy", value_status::Used, {}, 
-        "Set the replication strategy for the redis keyspace. The setting is used by the first node in the boot phase when the keyspace is not exists to create keyspace for redis.\n"
-        "The replication strategy determines how many copies of the data are kept in a given data center. This setting impacts consistency, availability and request speed.\n"
-        "Two strategies are available: SimpleStrategy and NetworkTopologyStrategy.\n"
-        "\n"
-        "* class: (Default: SimpleStrategy ). Set the replication strategy for redis keyspace.\n"
-        "* 'replication_factor': N, (Default: 'replication_factor':1) IFF the class is SimpleStrategy, assign the same replication factor to the entire cluster.\n"
-        "* 'datacenter_name': N [,...], (Default: 'dc1:1') IFF the class is NetworkTopologyStrategy, assign replication factors to each data center in a comma separated list.\n"
-        "\n"
-        "Related information: About replication strategy.")
     , sanitizer_report_backtrace(this, "sanitizer_report_backtrace", value_status::Used, false,
             "In debug mode, report log-structured allocator sanitizer violations with a backtrace. Slow.")
     , flush_schema_tables_after_modification(this, "flush_schema_tables_after_modification", liveness::LiveUpdate, value_status::Used, true,
@@ -1320,7 +1474,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "The maximum fraction of cache memory permitted for use by index cache. Clamped to the [0.0; 1.0] range. Must be small enough to not deprive the row cache of memory, but should be big enough to fit a large fraction of the index. The default value 0.2 means that at least 80\% of cache memory is reserved for the row cache, while at most 20\% is usable by the index cache.")
     , consistent_cluster_management(this, "consistent_cluster_management", value_status::Deprecated, true, "Use RAFT for cluster management and DDL.")
     , force_gossip_topology_changes(this, "force_gossip_topology_changes", value_status::Used, false, "Force gossip-based topology operations in a fresh cluster. Only the first node in the cluster must use it. The rest will fall back to gossip-based operations anyway. This option should be used only for testing.  Note: gossip topology changes are incompatible with tablets.")
-    , recovery_leader(this, "recovery_leader", liveness::LiveUpdate, value_status::Used, "", "Host ID of the node restarted first while performing the Manual Raft-based Recovery Procedure. Warning: this option disables some guardrails for the needs of the Manual Raft-based Recovery Procedure. Make sure you unset it at the end of the procedure.")
+    , recovery_leader(this, "recovery_leader", liveness::LiveUpdate, value_status::Used, utils::null_uuid(), "Host ID of the node restarted first while performing the Manual Raft-based Recovery Procedure. Warning: this option disables some guardrails for the needs of the Manual Raft-based Recovery Procedure. Make sure you unset it at the end of the procedure.")
     , wasm_cache_memory_fraction(this, "wasm_cache_memory_fraction", value_status::Used, 0.01, "Maximum total size of all WASM instances stored in the cache as fraction of total shard memory.")
     , wasm_cache_timeout_in_ms(this, "wasm_cache_timeout_in_ms", value_status::Used, 5000, "Time after which an instance is evicted from the cache.")
     , wasm_cache_instance_size_limit(this, "wasm_cache_instance_size_limit", value_status::Used, 1024*1024, "Instances with size above this limit will not be stored in the cache.")
@@ -1328,7 +1482,6 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , wasm_udf_total_fuel(this, "wasm_udf_total_fuel", value_status::Used, 100000000, "Wasmtime fuel a WASM UDF can consume before termination.")
     , wasm_udf_memory_limit(this, "wasm_udf_memory_limit", value_status::Used, 2*1024*1024, "How much memory each WASM UDF can allocate at most.")
     , relabel_config_file(this, "relabel_config_file", value_status::Used, "", "Optionally, read relabel config from file.")
-    , object_storage_config_file(this, "object_storage_config_file", value_status::Used, "", "Optionally, read object-storage endpoints config from file.")
     , live_updatable_config_params_changeable_via_cql(this, "live_updatable_config_params_changeable_via_cql", liveness::MustRestart, value_status::Used, true, "If set to true, configuration parameters defined with LiveUpdate can be updated in runtime via CQL (by updating system.config virtual table), otherwise they can't.")
     , auth_superuser_name(this, "auth_superuser_name", value_status::Used, "",
         "Initial authentication super username. Ignored if authentication tables already contain a super user.")
@@ -1369,10 +1522,14 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , ldap_bind_dn(this, "ldap_bind_dn", value_status::Used, "", "Distinguished name used by LDAPRoleManager for binding to LDAP server.")
     , ldap_bind_passwd(this, "ldap_bind_passwd", value_status::Used, "", "Password used by LDAPRoleManager for binding to LDAP server.")
     , saslauthd_socket_path(this, "saslauthd_socket_path", value_status::Used, "", "UNIX domain socket on which saslauthd is listening.")
-
+    , object_storage_endpoints(this, "object_storage_endpoints", liveness::LiveUpdate, value_status::Used, {}, "Object storage endpoints configuration.")
     , error_injections_at_startup(this, "error_injections_at_startup", error_injection_value_status, {}, "List of error injections that should be enabled on startup.")
     , topology_barrier_stall_detector_threshold_seconds(this, "topology_barrier_stall_detector_threshold_seconds", value_status::Used, 2, "Report sites blocking topology barrier if it takes longer than this.")
-    , enable_tablets(this, "enable_tablets", value_status::Used, false, "Enable tablets for newly created keyspaces.")
+    , enable_tablets(this, "enable_tablets", value_status::Used, false, "Enable tablets for newly created keyspaces. (deprecated)")
+    , tablets_mode_for_new_keyspaces(this, "tablets_mode_for_new_keyspaces", value_status::Used, tablets_mode_t::mode::unset, "Control tablets for new keyspaces.  Can be set to the following values:\n"
+            "\tdisabled: New keyspaces use vnodes by default, unless enabled by the tablets={'enabled':true} option\n"
+            "\tenabled:  New keyspaces use tablets by default, unless disabled by the tablets={'disabled':true} option\n"
+            "\tenforced: New keyspaces must use tablets. Tablets cannot be disabled using the CREATE KEYSPACE option")
     , view_flow_control_delay_limit_in_ms(this, "view_flow_control_delay_limit_in_ms", liveness::LiveUpdate, value_status::Used, 1000,
         "The maximal amount of time that materialized-view update flow control may delay responses "
         "to try to slow down the client and prevent buildup of unfinished view updates. "
@@ -1381,10 +1538,15 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , disk_space_monitor_normal_polling_interval_in_seconds(this, "disk_space_monitor_normal_polling_interval_in_seconds", value_status::Used, 10, "Disk-space polling interval while below polling threshold")
     , disk_space_monitor_high_polling_interval_in_seconds(this, "disk_space_monitor_high_polling_interval_in_seconds", value_status::Used, 1, "Disk-space polling interval at or above polling threshold")
     , disk_space_monitor_polling_interval_threshold(this, "disk_space_monitor_polling_interval_threshold", value_status::Used, 0.9, "Disk-space polling threshold. Polling interval is increased when disk utilization is greater than or equal to this threshold")
+    , critical_disk_utilization_level(this, "critical_disk_utilization_level", liveness::LiveUpdate, value_status::Used, 0.98, "Disk utilization level above which mechanisms preventing a node getting out of space are activated")
     , enable_create_table_with_compact_storage(this, "enable_create_table_with_compact_storage", liveness::LiveUpdate, value_status::Used, false, "Enable the deprecated feature of CREATE TABLE WITH COMPACT STORAGE.  This feature will eventually be removed in a future version.")
     , rf_rack_valid_keyspaces(this, "rf_rack_valid_keyspaces", liveness::MustRestart, value_status::Used, false,
         "Enforce RF-rack-valid keyspaces. Additionally, if there are existing RF-rack-invalid "
         "keyspaces, attempting to start a node with this option ON will fail.")
+    // FIXME: make frequency per table in order to reduce work in each iteration.
+    // Bigger tables will take longer to be resized. similar-sized tables can be batched into same iteration.
+    , tablet_load_stats_refresh_interval_in_seconds(this, "tablet_load_stats_refresh_interval_in_seconds", liveness::LiveUpdate, value_status::Used, 60,
+        "Tablet load stats refresh rate in seconds.")
     , default_log_level(this, "default_log_level", value_status::Used, seastar::log_level::info, "Default log level for log messages")
     , logger_log_level(this, "logger_log_level", value_status::Used, {}, "Map of logger name to log level. Valid log levels are 'error', 'warn', 'info', 'debug' and 'trace'")
     , log_to_stdout(this, "log_to_stdout", value_status::Used, true, "Send log output to stdout")
@@ -1478,6 +1640,14 @@ std::istream& operator>>(std::istream& is, db::seed_provider_type& s) {
 std::istream& operator>>(std::istream& is, error_injection_at_startup& eias) {
     eias = error_injection_at_startup();
     is >> eias.name;
+    return is;
+}
+
+
+std::istream& operator>>(std::istream& is, object_storage_endpoint_param& f) {
+    // FIXME -- this operator is used, in particular, by boost lexical_cast<>
+    // it's here just to make the code compile, but it's not yet called for real
+    throw std::runtime_error("reading object_storage_endpoint_param from istream is not implemented");
     return is;
 }
 
@@ -1583,7 +1753,8 @@ std::map<sstring, db::experimental_features_t::feature> db::experimental_feature
         {"broadcast-tables", feature::BROADCAST_TABLES},
         {"keyspace-storage-options", feature::KEYSPACE_STORAGE_OPTIONS},
         {"tablets", feature::UNUSED},
-        {"views-with-tablets", feature::VIEWS_WITH_TABLETS}
+        {"views-with-tablets", feature::UNUSED},
+        {"strongly-consistent-tables", feature::STRONGLY_CONSISTENT_TABLES}
     };
 }
 
@@ -1610,6 +1781,16 @@ std::unordered_map<sstring, db::tri_mode_restriction_t::mode> db::tri_mode_restr
             {"false", db::tri_mode_restriction_t::mode::FALSE},
             {"0", db::tri_mode_restriction_t::mode::FALSE},
             {"warn", db::tri_mode_restriction_t::mode::WARN}};
+}
+
+std::unordered_map<sstring, db::tablets_mode_t::mode> db::tablets_mode_t::map() {
+    return {{"disabled", db::tablets_mode_t::mode::disabled},
+            {"0", db::tablets_mode_t::mode::disabled},
+            {"enabled", db::tablets_mode_t::mode::enabled},
+            {"1", db::tablets_mode_t::mode::enabled},
+            {"enforced", db::tablets_mode_t::mode::enforced},
+            {"2", db::tablets_mode_t::mode::enforced}
+            };
 }
 
 template struct utils::config_file::named_value<seastar::log_level>;

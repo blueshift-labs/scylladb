@@ -34,9 +34,10 @@ static const class_registrator<
         saslauthd_authenticator,
         cql3::query_processor&,
         ::service::raft_group0_client&,
-        ::service::migration_manager&> saslauthd_auth_reg("com.scylladb.auth.SaslauthdAuthenticator");
+        ::service::migration_manager&,
+        utils::alien_worker&> saslauthd_auth_reg("com.scylladb.auth.SaslauthdAuthenticator");
 
-saslauthd_authenticator::saslauthd_authenticator(cql3::query_processor& qp, ::service::raft_group0_client&, ::service::migration_manager&)
+saslauthd_authenticator::saslauthd_authenticator(cql3::query_processor& qp, ::service::raft_group0_client&, ::service::migration_manager&, utils::alien_worker&)
     : _socket_path(qp.db().get_config().saslauthd_socket_path())
 {}
 
@@ -181,7 +182,7 @@ future<> saslauthd_authenticator::alter(std::string_view role_name, const authen
 }
 
 future<> saslauthd_authenticator::drop(std::string_view name, ::service::group0_batch& mc) {
-    throw exceptions::authentication_exception("Cannot delete passwords with SaslauthdAuthenticator");
+    return make_ready_future<>();
 }
 
 future<custom_options> saslauthd_authenticator::query_custom_options(std::string_view role_name) const {

@@ -9,8 +9,8 @@
 #define BOOST_TEST_MODULE core
 
 #include <boost/test/unit_test.hpp>
-#include "boost/icl/interval.hpp"
-#include "boost/icl/interval_map.hpp"
+#include <boost/icl/interval.hpp>
+#include <boost/icl/interval_map.hpp>
 #include <fmt/ranges.h>
 #include <unordered_set>
 
@@ -370,3 +370,5 @@ BOOST_AUTO_TEST_CASE(range_deoverlap_tests) {
         BOOST_REQUIRE_EQUAL(interval<unsigned>({{4, false}}, {5}), deoverlapped[1]);
     }
 }
+
+static_assert(std::is_trivially_copyable_v<interval<dht::token>>);

@@ -14,7 +14,7 @@ from re import fullmatch
 import pytest
 from botocore.exceptions import ClientError
 
-from test.alternator.util import list_tables, unique_table_name, create_test_table, random_string, new_test_table, is_aws
+from test.alternator.util import list_tables, multiset, unique_table_name, create_test_table, random_string, new_test_table, is_aws, scylla_config_read
 
 
 # Utility function for create a table with a given name and some valid
@@ -95,17 +95,16 @@ def test_create_and_delete_table_non_scylla_name(dynamodb):
 
 # names with 255 characters are allowed in Dynamo, but they are not currently
 # supported in Scylla because we create a directory whose name is the table's
-# name followed by 33 bytes (underscore and UUID). So currently, we only
-# correctly support names with length up to 222.
-def test_create_and_delete_table_very_long_name(dynamodb):
-    # In the future, this should work:
-    #create_and_delete_table(dynamodb, 'n' * 255)
-    # But for now, only 222 works:
-    create_and_delete_table(dynamodb, 'n' * 222)
-    # We cannot test the following on DynamoDB because it will succeed
-    # (DynamoDB allows up to 255 bytes)
-    #with pytest.raises(ClientError, match='ValidationException'):
-    #   create_table(dynamodb, 'n' * 223)
+# name followed by 33 bytes (underscore and UUID). Currently (see #24598),
+# we only support names with length up to 192.
+@pytest.mark.xfail(reason="Alternator limits table name length to 192")
+def test_create_and_delete_table_255(dynamodb):
+    create_and_delete_table(dynamodb, 'n' * 255)
+def test_create_and_delete_table_256(dynamodb):
+    with pytest.raises(ClientError, match='ValidationException'):
+       create_and_delete_table(dynamodb, 'n' * 256)
+def test_create_and_delete_table_192(dynamodb):
+    create_and_delete_table(dynamodb, 'n' * 192)
 
 # Tests creating a table with an invalid schema should return a
 # ValidationException error.
@@ -457,20 +456,14 @@ def test_update_table_non_existent(dynamodb, test_table):
 # option enabled, and pass with it enabled (and also pass on Cassandra).
 # These tests should use the "fails_without_consistent_cluster_management"
 # fixture. When consistent mode becomes the default, this fixture can be removed.
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def check_pre_consistent_cluster_management(dynamodb):
     # If not running on Scylla, return false.
     if is_aws(dynamodb):
         return False
-    # In Scylla, we check Raft mode by inspecting the configuration via a
-    # system table (which is also visible in Alternator)
-    config_table = dynamodb.Table('.scylla.alternator.system.config')
-    consistent = config_table.query(
-            KeyConditionExpression='#key=:val',
-            ExpressionAttributeNames={'#key': 'name'},
-            ExpressionAttributeValues={':val': 'consistent_cluster_management'}
-        )['Items']
-    return len(consistent) == 0 or consistent[0]['value'] == 'false'
+    consistent = scylla_config_read(dynamodb, 'consistent_cluster_management')
+    return consistent is None or consistent == 'false'
+
 @pytest.fixture(scope="function")
 def fails_without_consistent_cluster_management(request, check_pre_consistent_cluster_management):
     if check_pre_consistent_cluster_management:

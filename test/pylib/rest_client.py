@@ -6,16 +6,21 @@
 """Asynchronous helper for Scylla REST API operations.
 """
 from __future__ import annotations                           # Type hints as strings
-from abc import ABCMeta
-from collections.abc import Mapping
+
 import logging
 import os.path
-from typing import Any, Optional, AsyncIterator
+from urllib.parse import quote
+from abc import ABCMeta
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
-from aiohttp import request, BaseConnector, UnixConnector, ClientTimeout
+from typing import Any, Optional, AsyncIterator
+
 import pytest
-from test.pylib.internal_types import IPAddress, HostID
+from aiohttp import request, BaseConnector, UnixConnector, ClientTimeout
 from cassandra.pool import Host                          # type: ignore # pylint: disable=no-name-in-module
+
+from test.pylib.internal_types import IPAddress, HostID
+from test.pylib.util import universalasync_typed_wrap
 
 
 logger = logging.getLogger(__name__)
@@ -145,7 +150,8 @@ class TCPRESTClient(RESTClient):
         self.default_port: int = port
 
 
-class ScyllaRESTAPIClient():
+@universalasync_typed_wrap
+class ScyllaRESTAPIClient:
     """Async Scylla REST API client"""
 
     def __init__(self, port: int = 10000):
@@ -192,6 +198,14 @@ class ScyllaRESTAPIClient():
                                host = initiator_ip, timeout = timeout)
         logger.debug("remove_node for %s finished", host_id)
 
+    async def exclude_node(self, initiator_ip: IPAddress, hosts: list[HostID], timeout: float = 60) -> None:
+        """Initiate exclude node of hosts in initiator initiator_ip"""
+        logger.info("exclude_node for %s on %s", hosts, initiator_ip)
+        await self.client.post("/storage_service/exclude_node",
+                               params = {"hosts": ",".join(hosts)},
+                               host = initiator_ip, timeout = timeout)
+        logger.debug("exclude_node for %s finished", hosts)
+
     async def decommission_node(self, host_ip: str, timeout: float) -> None:
         """Initiate decommission node of host_ip"""
         logger.debug("decommission_node %s", host_ip)
@@ -225,12 +239,22 @@ class ScyllaRESTAPIClient():
         assert isinstance(data, list)
         return data
 
+    async def get_tokens(self, node_ip: str, endpoint: str | None = None) -> list:
+        """Get a list of the tokens for the specified node."""
+
+        data = await self.client.get_json(
+            resource_uri="/storage_service/tokens" if endpoint is None else f"/storage_service/tokens/{endpoint}",
+            host=node_ip,
+        )
+        assert isinstance(data, list)
+        return data
+
     async def enable_injection(self, node_ip: str, injection: str, one_shot: bool, parameters: dict[str, Any] = {}) -> None:
         """Enable error injection named `injection` on `node_ip`. Depending on `one_shot`,
            the injection will be executed only once or every time the process passes the injection point.
            Note: this only has an effect in specific build modes: debug,dev,sanitize.
         """
-        await self.client.post(f"/v2/error_injection/injection/{injection}",
+        await self.client.post(f"/v2/error_injection/injection/{quote(injection, safe='')}",
                                host=node_ip, params={"one_shot": str(one_shot)}, json={ key: str(value) for key, value in parameters.items() })
 
     async def get_injection(self, node_ip: str, injection: str) -> list[dict[str, Any]]:
@@ -239,7 +263,7 @@ class ScyllaRESTAPIClient():
            active, as well as any parameters it might have.
            Note: this only has an effect in specific build modes: debug,dev,sanitize.
         """
-        return await self.client.get_json(f"/v2/error_injection/injection/{injection}", host=node_ip)
+        return await self.client.get_json(f"/v2/error_injection/injection/{quote(injection, safe='')}", host=node_ip)
 
     async def move_tablet(self, node_ip: str, ks: str, table: str, src_host: HostID, src_shard: int, dst_host: HostID, dst_shard: int, token: int, timeout: Optional[float] = None) -> None:
         await self.client.post(f"/storage_service/tablets/move", host=node_ip, timeout=timeout, params={
@@ -273,13 +297,15 @@ class ScyllaRESTAPIClient():
             "token": str(token)
         })
 
-    async def tablet_repair(self, node_ip: str, ks: str, table: str, token : int, hosts_filter: Optional[str] = None, dcs_filter: Optional[str] = None, timeout: Optional[float] = None, await_completion: bool = True) -> None:
+    async def tablet_repair(self, node_ip: str, ks: str, table: str, token : int | str, hosts_filter: Optional[str] = None, dcs_filter: Optional[str] = None, timeout: Optional[float] = None, await_completion: bool = True, incremental_mode: Optional[str] = None) -> None:
         params={
             "ks": ks,
             "table": table,
             "tokens": str(token),
             "await_completion": str(await_completion).lower()
         }
+        if incremental_mode is not None:
+            params["incremental_mode"] = str(incremental_mode).lower()
         if hosts_filter:
             params["hosts_filter"] = hosts_filter
         if dcs_filter:
@@ -293,8 +319,14 @@ class ScyllaRESTAPIClient():
     async def disable_tablet_balancing(self, node_ip: str) -> None:
         await self.client.post(f"/storage_service/tablets/balancing", host=node_ip, params={"enabled": "false"})
 
+    async def keyspace_upgrade_sstables(self, node_ip: str, ks: str) -> None:
+        await self.client.get(f"/storage_service/keyspace_upgrade_sstables/{ks}", host=node_ip)
+
+    async def keyspace_scrub_sstables(self, node_ip: str, ks: str, scrub_mode: str) -> None:
+        await self.client.get(f"/storage_service/keyspace_scrub/{ks}", host=node_ip,  params={"scrub_mode": scrub_mode})
+
     async def disable_injection(self, node_ip: str, injection: str) -> None:
-        await self.client.delete(f"/v2/error_injection/injection/{injection}", host=node_ip)
+        await self.client.delete(f"/v2/error_injection/injection/{quote(injection, safe='')}", host=node_ip)
 
     async def get_enabled_injections(self, node_ip: str) -> list[str]:
         data = await self.client.get_json("/v2/error_injection/injection", host=node_ip)
@@ -303,7 +335,7 @@ class ScyllaRESTAPIClient():
         return data
 
     async def message_injection(self, node_ip: str, injection: str) -> None:
-        await self.client.post(f"/v2/error_injection/injection/{injection}/message", host=node_ip)
+        await self.client.post(f"/v2/error_injection/injection/{quote(injection, safe='')}/message", host=node_ip)
 
     async def inject_disconnect(self, node_ip: str, ip_to_disconnect_from: str) -> None:
         await self.client.post(f"/v2/error_injection/disconnect/{ip_to_disconnect_from}", host=node_ip)
@@ -362,10 +394,16 @@ class ScyllaRESTAPIClient():
         """Cleanup keyspace"""
         await self.client.post(f"/storage_service/keyspace_cleanup/{ks}", host=node_ip)
 
-    async def load_new_sstables(self, node_ip: str, keyspace: str, table: str, primary_replica : bool = False) -> None:
+    async def cleanup_all(self, node_ip: str):
+        await self.client.post("/storage_service/cleanup_all", node_ip)
+
+    async def load_new_sstables(self, node_ip: str, keyspace: str, table: str, primary_replica : bool = False, scope: str = "all", load_and_stream : bool = False) -> None:
         """Load sstables from upload directory"""
-        primary_replica_value = 'true' if primary_replica else 'false'
-        await self.client.post(f"/storage_service/sstables/{keyspace}?cf={table}&primary_replica_only={primary_replica_value}", host=node_ip)
+        params = {"cf": table,
+                  "primary_replica_only": "true" if primary_replica else "false",
+                  "scope": scope,
+                  "load_and_stream": "true" if load_and_stream else "false"}
+        await self.client.post(f"/storage_service/sstables/{keyspace}", host=node_ip, params=params)
 
     async def drop_sstable_caches(self, node_ip: str) -> None:
         """Drop sstable caches"""
@@ -420,14 +458,26 @@ class ScyllaRESTAPIClient():
 
     async def repair(self, node_ip: str, keyspace: str, table: str, ranges: str = '') -> None:
         """Repair the given table and wait for it to complete"""
-        if ranges:
-            params = {"columnFamilies": table, "ranges": ranges}
+        vnode_keyspaces = await self.client.get_json(f"/storage_service/keyspaces", host=node_ip, params={"replication": "vnodes"})
+        if keyspace in vnode_keyspaces:
+            if ranges:
+                params = {"columnFamilies": table, "ranges": ranges}
+            else:
+                params = {"columnFamilies": table}
+            sequence_number = await self.client.post_json(f"/storage_service/repair_async/{keyspace}", host=node_ip, params=params)
+            status = await self.client.get_json(f"/storage_service/repair_status", host=node_ip, params={"id": str(sequence_number)})
+            if status != 'SUCCESSFUL':
+                raise Exception(f"Repair id {sequence_number} on node {node_ip} for table {keyspace}.{table} failed: status={status}")
         else:
-            params = {"columnFamilies": table}
-        sequence_number = await self.client.post_json(f"/storage_service/repair_async/{keyspace}", host=node_ip, params=params)
-        status = await self.client.get_json(f"/storage_service/repair_status", host=node_ip, params={"id": str(sequence_number)})
-        if status != 'SUCCESSFUL':
-            raise Exception(f"Repair id {sequence_number} on node {node_ip} for table {keyspace}.{table} failed: status={status}")
+            if ranges:
+                raise ValueError(f"Ranges parameter is not supported for tablet keyspaces")
+            params={
+                "ks": keyspace,
+                "table": table,
+                "tokens": "all",
+                "await_completion": "true",
+            }
+            await self.client.post_json(f"/storage_service/tablets/repair", host=node_ip, params=params)
 
     def __get_autocompaction_url(self, keyspace: str, table: Optional[str] = None) -> str:
         """Return autocompaction url for the given keyspace/table"""
@@ -441,6 +491,14 @@ class ScyllaRESTAPIClient():
     async def disable_autocompaction(self, node_ip: str, keyspace: str, table: Optional[str] = None) -> None:
         """Disable autocompaction for the given keyspace/table"""
         await self.client.delete(self.__get_autocompaction_url(keyspace, table), host=node_ip)
+
+    async def retrain_dict(self, node_ip: str, keyspace: str, table: str):
+        url = f"/storage_service/retrain_dict?keyspace={keyspace}&cf={table}"
+        await self.client.post_json(url, host=node_ip)
+
+    async def estimate_compression_ratios(self, node_ip: str, keyspace: str, table: str):
+        url = f"/storage_service/estimate_compression_ratios?keyspace={keyspace}&cf={table}"
+        return await self.client.get_json(url, host=node_ip)
 
     async def get_sstable_info(self, node_ip: str, keyspace: Optional[str] = None, table: Optional[str] = None):
         url = "/storage_service/sstable_info"
@@ -468,6 +526,63 @@ class ScyllaRESTAPIClient():
     async def get_config(self, node_ip: str, id: str):
         return await self.client.get_json(f'/v2/config/{id}', host=node_ip)
 
+    async def set_trace_probability(self, node_ip: str, probability: float) -> None:
+        await self.client.post(
+            resource_uri="/storage_service/trace_probability",
+            host=node_ip,
+            params={"probability": probability},
+        )
+
+    async def describe_ring(self, node_ip: str, keyspace: str, table: Optional[str] = None) -> Any:
+        params = None
+        if (table):
+            params = {"table": table}
+        return await self.client.get_json(f'/storage_service/describe_ring/{keyspace}', host=node_ip, params=params)
+
+    async def range_to_endpoint_map(self, node_ip: str, keyspace: str, table: Optional[str] = None) -> Any:
+        params = None
+        if (table):
+            params = {"cf": table}
+        return await self.client.get_json(f'/storage_service/range_to_endpoint_map/{keyspace}', host=node_ip, params=params)
+
+    async def natural_endpoints(self, node_ip: str, keyspace: str, table: str, key: str) -> Any:
+        params = {"cf": table, "key": key}
+        return await self.client.get_json(f'/storage_service/natural_endpoints/{keyspace}', host=node_ip, params=params)
+
+    async def reload_raft_topology_state(self, node_ip: str):
+        await self.client.post("/storage_service/raft_topology/reload", node_ip)
+
+    async def tokens_endpoint(self, node_ip: str, keyspace: Optional[str] = None, table: Optional[str] = None) -> Any:
+        params = {}
+        if keyspace:
+            params['keyspace'] = keyspace
+        if table:
+            params['cf'] = table
+        return await self.client.get_json('/storage_service/tokens_endpoint', host=node_ip, params=params)
+
+
+class ScyllaMetricsLine:
+    def __init__(self, name: str, labels: dict, value: float):
+        self.name = name
+        self.labels = labels
+        self.value = value
+
+    @staticmethod
+    def from_string(line: str):
+        labels_start = line.find('{')
+        labels_finish = line.find('}')
+        if labels_start == -1 or labels_finish == -1:
+            return None
+        name = line[:labels_start].strip()
+        label_str = line[labels_start + 1:labels_finish]
+        if not label_str.strip():
+            labels = {}
+        else:
+            items = [kv.split('=') for kv in label_str.split(',') if kv]
+            labels = {k.strip(): v.strip().strip('"') for k, v in items}
+        value = float(line[labels_finish + 2:])
+        return ScyllaMetricsLine(name, labels, value)
+
 class ScyllaMetrics:
     def __init__(self, lines: list[str]):
         self.lines: list[str] = lines
@@ -478,36 +593,29 @@ class ScyllaMetrics:
         """
         return [l for l in self.lines if l.startswith(prefix)]
 
-    def get(self, name: str, labels = None, shard: str ='total'):
-        """Get the metric value by name. Allows to specify additional labels filter, e.g.
-           metrics.get('scylla_transport_cql_errors_total', {'type': 'protocol_error'}).
-           If shard is not set, returns the sum of metric values across all shards,
-           otherwise returns the metric value from the specified shard.
-        """
-        result = None
-        for l in self.lines:
-            if not l.startswith(name):
-                continue
-            labels_start = l.find('{')
-            labels_finish = l.find('}')
-            if labels_start == -1 or labels_finish == -1:
-                raise ValueError(f'invalid metric format [{l}]')
-            def match_kv(kv):
-                key, val = kv.split('=')
-                val = val.strip('"')
-                return shard == 'total' or val == shard if key == 'shard' \
-                    else labels is None or labels.get(key, None) == val
-            match = all(match_kv(kv) for kv in l[labels_start + 1:labels_finish].split(','))
-            if match:
-                value = float(l[labels_finish + 2:])
-                if result is None:
-                    result = value
-                else:
-                    result += value
-                if shard != 'total':
-                    break
-        return result
+    def _labels_match(self, metric_labels: dict, filter_labels: dict):
+        return all(metric_labels.get(k) == str(v) for k, v in filter_labels.items())
 
+    def get(self, name: str, labels = {}):
+        """Get the metric value by name, optionally filtering by labels.
+
+        The name parameter is used to filter metrics by prefix - all metrics whose
+        names start with the given string will be considered. The labels parameter
+        is a dictionary of key-value pairs used to further filter the metrics.
+
+        Example:
+            metrics.get('scylla_transport_cql_errors_total',
+                       {'type': 'protocol_error', 'shard': '0'})
+
+        Returns the sum of all matching metric values, or None if no matches found.
+        """
+        values = [
+            parsed_line.value
+            for l in self.lines_by_prefix(name)
+            if (parsed_line := ScyllaMetricsLine.from_string(l)) is not None
+            and self._labels_match(parsed_line.labels, labels)
+        ]
+        return sum(values) if values else None
 
 class ScyllaMetricsClient:
     """Async Scylla Metrics API client"""
@@ -563,16 +671,20 @@ async def inject_error_one_shot(api: ScyllaRESTAPIClient, node_ip: IPAddress, in
     return InjectionHandler(api, injection, node_ip)
 
 
-async def read_barrier(api: ScyllaRESTAPIClient, node_ip: IPAddress, group_id: Optional[str] = None) -> None:
+async def read_barrier(api: ScyllaRESTAPIClient, node_ip: IPAddress, group_id: Optional[str] = None,
+                       timeout: Optional[int] = None) -> None:
     """ Issue a read barrier on the specific host for the group_id.
 
         :param api: the REST API client
         :param node_ip: the node IP address for which the read barrier will be posted
         :param group_id: the optional group id (default=group0)
+        :param timeout: the optional timeout in seconds (for the Raft operation on the node)
     """
     params = {}
     if group_id:
         params["group_id"] = group_id
+    if timeout:
+        params["timeout"] = str(timeout)
 
     await api.client.post("/raft/read_barrier", host=node_ip, params=params)
 

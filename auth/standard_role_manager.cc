@@ -9,6 +9,7 @@
 #include "auth/standard_role_manager.hh"
 
 #include <optional>
+#include <stdexcept>
 #include <unordered_set>
 #include <vector>
 
@@ -28,6 +29,7 @@
 #include "cql3/util.hh"
 #include "db/consistency_level_type.hh"
 #include "exceptions/exceptions.hh"
+#include "utils/error_injection.hh"
 #include "utils/log.hh"
 #include <seastar/core/loop.hh>
 #include <seastar/coroutine/maybe_yield.hh>
@@ -35,6 +37,7 @@
 #include "utils/class_registrator.hh"
 #include "service/migration_manager.hh"
 #include "password_authenticator.hh"
+#include "utils/managed_string.hh"
 
 namespace auth {
 
@@ -47,22 +50,11 @@ constexpr std::string_view name{"role_members" , 12};
 }
 
 namespace role_attributes_table {
+
 constexpr std::string_view name{"role_attributes", 15};
 
-static std::string_view creation_query() noexcept {
-    static const sstring instance = seastar::format(
-            "CREATE TABLE {}.{} ("
-            "  role text,"
-            "  name text,"
-            "  value text,"
-            "  PRIMARY KEY(role, name)"
-            ")",
-            meta::legacy::AUTH_KS,
-            name);
+}
 
-    return instance;
-}
-}
 }
 
 static logging::logger log("standard_role_manager");
@@ -126,7 +118,7 @@ static future<record> require_record(cql3::query_processor& qp, std::string_view
 }
 
 static bool has_can_login(const cql3::untyped_result_set_row& row) {
-    return row.has("can_login") && !(boolean_type->deserialize(row.get_blob("can_login")).is_null());
+    return row.has("can_login") && !(boolean_type->deserialize(row.get_blob_unfragmented("can_login")).is_null());
 }
 
 standard_role_manager::standard_role_manager(cql3::query_processor& qp, ::service::raft_group0_client& g0, ::service::migration_manager& mm)
@@ -150,6 +142,17 @@ const resource_set& standard_role_manager::protected_resources() const {
 }
 
 future<> standard_role_manager::create_legacy_metadata_tables_if_missing() const {
+    static const sstring create_roles_query = fmt::format(
+            "CREATE TABLE {}.{} ("
+            "  {} text PRIMARY KEY,"
+            "  can_login boolean,"
+            "  is_superuser boolean,"
+            "  member_of set<text>,"
+            "  salted_hash text"
+            ")",
+            meta::legacy::AUTH_KS,
+            meta::roles_table::name,
+            meta::roles_table::role_col_name);
     static const sstring create_role_members_query = fmt::format(
             "CREATE TABLE {}.{} ("
             "  role text,"
@@ -158,13 +161,20 @@ future<> standard_role_manager::create_legacy_metadata_tables_if_missing() const
             ")",
             meta::legacy::AUTH_KS,
             meta::role_members_table::name);
-
-
+    static const sstring create_role_attributes_query = seastar::format(
+            "CREATE TABLE {}.{} ("
+            "  role text,"
+            "  name text,"
+            "  value text,"
+            "  PRIMARY KEY(role, name)"
+            ")",
+            meta::legacy::AUTH_KS,
+            meta::role_attributes_table::name);
     return when_all_succeed(
             create_legacy_metadata_table_if_missing(
                     meta::roles_table::name,
                     _qp,
-                    meta::roles_table::creation_query(),
+                    create_roles_query,
                     _migration_manager),
             create_legacy_metadata_table_if_missing(
                     meta::role_members_table::name,
@@ -174,34 +184,84 @@ future<> standard_role_manager::create_legacy_metadata_tables_if_missing() const
             create_legacy_metadata_table_if_missing(
                     meta::role_attributes_table::name,
                     _qp,
-                    meta::role_attributes_table::creation_query(),
+                    create_role_attributes_query,
                     _migration_manager)).discard_result();
 }
 
-future<> standard_role_manager::create_default_role_if_missing() {
+future<> standard_role_manager::legacy_create_default_role_if_missing() {
     try {
-        const auto exists = co_await default_role_row_satisfies(_qp, &has_can_login, _superuser);
+        const auto exists = co_await legacy::default_role_row_satisfies(_qp, &has_can_login, _superuser);
         if (exists) {
             co_return;
         }
         const sstring query = seastar::format("INSERT INTO {}.{} ({}, is_superuser, can_login) VALUES (?, true, true)",
-                get_auth_ks_name(_qp),
+                meta::legacy::AUTH_KS,
                 meta::roles_table::name,
                 meta::roles_table::role_col_name);
-        if (legacy_mode(_qp)) {
-            co_await _qp.execute_internal(
-                    query,
-                    db::consistency_level::QUORUM,
-                    internal_distributed_query_state(),
-                    {_superuser},
-                    cql3::query_processor::cache_internal::no).discard_result();
-        } else {
-            co_await announce_mutations(_qp, _group0_client, query, {_superuser}, _as, ::service::raft_timeout{});
-        }
+        co_await _qp.execute_internal(
+                query,
+                db::consistency_level::QUORUM,
+                internal_distributed_query_state(),
+                {_superuser},
+                cql3::query_processor::cache_internal::no).discard_result();
         log.info("Created default superuser role '{}'.", _superuser);
     } catch(const exceptions::unavailable_exception& e) {
         log.warn("Skipped default role setup: some nodes were not ready; will retry");
         throw e;
+    }
+}
+
+future<> standard_role_manager::maybe_create_default_role() {
+    auto has_superuser = [this] () -> future<bool> {
+        const sstring query = seastar::format("SELECT * FROM {}.{} WHERE is_superuser = true ALLOW FILTERING", get_auth_ks_name(_qp), meta::roles_table::name);
+        auto results = co_await _qp.execute_internal(query, db::consistency_level::LOCAL_ONE,
+                internal_distributed_query_state(), cql3::query_processor::cache_internal::yes);
+        for (const auto& result : *results) {
+            if (has_can_login(result)) {
+                co_return true;
+            }
+        }
+        co_return false;
+    };
+    if (co_await has_superuser()) {
+        co_return;
+    }
+    // We don't want to start operation earlier to avoid quorum requirement in
+    // a common case.
+    ::service::group0_batch batch(
+            co_await _group0_client.start_operation(_as, get_raft_timeout()));
+    // Check again as the state may have changed before we took the guard (batch).
+    if (co_await has_superuser()) {
+        co_return;
+    }
+    // There is no superuser which has can_login field - create default role.
+    // Note that we don't check if can_login is set to true.
+    const sstring insert_query = seastar::format("INSERT INTO {}.{} ({}, is_superuser, can_login) VALUES (?, true, true)",
+            get_auth_ks_name(_qp),
+            meta::roles_table::name,
+            meta::roles_table::role_col_name);
+    co_await collect_mutations(_qp, batch, insert_query, {_superuser});
+    co_await std::move(batch).commit(_group0_client, _as, get_raft_timeout());
+    log.info("Created default superuser role '{}'.", _superuser);
+}
+
+future<> standard_role_manager::maybe_create_default_role_with_retries() {
+    size_t retries = _migration_manager.get_concurrent_ddl_retries();
+    while (true)  {
+        try {
+            co_return co_await maybe_create_default_role();
+        } catch (const ::service::group0_concurrent_modification& ex) {
+            log.warn("Failed to execute maybe_create_default_role due to guard conflict.{}.", retries ? " Retrying" : " Number of retries exceeded, giving up");
+            if (retries--) {
+                continue;
+            }
+            // Log error but don't crash the whole node startup sequence.
+            log.error("Failed to create default superuser role due to guard conflict.");
+            co_return;
+        } catch (const ::service::raft_operation_timeout_error& ex) {
+            log.error("Failed to create default superuser role due to exception: {}", ex.what());
+            co_return;
+        }
     }
 }
 
@@ -230,7 +290,7 @@ future<> standard_role_manager::migrate_legacy_metadata() {
                     std::move(config),
                     ::service::group0_batch::unused(),
                     [this](const auto& name, const auto& config, auto& mc) {
-                return create_or_replace(name, config, mc);
+                return create_or_replace(meta::legacy::AUTH_KS, name, config, mc);
             });
         }).finally([results] {});
     }).then([] {
@@ -251,11 +311,15 @@ future<> standard_role_manager::start() {
             const bool legacy = legacy_mode(_qp);
             if (legacy) {
                 if (!_superuser_created_promise.available()) {
+                    // Counterintuitively, we mark promise as ready before any startup work
+                    // because wait_for_schema_agreement() below will block indefinitely
+                    // without cluster majority. In that case, blocking node startup
+                    // would lead to a cluster deadlock.
                     _superuser_created_promise.set_value();
                 }
                 co_await _migration_manager.wait_for_schema_agreement(_qp.db().real_database(), db::timeout_clock::time_point::max(), &_as);
 
-                if (co_await any_nondefault_role_row_satisfies(_qp, &has_can_login)) {
+                if (co_await legacy::any_nondefault_role_row_satisfies(_qp, &has_can_login)) {
                     if (legacy_metadata_exists()) {
                         log.warn("Ignoring legacy user metadata since nondefault roles already exist.");
                     }
@@ -266,10 +330,13 @@ future<> standard_role_manager::start() {
                     co_await migrate_legacy_metadata();
                     co_return;
                 }
+                co_await legacy_create_default_role_if_missing();
             }
-            co_await create_default_role_if_missing();
             if (!legacy) {
-                _superuser_created_promise.set_value();
+                co_await maybe_create_default_role_with_retries();
+                if (!_superuser_created_promise.available()) {
+                    _superuser_created_promise.set_value();
+                }
             }
         };
 
@@ -288,12 +355,12 @@ future<> standard_role_manager::ensure_superuser_is_created() {
     return _superuser_created_promise.get_shared_future();
 }
 
-future<> standard_role_manager::create_or_replace(std::string_view role_name, const role_config& c, ::service::group0_batch& mc) {
+future<> standard_role_manager::create_or_replace(std::string_view auth_ks_name, std::string_view role_name, const role_config& c, ::service::group0_batch& mc) {
     const sstring query = seastar::format("INSERT INTO {}.{} ({}, is_superuser, can_login) VALUES (?, ?, ?)",
-            get_auth_ks_name(_qp),
+            auth_ks_name,
             meta::roles_table::name,
             meta::roles_table::role_col_name);
-    if (legacy_mode(_qp)) {
+    if (auth_ks_name == meta::legacy::AUTH_KS) {
         co_await _qp.execute_internal(
                 query,
                 consistency_for_role(role_name),
@@ -312,7 +379,7 @@ standard_role_manager::create(std::string_view role_name, const role_config& c, 
             throw role_already_exists(role_name);
         }
 
-        return create_or_replace(role_name, c, mc);
+        return create_or_replace(get_auth_ks_name(_qp), role_name, c, mc);
     });
 }
 
@@ -596,21 +663,30 @@ future<role_set> standard_role_manager::query_granted(std::string_view grantee_n
     });
 }
 
-future<role_to_directly_granted_map> standard_role_manager::query_all_directly_granted() {
+future<role_to_directly_granted_map> standard_role_manager::query_all_directly_granted(::service::query_state& qs) {
     const sstring query = seastar::format("SELECT * FROM {}.{}",
             get_auth_ks_name(_qp),
             meta::role_members_table::name);
 
+    const auto results = co_await _qp.execute_internal(
+            query,
+            db::consistency_level::ONE,
+            qs,
+            cql3::query_processor::cache_internal::yes);
+
     role_to_directly_granted_map roles_map;
-    co_await _qp.query_internal(query, [&roles_map] (const cql3::untyped_result_set_row& row) -> future<stop_iteration> {
-        roles_map.insert({row.get_as<sstring>("member"), row.get_as<sstring>("role")});
-        co_return stop_iteration::no;
-    });
+    std::transform(
+            results->begin(),
+            results->end(),
+            std::inserter(roles_map, roles_map.begin()),
+            [] (const cql3::untyped_result_set_row& row) {
+                return std::make_pair(row.get_as<sstring>("member"), row.get_as<sstring>("role")); }
+    );
 
     co_return roles_map;
 }
 
-future<role_set> standard_role_manager::query_all() {
+future<role_set> standard_role_manager::query_all(::service::query_state& qs) {
     const sstring query = seastar::format("SELECT {} FROM {}.{}",
             meta::roles_table::role_col_name,
             get_auth_ks_name(_qp),
@@ -619,10 +695,16 @@ future<role_set> standard_role_manager::query_all() {
     // To avoid many copies of a view.
     static const auto role_col_name_string = sstring(meta::roles_table::role_col_name);
 
+    if (utils::get_local_injector().enter("standard_role_manager_fail_legacy_query")) {
+        if (legacy_mode(_qp)) {
+            throw std::runtime_error("standard_role_manager::query_all: failed due to error injection");
+        }
+    }
+
     const auto results = co_await _qp.execute_internal(
             query,
             db::consistency_level::QUORUM,
-            internal_distributed_query_state(),
+            qs,
             cql3::query_processor::cache_internal::yes);
 
     role_set roles;
@@ -654,11 +736,11 @@ future<bool> standard_role_manager::can_login(std::string_view role_name) {
     });
 }
 
-future<std::optional<sstring>> standard_role_manager::get_attribute(std::string_view role_name, std::string_view attribute_name) {
+future<std::optional<sstring>> standard_role_manager::get_attribute(std::string_view role_name, std::string_view attribute_name, ::service::query_state& qs) {
     const sstring query = seastar::format("SELECT name, value FROM {}.{} WHERE role = ? AND name = ?",
             get_auth_ks_name(_qp),
             meta::role_attributes_table::name);
-    const auto result_set = co_await _qp.execute_internal(query, {sstring(role_name), sstring(attribute_name)}, cql3::query_processor::cache_internal::yes);
+    const auto result_set = co_await _qp.execute_internal(query, db::consistency_level::ONE, qs, {sstring(role_name), sstring(attribute_name)}, cql3::query_processor::cache_internal::yes);
     if (!result_set->empty()) {
         const cql3::untyped_result_set_row &row = result_set->one();
         co_return std::optional<sstring>(row.get_as<sstring>("value"));
@@ -666,11 +748,11 @@ future<std::optional<sstring>> standard_role_manager::get_attribute(std::string_
     co_return std::optional<sstring>{};
 }
 
-future<role_manager::attribute_vals> standard_role_manager::query_attribute_for_all (std::string_view attribute_name) {
-    return query_all().then([this, attribute_name] (role_set roles) {
-        return do_with(attribute_vals{}, [this, attribute_name, roles = std::move(roles)] (attribute_vals &role_to_att_val) {
-            return parallel_for_each(roles.begin(), roles.end(), [this, &role_to_att_val, attribute_name] (sstring role) {
-                return get_attribute(role, attribute_name).then([&role_to_att_val, role] (std::optional<sstring> att_val) {
+future<role_manager::attribute_vals> standard_role_manager::query_attribute_for_all (std::string_view attribute_name, ::service::query_state& qs) {
+    return query_all(qs).then([this, attribute_name, &qs] (role_set roles) {
+        return do_with(attribute_vals{}, [this, attribute_name, roles = std::move(roles), &qs] (attribute_vals &role_to_att_val) {
+            return parallel_for_each(roles.begin(), roles.end(), [this, &role_to_att_val, attribute_name, &qs] (sstring role) {
+                return get_attribute(role, attribute_name, qs).then([&role_to_att_val, role] (std::optional<sstring> att_val) {
                     if (att_val) {
                         role_to_att_val.emplace(std::move(role), std::move(*att_val));
                     }
@@ -715,25 +797,27 @@ future<> standard_role_manager::remove_attribute(std::string_view role_name, std
 future<std::vector<cql3::description>> standard_role_manager::describe_role_grants() {
     std::vector<cql3::description> result{};
 
-    const auto grants = co_await query_all_directly_granted();
+    const auto grants = co_await query_all_directly_granted(internal_distributed_query_state());
     result.reserve(grants.size());
 
     for (const auto& [grantee_role, granted_role] : grants) {
         const auto formatted_grantee = cql3::util::maybe_quote(grantee_role);
         const auto formatted_granted = cql3::util::maybe_quote(granted_role);
 
+        sstring create_statement = seastar::format("GRANT {} TO {};", formatted_granted, formatted_grantee);
+
         result.push_back(cql3::description {
             // Role grants do not belong to any keyspace.
             .keyspace = std::nullopt,
             .type = "grant_role",
             .name = granted_role,
-            .create_statement = seastar::format("GRANT {} TO {};", formatted_granted, formatted_grantee)
+            .create_statement = managed_string(create_statement)
         });
 
         co_await coroutine::maybe_yield();
     }
 
-    std::ranges::sort(result, std::less<>{}, [] (const cql3::description& desc) noexcept {
+    std::ranges::sort(result, std::less<>{}, [] (const cql3::description& desc) {
         return std::make_tuple(std::ref(desc.name), std::ref(*desc.create_statement));
     });
 

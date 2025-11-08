@@ -17,10 +17,10 @@ public:
     static constexpr const char to[] =
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     static constexpr uint8_t invalid_char = 255;
-    uint8_t from[255];
+    uint8_t from[256];
     base64_chars() {
         static_assert(sizeof(to) == 64 + 1);
-        for (int i = 0; i < 255; i++) {
+        for (int i = 0; i < 256; i++) {
             from[i] = invalid_char; // signal invalid character
         }
         for (int i = 0; i < 64; i++) {
@@ -127,8 +127,41 @@ bool base64_begins_with(std::string_view base, std::string_view operand) {
     if (unpadded_base_prefix != unpadded_operand) {
         return false;
     }
-    // Decode and compare last 4 bytes of base64-encoded strings
-    const std::string base_remainder = base64_decode_string(base.substr(operand.size() - 4, operand.size()));
+    // Decode and compare next 4 bytes of base64-encoded strings
+    const std::string base_remainder = base64_decode_string(base.substr(operand.size() - 4, 4));
     const std::string operand_remainder = base64_decode_string(operand.substr(operand.size() - 4));
     return base_remainder.starts_with(operand_remainder);
+}
+
+std::string base64url_encode(bytes_view in) {
+    std::string str = base64_encode(in);
+    for (char& c : str) {
+        if (c == '+') {
+            c = '-';
+        } else if (c == '/') {
+            c = '_';
+        }
+    }
+    str.erase(std::find(str.begin(), str.end(), '='), str.end());
+    return str;
+}
+
+bytes base64url_decode(std::string_view in) {
+    std::string str{in};
+    size_t mod = str.size() % 4;
+    if (mod == 1) {
+        std::invalid_argument(seastar::format("Base64 encoded length is invalid: {}", str.size()));
+    } else if (mod == 2) {
+        str.append("==", 2);
+    } else if (mod == 3) {
+        str.append("=", 1);
+    }
+    for (char& c : str) {
+        if (c == '-') {
+            c = '+';
+        } else if (c == '_') {
+            c = '/';
+        }
+    }
+    return base64_decode(str);
 }

@@ -11,6 +11,7 @@
 #include <seastar/core/thread.hh>
 #include <seastar/util/closeable.hh>
 
+#include "locator/abstract_replication_strategy.hh"
 #include "utils/log.hh"
 #include "data_dictionary/keyspace_metadata.hh"
 #include "db/cql_type_parser.hh"
@@ -49,7 +50,8 @@ tools::tablets_t do_load_system_tablets(const db::config& dbcfg,
                                         std::string_view table_name,
                                         reader_permit permit) {
     sharded<sstable_manager_service> sst_man;
-    sst_man.start(std::ref(dbcfg)).get();
+    auto scf = make_sstable_compressor_factory_for_tests_in_thread();
+    sst_man.start(std::ref(dbcfg), std::ref(*scf)).get();
     auto stop_sst_man_service = deferred_stop(sst_man);
 
     auto schema = db::system_keyspace::tablets();
@@ -70,8 +72,8 @@ tools::tablets_t do_load_system_tablets(const db::config& dbcfg,
 
     auto ks = make_lw_shared<data_dictionary::keyspace_metadata>(keyspace_name,
                                                                  "org.apache.cassandra.locator.LocalStrategy",
-                                                                 std::map<sstring, sstring>{},
-                                                                 std::nullopt, false);
+                                                                 locator::replication_strategy_config_options{},
+                                                                 std::nullopt, std::nullopt, false);
     db::cql_type_parser::raw_builder ut_builder(*ks);
 
     tools::tablets_t tablets;

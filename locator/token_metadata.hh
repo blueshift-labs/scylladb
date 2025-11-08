@@ -18,11 +18,12 @@
 #include <optional>
 #include <memory>
 #include <boost/icl/interval.hpp>
-#include "interval.hh"
+#include "utils/interval.hh"
 #include <seastar/core/shared_future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/sharded.hh>
+#include "utils/chunked_vector.hh"
 #include "utils/phased_barrier.hh"
 #include "service/topology_state_machine.hh"
 
@@ -47,7 +48,7 @@ class abstract_replication_strategy;
 
 using token = dht::token;
 
-class token_metadata;
+class shared_token_metadata;
 class tablet_metadata;
 
 struct host_id_or_endpoint {
@@ -158,7 +159,7 @@ public:
         return tmp;
     }
 private:
-    std::vector<token>::const_iterator _cur_it;
+    utils::chunked_vector<token>::const_iterator _cur_it;
     size_t _remaining = 0;
     const token_metadata_impl* _token_metadata = nullptr;
 
@@ -166,6 +167,7 @@ private:
 };
 
 class token_metadata final {
+    shared_token_metadata* _shared_token_metadata = nullptr;
     std::unique_ptr<token_metadata_impl> _impl;
 private:
     friend class token_metadata_ring_splitter;
@@ -178,12 +180,12 @@ public:
     using version_t = service::topology::version_t;
     using version_tracker_t = version_tracker;
 
-    token_metadata(config cfg);
+    token_metadata(shared_token_metadata& stm, config cfg);
     explicit token_metadata(std::unique_ptr<token_metadata_impl> impl);
     token_metadata(token_metadata&&) noexcept; // Can't use "= default;" - hits some static_assert in unique_ptr
     token_metadata& operator=(token_metadata&&) noexcept;
     ~token_metadata();
-    const std::vector<token>& sorted_tokens() const;
+    const utils::chunked_vector<token>& sorted_tokens() const;
     const tablet_metadata& tablets() const;
     tablet_metadata& tablets();
     void set_tablets(tablet_metadata);
@@ -351,19 +353,26 @@ public:
     version_t get_version() const;
     void set_version(version_t version);
 
+    shared_token_metadata& get_shared_token_metadata();
+
     friend class token_metadata_impl;
     friend class shared_token_metadata;
 private:
     void set_version_tracker(version_tracker_t tracker);
+
+    void set_shared_token_metadata(shared_token_metadata& stm);
+
+    // Clears and disposes the token metadata impl in the background, if present.
+    void clear_and_dispose_impl() noexcept;
 };
 
 struct topology_change_info {
     lw_shared_ptr<token_metadata> target_token_metadata;
-    std::vector<dht::token> all_tokens;
+    utils::chunked_vector<dht::token> all_tokens;
     token_metadata::read_new_t read_new;
 
     topology_change_info(lw_shared_ptr<token_metadata> target_token_metadata_,
-        std::vector<dht::token> all_tokens_,
+        utils::chunked_vector<dht::token> all_tokens_,
         token_metadata::read_new_t read_new_);
     future<> clear_gently();
 };
@@ -371,12 +380,8 @@ struct topology_change_info {
 using token_metadata_lock = semaphore_units<>;
 using token_metadata_lock_func = noncopyable_function<future<token_metadata_lock>() noexcept>;
 
-template <typename... Args>
-mutable_token_metadata_ptr make_token_metadata_ptr(Args... args) {
-    return make_lw_shared<token_metadata>(std::forward<Args>(args)...);
-}
-
-class shared_token_metadata {
+class shared_token_metadata : public peering_sharded_service<shared_token_metadata> {
+    named_gate _background_dispose_gate{"shared_token_metadata::background_dispose_gate"};
     mutable_token_metadata_ptr _shared;
     token_metadata_lock_func _lock_func;
     std::chrono::steady_clock::duration _stall_detector_threshold = std::chrono::seconds(2);
@@ -397,7 +402,6 @@ class shared_token_metadata {
     //   includes its own invocation as an operation in the new phase.
     utils::phased_barrier _versions_barrier;
     shared_future<> _stale_versions_in_use{make_ready_future<>()};
-    token_metadata::version_t _fence_version = 0;
     using version_tracker_list_type = boost::intrusive::list<version_tracker,
             boost::intrusive::member_hook<version_tracker, version_tracker::link_type, &version_tracker::_link>,
             boost::intrusive::constant_time_size<false>>;
@@ -408,14 +412,26 @@ public:
     // used to construct the shared object as a sharded<> instance
     // lock_func returns semaphore_units<>
     explicit shared_token_metadata(token_metadata_lock_func lock_func, token_metadata::config cfg)
-        : _shared(make_token_metadata_ptr(std::move(cfg)))
+        : _shared(make_lw_shared<token_metadata>(*this, cfg))
         , _lock_func(std::move(lock_func))
+        , _versions_barrier("shared_token_metadata::versions_barrier")
     {
         _shared->set_version_tracker(new_tracker(_shared->get_version()));
     }
 
     shared_token_metadata(const shared_token_metadata& x) = delete;
     shared_token_metadata(shared_token_metadata&& x) = default;
+
+    future<> stop() noexcept;
+
+    mutable_token_metadata_ptr make_token_metadata_ptr() {
+        return make_lw_shared<token_metadata>(*this, token_metadata::config{_shared->get_topology().get_config()});
+    }
+
+    mutable_token_metadata_ptr make_token_metadata_ptr(token_metadata&& tm) {
+        tm.set_shared_token_metadata(*this);
+        return make_lw_shared<token_metadata>(std::move(tm));
+    }
 
     token_metadata_ptr get() const noexcept {
         return _shared;
@@ -429,11 +445,6 @@ public:
 
     future<> stale_versions_in_use() const {
         return _stale_versions_in_use.get_future();
-    }
-
-    void update_fence_version(token_metadata::version_t version);
-    token_metadata::version_t get_fence_version() const noexcept {
-        return _fence_version;
     }
 
     // Token metadata changes are serialized
@@ -466,11 +477,22 @@ public:
     // Must be called on shard 0.
     static future<> mutate_on_all_shards(sharded<shared_token_metadata>& stm, seastar::noncopyable_function<future<> (token_metadata&)> func);
 
+    void clear_and_dispose(std::unique_ptr<token_metadata_impl> impl) noexcept;
+
 private:
     // for testing only, unsafe to be called without awaiting get_lock() first
     void mutate_token_metadata_for_test(seastar::noncopyable_function<void (token_metadata&)> func);
 
     friend struct ::sort_by_proximity_topology;
+};
+
+class pending_token_metadata {
+    std::vector<locator::mutable_token_metadata_ptr> _shards{smp::count};
+public:
+    future<> assign(locator::mutable_token_metadata_ptr new_token_metadata);
+    locator::mutable_token_metadata_ptr& local();
+    locator::token_metadata_ptr local() const;
+    future<> destroy();
 };
 
 }

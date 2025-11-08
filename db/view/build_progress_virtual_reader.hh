@@ -12,7 +12,7 @@
 #include "db/system_keyspace.hh"
 #include "readers/mutation_reader.hh"
 #include "mutation/mutation_fragment.hh"
-#include "query-request.hh"
+#include "query/query-request.hh"
 #include "schema/schema_fwd.hh"
 
 #include <iterator>
@@ -63,7 +63,7 @@ class build_progress_virtual_reader {
                 , _legacy_generation_number_col(_schema->get_column_definition("generation_number")->id)
                 , _legacy_slice(slice)
                 , _slice(adjust_partition_slice())
-                , _underlying(scylla_views_build_progress.make_reader_v2(
+                , _underlying(scylla_views_build_progress.make_mutation_reader(
                         scylla_views_build_progress.schema(),
                         std::move(permit),
                         range,

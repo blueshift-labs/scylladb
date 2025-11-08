@@ -47,13 +47,11 @@
 #include "types/types.hh"
 #include "sstables/types.hh"
 #include "checksum_utils.hh"
-#include "../compress.hh"
 
 class reader_permit;
 
 class compression_parameters;
 class compressor;
-using compressor_ptr = shared_ptr<compressor>;
 
 namespace sstables {
 
@@ -299,9 +297,12 @@ private:
     // Variables *not* found in the "Compression Info" file (added by update()):
     uint64_t _compressed_file_length = 0;
     uint32_t _full_checksum = 0;
+    compressor_ptr _compressor;
 public:
     // Set the compressor algorithm, please check the definition of enum compressor.
     void set_compressor(compressor_ptr c);
+    compressor& get_compressor() const;
+    void discard_hidden_options();
     // After changing _compression, update() must be called to update
     // additional variables depending on it.    
     void update(uint64_t compressed_file_length);
@@ -359,27 +360,29 @@ public:
     friend class sstable;
 };
 
-// for API query only. Free function just to distinguish it from an accessor in compression
-compressor_ptr get_sstable_compressor(const compression&);
+using stream_creator_fn = std::function<future<input_stream<char>>(uint64_t, uint64_t, file_input_stream_options)>;
 
 // Note: compression_metadata is passed by reference; The caller is
 // responsible for keeping the compression_metadata alive as long as there
 // are open streams on it. This should happen naturally on a higher level -
 // as long as we have *sstables* work in progress, we need to keep the whole
 // sstable alive, and the compression metadata is only a part of it.
-input_stream<char> make_compressed_file_k_l_format_input_stream(file f,
+input_stream<char> make_compressed_file_k_l_format_input_stream(stream_creator_fn stream_creator,
                 sstables::compression* cm, uint64_t offset, size_t len,
                 class file_input_stream_options options, reader_permit permit,
                 std::optional<uint32_t> digest);
 
-input_stream<char> make_compressed_file_m_format_input_stream(file f,
+input_stream<char> make_compressed_file_m_format_input_stream(stream_creator_fn stream_creator,
                 sstables::compression* cm, uint64_t offset, size_t len,
                 class file_input_stream_options options, reader_permit permit,
                 std::optional<uint32_t> digest);
 
 output_stream<char> make_compressed_file_m_format_output_stream(output_stream<char> out,
                 sstables::compression* cm,
-                const compression_parameters& cp);
+                const compression_parameters& cp,
+                compressor_ptr);
+
+
+std::map<sstring, sstring> options_from_compression(const compression& c);
 
 }
-

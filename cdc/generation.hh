@@ -44,6 +44,10 @@ namespace gms {
     class gossiper;
 } // namespace gms
 
+namespace locator {
+    class tablet_map;
+} // namespace locator
+
 namespace cdc {
 
 api::timestamp_clock::duration get_generation_leeway();
@@ -63,6 +67,7 @@ public:
     uint8_t version() const;
     size_t index() const;
     const bytes& to_bytes() const;
+    bytes to_bytes() &&;
     dht::token token() const;
 
     partition_key to_partition_key(const schema& log_schema) const;
@@ -97,10 +102,20 @@ class topology_description {
     utils::chunked_vector<token_range_description> _entries;
 public:
     topology_description(utils::chunked_vector<token_range_description> entries);
+
+    topology_description(const topology_description&) = delete;
+    topology_description& operator=(const topology_description&) = delete;
+
+    topology_description(topology_description&&) = default;
+    topology_description& operator=(topology_description&&) = default;
+
     bool operator==(const topology_description&) const;
 
     const utils::chunked_vector<token_range_description>& entries() const&;
     utils::chunked_vector<token_range_description>&& entries() &&;
+
+    /// The object MUST NOT be modified until the returned future resolves.
+    future<topology_description> clone_async() const;
 };
 
 /**
@@ -117,6 +132,26 @@ public:
         , timestamp(ts)
     {}
 };
+
+enum class stream_state : int8_t {
+    current = 0,
+    closed = 1,
+    opened = 2,
+};
+
+stream_state read_stream_state(int8_t val);
+
+struct committed_stream_set {
+    db_clock::time_point ts;
+    utils::chunked_vector<cdc::stream_id> streams;
+};
+
+struct cdc_stream_diff {
+    utils::chunked_vector<stream_id> closed_streams;
+    utils::chunked_vector<stream_id> opened_streams;
+};
+
+using table_streams = std::map<api::timestamp_type, committed_stream_set>;
 
 class no_generation_data_exception : public std::runtime_error {
 public:
@@ -183,5 +218,13 @@ static constexpr auto CDC_GENERATIONS_V3_KEY = "cdc_generations";
 future<utils::chunked_vector<mutation>> get_cdc_generation_mutations_v3(
     schema_ptr, utils::UUID gen_uuid, const cdc::topology_description&,
     size_t mutation_size_threshold, api::timestamp_type mutation_timestamp);
+
+future<mutation> create_table_streams_mutation(table_id, db_clock::time_point, const locator::tablet_map&, api::timestamp_type);
+future<mutation> create_table_streams_mutation(table_id, db_clock::time_point, const utils::chunked_vector<cdc::stream_id>&, api::timestamp_type);
+utils::chunked_vector<mutation> make_drop_table_streams_mutations(table_id, api::timestamp_type ts);
+
+future<mutation> get_switch_streams_mutation(table_id table, db_clock::time_point stream_ts, cdc_stream_diff diff, api::timestamp_type ts);
+future<utils::chunked_vector<mutation>> get_cdc_stream_gc_mutations(table_id table, db_clock::time_point base_ts, const utils::chunked_vector<cdc::stream_id>& base_stream_set, api::timestamp_type ts);
+table_streams::const_iterator get_new_base_for_gc(const table_streams&, std::chrono::seconds ttl);
 
 } // namespace cdc

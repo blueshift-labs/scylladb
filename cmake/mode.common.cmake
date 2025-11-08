@@ -80,7 +80,7 @@ function(get_padded_dynamic_linker_option output length)
   endif()
   # prefixing a path with "/"s does not actually change it means
   pad_at_begin(padded_dynamic_linker "/" "${dynamic_linker}" ${length})
-  set(${output} "${dynamic_linker_option}=${padded_dynamic_linker}" PARENT_SCOPE)
+  set(${output} "--dynamic-linker=${padded_dynamic_linker}" PARENT_SCOPE)
 endfunction()
 
 # We want to strip the absolute build paths from the binary,
@@ -117,6 +117,9 @@ add_compile_options("-ffile-prefix-map=${CMAKE_BINARY_DIR}=.")
 cmake_path(GET CMAKE_BINARY_DIR FILENAME build_dir_name)
 add_compile_options("-ffile-prefix-map=${CMAKE_BINARY_DIR}/=${build_dir_name}")
 
+# https://github.com/llvm/llvm-project/issues/163007
+add_compile_options("-fextend-variable-liveness=none")
+
 default_target_arch(target_arch)
 if(target_arch)
   add_compile_options("-march=${target_arch}")
@@ -135,7 +138,9 @@ function(maybe_limit_stack_usage_in_KB stack_usage_threshold_in_KB config)
   endif()
 endfunction()
 
-macro(update_cxx_flags flags)
+option(Scylla_WITH_DEBUG_INFO "Enable debug info" OFF)
+
+macro(update_build_flags config)
   cmake_parse_arguments (
     parsed_args
     "WITH_DEBUG_INFO"
@@ -145,11 +150,22 @@ macro(update_cxx_flags flags)
   if(NOT DEFINED parsed_args_OPTIMIZATION_LEVEL)
     message(FATAL_ERROR "OPTIMIZATION_LEVEL is missing")
   endif()
-  string(APPEND ${flags}
+  string(TOUPPER ${config} CONFIG)
+  set(cxx_flags "CMAKE_CXX_FLAGS_${CONFIG}")
+  set(linker_flags "CMAKE_EXE_LINKER_FLAGS_${CONFIG}")
+  string(APPEND ${cxx_flags}
     " -O${parsed_args_OPTIMIZATION_LEVEL}")
-  if(parsed_args_WITH_DEBUG_INFO)
-    string(APPEND ${flags} " -g -gz")
+  if(parsed_args_WITH_DEBUG_INFO OR ${Scylla_WITH_DEBUG_INFO})
+    string(APPEND ${cxx_flags} " -g -gz")
+  else()
+    # If Scylla is compiled without debug info, strip the debug symbols from
+    # the result in case one of the linked static libraries happens to have
+    # some debug symbols. See issue #23834.
+    string(APPEND ${linker_flags} " -Wl,--strip-debug")
   endif()
+  unset(CONFIG)
+  unset(cxx_flags)
+  unset(linker_flags)
 endmacro()
 
 set(pgo_opts "")
@@ -283,7 +299,7 @@ else()
   # that. The 512 includes the null at the end, hence the 511 below.
   get_padded_dynamic_linker_option(dynamic_linker_option 511)
 endif()
-add_link_options("${dynamic_linker_option}")
+add_link_options("LINKER:${dynamic_linker_option}")
 
 if(Scylla_ENABLE_LTO)
   include(CheckIPOSupported)

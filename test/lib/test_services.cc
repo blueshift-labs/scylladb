@@ -11,8 +11,11 @@
 #include "test/lib/sstable_test_env.hh"
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/test_utils.hh"
+#include "init.hh"
 #include "db/config.hh"
+#include "db/object_storage_endpoint_param.hh"
 #include "db/large_data_handler.hh"
+#include "db/corrupt_data_handler.hh"
 #include "dht/i_partitioner.hh"
 #include "gms/feature_service.hh"
 #include "repair/row_level.hh"
@@ -23,16 +26,17 @@
 #include <iostream>
 #include <fmt/ranges.h>
 #include <seastar/util/defer.hh>
+#include "sstables/generation_type.hh"
 
 static const sstring some_keyspace("ks");
 static const sstring some_column_family("cf");
 
-class table_for_tests::table_state : public compaction::table_state {
+class table_for_tests::compaction_group_view : public compaction::compaction_group_view {
     table_for_tests::data& _data;
     sstables::sstables_manager& _sstables_manager;
     std::vector<sstables::shared_sstable> _compacted_undeleted;
     tombstone_gc_state _tombstone_gc_state;
-    mutable compaction_backlog_tracker _backlog_tracker;
+    mutable compaction::compaction_backlog_tracker _backlog_tracker;
     compaction::compaction_strategy_state _compaction_strategy_state;
     std::string _group_id;
     seastar::condition_variable _staging_condition;
@@ -41,15 +45,16 @@ private:
         return *_data.cf;
     }
 public:
-    explicit table_state(table_for_tests::data& data, sstables::sstables_manager& sstables_manager)
+    explicit compaction_group_view(table_for_tests::data& data, sstables::sstables_manager& sstables_manager)
             : _data(data)
             , _sstables_manager(sstables_manager)
             , _tombstone_gc_state(nullptr)
             , _backlog_tracker(get_compaction_strategy().make_backlog_tracker())
             , _compaction_strategy_state(compaction::compaction_strategy_state::make(get_compaction_strategy()))
-            , _group_id("table_for_tests::table_state")
+            , _group_id("table_for_tests::compaction_group_view")
     {
     }
+    dht::token_range token_range() const noexcept override { return dht::token_range::make(dht::first_token(), dht::last_token()); }
     const schema_ptr& schema() const noexcept override {
         return table().schema();
     }
@@ -59,29 +64,29 @@ public:
     bool compaction_enforce_min_threshold() const noexcept override {
         return true;
     }
-    const sstables::sstable_set& main_sstable_set() const override {
-        return table().try_get_table_state_with_static_sharding().main_sstable_set();
+    future<lw_shared_ptr<const sstables::sstable_set>> main_sstable_set() const override {
+        co_return co_await table().try_get_compaction_group_view_with_static_sharding().main_sstable_set();
     }
-    const sstables::sstable_set& maintenance_sstable_set() const override {
-        return table().try_get_table_state_with_static_sharding().maintenance_sstable_set();
+    future<lw_shared_ptr<const sstables::sstable_set>> maintenance_sstable_set() const override {
+        co_return co_await table().try_get_compaction_group_view_with_static_sharding().maintenance_sstable_set();
     }
     lw_shared_ptr<const sstables::sstable_set> sstable_set_for_tombstone_gc() const override {
-        return make_lw_shared<const sstables::sstable_set>(main_sstable_set());
+        return table().try_get_compaction_group_with_static_sharding()->main_sstables();
     }
     std::unordered_set<sstables::shared_sstable> fully_expired_sstables(const std::vector<sstables::shared_sstable>& sstables, gc_clock::time_point query_time) const override {
-        return sstables::get_fully_expired_sstables(*this, sstables, query_time);
+        return compaction::get_fully_expired_sstables(*this, sstables, query_time);
     }
     const std::vector<sstables::shared_sstable>& compacted_undeleted_sstables() const noexcept override {
         return _compacted_undeleted;
     }
-    sstables::compaction_strategy& get_compaction_strategy() const noexcept override {
+    compaction::compaction_strategy& get_compaction_strategy() const noexcept override {
         return table().get_compaction_strategy();
     }
     compaction::compaction_strategy_state& get_compaction_strategy_state() noexcept override {
         return _compaction_strategy_state;
     }
     reader_permit make_compaction_reader_permit() const override {
-        return table().compaction_concurrency_semaphore().make_tracking_only_permit(schema(), "table_for_tests::table_state", db::no_timeout, {});
+        return table().compaction_concurrency_semaphore().make_tracking_only_permit(schema(), "table_for_tests::compaction_group_view", db::no_timeout, {});
     }
     sstables::sstables_manager& get_sstables_manager() noexcept override {
         return _sstables_manager;
@@ -103,8 +108,8 @@ public:
         return table().min_memtable_live_row_marker_timestamp();
     }
     bool memtable_has_key(const dht::decorated_key& key) const override { return false; }
-    future<> on_compaction_completion(sstables::compaction_completion_desc desc, sstables::offstrategy offstrategy) override {
-        return table().try_get_table_state_with_static_sharding().on_compaction_completion(std::move(desc), offstrategy);
+    future<> on_compaction_completion(compaction::compaction_completion_desc desc, sstables::offstrategy offstrategy) override {
+        return table().try_get_compaction_group_view_with_static_sharding().on_compaction_completion(std::move(desc), offstrategy);
     }
     bool is_auto_compaction_disabled_by_user() const noexcept override {
         return table().is_auto_compaction_disabled_by_user();
@@ -115,7 +120,7 @@ public:
     const tombstone_gc_state& get_tombstone_gc_state() const noexcept override {
         return _tombstone_gc_state;
     }
-    compaction_backlog_tracker& get_backlog_tracker() override {
+    compaction::compaction_backlog_tracker& get_backlog_tracker() override {
         return _backlog_tracker;
     }
     const std::string get_group_id() const noexcept override {
@@ -127,6 +132,7 @@ public:
     dht::token_range get_token_range_after_split(const dht::token& t) const noexcept override {
         return table().get_token_range_after_split(t);
     }
+    int64_t get_sstables_repaired_at() const noexcept override { return 0; }
 };
 
 table_for_tests::data::data()
@@ -140,19 +146,19 @@ schema_ptr table_for_tests::make_default_schema() {
         .build();
 }
 
-table_for_tests::table_for_tests(sstables::sstables_manager& sstables_manager, compaction_manager& cm, schema_ptr s, replica::table::config cfg, data_dictionary::storage_options storage)
+table_for_tests::table_for_tests(sstables::sstables_manager& sstables_manager, compaction::compaction_manager& cm, schema_ptr s, replica::table::config cfg, data_dictionary::storage_options storage)
     : _data(make_lw_shared<data>())
 {
     cfg.cf_stats = &_data->cf_stats;
     _data->s = s ? s : make_default_schema();
     _data->cf = make_lw_shared<replica::column_family>(_data->s, std::move(cfg), make_lw_shared<replica::storage_options>(storage), cm, sstables_manager, _data->cl_stats, sstables_manager.get_cache_tracker(), nullptr);
     _data->cf->mark_ready_for_writes(nullptr);
-    _data->table_s = std::make_unique<table_state>(*_data, sstables_manager);
+    _data->table_s = std::make_unique<compaction_group_view>(*_data, sstables_manager);
     cm.add(*_data->table_s);
     _data->storage = std::move(storage);
 }
 
-compaction::table_state& table_for_tests::as_table_state() noexcept {
+compaction::compaction_group_view& table_for_tests::as_compaction_group_view() noexcept {
     return *_data->table_s;
 }
 
@@ -166,28 +172,43 @@ void table_for_tests::set_tombstone_gc_enabled(bool tombstone_gc_enabled) noexce
     _data->cf->set_tombstone_gc_enabled(tombstone_gc_enabled);
 }
 
+void table_for_tests::set_repair_sstable_classifier(replica::repair_classifier_func repair_sstable_classifier) {
+    _data->cf->for_each_compaction_group([&] (replica::compaction_group& cg) {
+        cg.set_repair_sstable_classifier(repair_sstable_classifier);
+    });
+}
+
 namespace sstables {
 
-std::unordered_map<sstring, s3::endpoint_config> make_storage_options_config(const data_dictionary::storage_options& so) {
-    std::unordered_map<sstring, s3::endpoint_config> cfg;
+std::vector<db::object_storage_endpoint_param> make_storage_options_config(const data_dictionary::storage_options& so) {
+    std::vector<db::object_storage_endpoint_param> endpoints;
     std::visit(overloaded_functor {
         [] (const data_dictionary::storage_options::local& loc) mutable -> void {
         },
-        [&cfg] (const data_dictionary::storage_options::s3& os) mutable -> void {
-            cfg[os.endpoint] = s3::endpoint_config {
-                .port = std::stoul(tests::getenv_safe("S3_SERVER_PORT_FOR_TEST")),
-                .use_https = ::getenv("AWS_DEFAULT_REGION") != nullptr,
-                .region = ::getenv("AWS_DEFAULT_REGION") ? : "local",
-            };
+        [&endpoints] (const data_dictionary::storage_options::object_storage& os) mutable -> void {
+            if (os.type == data_dictionary::storage_options::S3_NAME) {
+                endpoints.emplace_back(os.endpoint, 
+                    s3::endpoint_config {
+                    .port = std::stoul(tests::getenv_safe("S3_SERVER_PORT_FOR_TEST")),
+                    .use_https = ::getenv("AWS_DEFAULT_REGION") != nullptr,
+                    .region = tests::getenv_or_default("AWS_DEFAULT_REGION", "local"),
+                });
+            }
+            if (os.type == data_dictionary::storage_options::GS_NAME) {
+                endpoints.emplace_back(db::object_storage_endpoint_param::gs_storage{
+                    .endpoint = os.endpoint, 
+                    .credentials_file = tests::getenv_or_default("GS_CREDENTIALS_FILE", "none")
+                });
+            }
         }
     }, so.value);
-    return cfg;
+    return endpoints;
 }
 
 std::unique_ptr<db::config> make_db_config(sstring temp_dir, const data_dictionary::storage_options so) {
     auto cfg = std::make_unique<db::config>();
     cfg->data_file_directories.set({ temp_dir });
-    cfg->object_storage_config.set(make_storage_options_config(so));
+    cfg->object_storage_endpoints(make_storage_options_config(so));
     return cfg;
 }
 
@@ -199,47 +220,53 @@ struct test_env::impl {
     ::cache_tracker cache_tracker;
     gms::feature_service feature_service;
     db::nop_large_data_handler nop_ld_handler;
+    db::nop_corrupt_data_handler nop_cd_handler;
+    sstable_compressor_factory& scf;
     test_env_sstables_manager mgr;
     std::unique_ptr<test_env_compaction_manager> cmgr;
     reader_concurrency_semaphore semaphore;
-    sstables::sstable_generation_generator gen{0};
-    sstables::uuid_identifiers use_uuid;
+    sstables::sstable_generation_generator gen;
     data_dictionary::storage_options storage;
     abort_source abort;
 
-    impl(test_env_config cfg, sstables::storage_manager* sstm, tmpdir* tdir);
+    impl(test_env_config cfg, sstable_compressor_factory&, sstables::storage_manager* sstm, tmpdir* tdir);
     impl(impl&&) = delete;
     impl(const impl&) = delete;
 
     sstables::generation_type new_generation() noexcept {
-        return gen(use_uuid);
+        return gen();
     }
 };
 
-test_env::impl::impl(test_env_config cfg, sstables::storage_manager* sstm, tmpdir* tdir)
+test_env::impl::impl(test_env_config cfg, sstable_compressor_factory& scfarg, sstables::storage_manager* sstm, tmpdir* tdir)
     : local_dir(tdir == nullptr ? std::optional<tmpdir>(std::in_place) : std::optional<tmpdir>(std::nullopt))
     , dir(tdir == nullptr ? local_dir.value() : *tdir)
     , db_config(make_db_config(dir.path().native(), cfg.storage))
     , dir_sem(1)
-    , feature_service(gms::feature_config_from_db_config(*db_config))
-    , mgr("test_env", cfg.large_data_handler == nullptr ? nop_ld_handler : *cfg.large_data_handler, *db_config,
-        feature_service, cache_tracker, cfg.available_memory, dir_sem,
-        [host_id = locator::host_id::create_random_id()]{ return host_id; }, abort, current_scheduling_group(), sstm)
+    , feature_service({get_disabled_features_from_db_config(*db_config)})
+    , nop_cd_handler(db::corrupt_data_handler::register_metrics::no)
+    , scf(scfarg)
+    , mgr(
+            "test_env",
+            cfg.large_data_handler == nullptr ? nop_ld_handler : *cfg.large_data_handler,
+            cfg.corrupt_data_handler == nullptr ? nop_cd_handler : *cfg.corrupt_data_handler,
+            *db_config,
+            feature_service,
+            cache_tracker,
+            cfg.available_memory,
+            dir_sem,
+            [host_id = locator::host_id::create_random_id()]{ return host_id; },
+            scf,
+            abort,
+            current_scheduling_group(),
+            sstm)
     , semaphore(reader_concurrency_semaphore::no_limits{}, "sstables::test_env", reader_concurrency_semaphore::register_metrics::no)
-    , use_uuid(cfg.use_uuid)
     , storage(std::move(cfg.storage))
 {
-    if (cfg.use_uuid) {
-        feature_service.uuid_sstable_identifiers.enable();
-    }
-    if (!storage.is_local_type()) {
-        // remote storage requires uuid-based identifier for naming sstables
-        SCYLLA_ASSERT(use_uuid == uuid_identifiers::yes);
-    }
 }
 
-test_env::test_env(test_env_config cfg, sstables::storage_manager* sstm, tmpdir* tmp)
-        : _impl(std::make_unique<impl>(std::move(cfg), sstm, tmp))
+test_env::test_env(test_env_config cfg, sstable_compressor_factory& scf, sstables::storage_manager* sstm, tmpdir* tmp)
+        : _impl(std::make_unique<impl>(std::move(cfg), scf, sstm, tmp))
 {
 }
 
@@ -258,7 +285,11 @@ void test_env::maybe_start_compaction_manager(bool enable) {
 
 future<> test_env::stop() {
     if (_impl->cmgr) {
-        co_await _impl->cmgr->get_compaction_manager().stop();
+        if (_impl->cmgr->get_compaction_manager().is_running()) {
+            co_await _impl->cmgr->get_compaction_manager().stop();
+        } else {
+            co_await _impl->cmgr->get_compaction_manager().get_task_manager_module().stop();
+        }
     }
     co_await _impl->mgr.close();
     co_await _impl->semaphore.stop();
@@ -316,12 +347,13 @@ future<> test_env::do_with_async(noncopyable_function<void (test_env&)> func, te
     if (!cfg.storage.is_local_type()) {
         auto db_cfg = make_shared<db::config>();
         db_cfg->experimental_features({db::experimental_features_t::feature::KEYSPACE_STORAGE_OPTIONS});
-        db_cfg->object_storage_config.set(make_storage_options_config(cfg.storage));
+        db_cfg->object_storage_endpoints(make_storage_options_config(cfg.storage));
         return seastar::async([func = std::move(func), cfg = std::move(cfg), db_cfg = std::move(db_cfg)] () mutable {
             sharded<sstables::storage_manager> sstm;
             sstm.start(std::ref(*db_cfg), sstables::storage_manager::config{}).get();
             auto stop_sstm = defer([&] { sstm.stop().get(); });
-            test_env env(std::move(cfg), &sstm.local());
+            auto scf = make_sstable_compressor_factory_for_tests_in_thread();
+            test_env env(std::move(cfg), *scf, &sstm.local());
             auto close_env = defer([&] { env.stop().get(); });
             env.manager().plug_sstables_registry(std::make_unique<mock_sstables_registry>());
             auto unplu = defer([&env] { env.manager().unplug_sstables_registry(); });
@@ -330,7 +362,8 @@ future<> test_env::do_with_async(noncopyable_function<void (test_env&)> func, te
     }
 
     return seastar::async([func = std::move(func), cfg = std::move(cfg)] () mutable {
-        test_env env(std::move(cfg));
+        auto scf = make_sstable_compressor_factory_for_tests_in_thread();
+        test_env env(std::move(cfg), *scf);
         auto close_env = defer([&] { env.stop().get(); });
         func(env);
     });
@@ -344,13 +377,13 @@ test_env::new_generation() noexcept {
 shared_sstable
 test_env::make_sstable(schema_ptr schema, sstring dir, sstables::generation_type generation,
         sstable::version_types v, sstable::format_types f,
-        size_t buffer_size, gc_clock::time_point now) {
+        size_t buffer_size, db_clock::time_point now) {
     // FIXME -- most of the callers work with _impl->dir's path, so
     // test_env can initialize the .dir/.prefix only once, when constructed
     auto storage = _impl->storage;
     std::visit(overloaded_functor {
         [&dir] (data_dictionary::storage_options::local& o) { o.dir = dir; },
-        [&schema] (data_dictionary::storage_options::s3& o) { o.location = schema->id(); },
+        [&schema] (data_dictionary::storage_options::object_storage& o) { o.location = schema->id(); },
     }, storage.value);
     return _impl->mgr.make_sstable(std::move(schema), storage, generation, sstables::sstable_state::normal, v, f, now, default_io_error_handler_gen(), buffer_size);
 }
@@ -363,7 +396,7 @@ test_env::make_sstable(schema_ptr schema, sstring dir, sstable::version_types v)
 shared_sstable
 test_env::make_sstable(schema_ptr schema, sstables::generation_type generation,
         sstable::version_types v, sstable::format_types f,
-        size_t buffer_size, gc_clock::time_point now) {
+        size_t buffer_size, db_clock::time_point now) {
     return make_sstable(std::move(schema), _impl->dir.path().native(), generation, std::move(v), std::move(f), buffer_size, now);
 }
 
@@ -472,7 +505,8 @@ test_env::do_with_sharded_async(noncopyable_function<void (sharded<test_env>&)> 
     return seastar::async([func = std::move(func)] {
         tmpdir tdir;
         sharded<test_env> env;
-        env.start(test_env_config{}, nullptr, &tdir).get();
+        auto scf = make_sstable_compressor_factory_for_tests_in_thread();
+        env.start(test_env_config{}, std::ref(*scf), nullptr, &tdir).get();
         auto stop = defer([&] { env.stop().get(); });
         func(env);
     });
@@ -486,7 +520,7 @@ test_env::make_table_for_tests(schema_ptr s, sstring dir) {
     auto storage = _impl->storage;
     std::visit(overloaded_functor {
         [&dir] (data_dictionary::storage_options::local& o) { o.dir = dir; },
-        [&s] (data_dictionary::storage_options::s3& o) { o.location = s->id(); },
+        [&s] (data_dictionary::storage_options::object_storage& o) { o.location = s->id(); },
     }, storage.value);
     return table_for_tests(manager(), _impl->cmgr->get_compaction_manager(), s, std::move(cfg), std::move(storage));
 }
@@ -496,15 +530,23 @@ test_env::make_table_for_tests(schema_ptr s) {
     return make_table_for_tests(std::move(s), _impl->dir.path().native());
 }
 
+sstables::sstable_set test_env::make_sstable_set(compaction::compaction_strategy& cs, schema_ptr s) {
+    auto t = make_table_for_tests(s);
+    auto close_t = deferred_stop(t);
+    return cs.make_sstable_set(t.as_compaction_group_view());
+}
+
 void test_env::request_abort() {
     _impl->abort.request_abort();
 }
 
-data_dictionary::storage_options make_test_object_storage_options() {
+data_dictionary::storage_options make_test_object_storage_options(std::string_view type) {
     data_dictionary::storage_options ret;
-    ret.value = data_dictionary::storage_options::s3 {
-        .bucket = tests::getenv_safe("S3_BUCKET_FOR_TEST"),
-        .endpoint = tests::getenv_safe("S3_SERVER_ADDRESS_FOR_TEST"),
+    auto t = std::string(type);
+    ret.value = data_dictionary::storage_options::object_storage {
+        .bucket = tests::getenv_safe(t + "_BUCKET_FOR_TEST"),
+        .endpoint = tests::getenv_safe(t + "_SERVER_ADDRESS_FOR_TEST"),
+        .type = t
     };
     return ret;
 }
@@ -523,7 +565,7 @@ future<shared_sstable> test_env::reusable_sst(schema_ptr schema, sstring dir, ss
     throw sst_not_found(dir, generation);
 }
 
-void test_env_compaction_manager::propagate_replacement(compaction::table_state& table_s, const std::vector<shared_sstable>& removed, const std::vector<shared_sstable>& added) {
+void test_env_compaction_manager::propagate_replacement(compaction::compaction_group_view& table_s, const std::vector<shared_sstable>& removed, const std::vector<shared_sstable>& added) {
     _cm.propagate_replacement(table_s, removed, added);
 }
 
@@ -535,7 +577,7 @@ future<> test_env_compaction_manager::perform_compaction(shared_ptr<compaction::
             testlog.error("compaction_manager_test: deregister_compaction uuid={}: task not found", task->compaction_data().compaction_uuid);
         }
         task->unlink();
-        task->switch_state(compaction_task_executor::state::none);
+        task->switch_state(compaction::compaction_task_executor::state::none);
     });
     co_await task->run_compaction();
 }

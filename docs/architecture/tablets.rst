@@ -42,6 +42,10 @@ the administrator. The tablet load balancer decides where to migrate
 the tablets, either within the same node to balance the shards or across 
 the nodes to balance the global load in the cluster.
 
+The number of tablets the load balancer maintains on a node is directly
+proportional to the node's storage capacity. A node with twice
+the storage will have twice the number of tablets located on it.
+
 As a table grows, each tablet can split into two, creating a new tablet.
 The load balancer can migrate the split halves independently to different nodes
 or shards.
@@ -83,6 +87,53 @@ especially for data models that contain small cells.
 File-based streaming is used for tablet migration in all 
 :ref:`keyspaces created with tablets enabled <tablets>`.
 
+.. _absolute-number-of-tablets:
+
+Absolute number of tablets
+==========================
+
+ScyllaDB has a background process that periodically re-evaluates the number of tablets of each table.
+The computed number of tablets a table will have is based on several parameters and factors. These are:
+
+* Keyspace tablets option ``'initial'``. This option sets the initial number of tablets on the keyspace level.
+  See :ref:`The tablets property <tablets>` for details.
+* Table-level option ``'expected_data_size_in_gb'``. This option sets the minimal number of tablets for a table
+  based on the expected table size and the target tablet size. See
+  :ref:`Per-table tablet options <cql-per-table-tablet-options>` for details.
+* Table-level option ``'min_per_shard_tablet_count'``. Using this option results in the number of tablets being
+  computed based on the number of shards in a DC so that each shard has at least ``'min_per_shard_tablet_count'``
+  tablets on average. See :ref:`Per-table tablet options <cql-per-table-tablet-options>` for details.
+* Table-level option ``'min_tablet_count'``. This option sets the minimal number of tablets for the given table.
+  See :ref:`Per-table tablet options <cql-per-table-tablet-options>` for details.
+* Config option ``'tablets_initial_scale_factor'``. This option sets the minimal number of tablets per shard
+  per table globally. This option can be overridden by the table-level option: ``'min_per_shard_tablet_count'``.
+  ``'tablets_initial_scale_factor'`` is ignored if either the keyspace option ``'initial'`` or table-level
+  option ``'min_tablet_count'`` is set.
+
+Another factor that determines the absolute tablet count is the amount of data the table contains. If the
+amount of data in the table is such that the average tablet size is larger than double the target tablet size,
+the table will be split (the number of tablets will be doubled), and if the average tablet size is smaller than
+half the target tablet size, it will be merged (the number of tablets will be halved).
+
+Each of these factors is taken into consideration, and the one producing the largest number of tablets wins, and
+will be used as the number of tablets for the given table.
+
+As the last step, in order to avoid having too many tablets per shard, which could potentially lead to overload
+and performance degradation, ScyllaDB will run the following algorithm to respect the ``tablets_per_shard_goal``
+config option:
+
+* Compute average tablet count per-shard in each DC.
+* Determine if per-shard goal is exceeded in that DC.
+* Compute scale factor by which tablet count should be multiplied so that the goal is not exceeded in that DC.
+* Take the smallest scale factor among all DCs, which ensures that no DC is overloaded.
+* Each table's tablet count is aligned to the nearest power of 2 post-scaling.
+
+Please note that because of this alignment, the scaling may not be effective and in the worst case may be
+overshot by a factor of 2, and that the ``tablets_per_shard_goal`` is a soft limit and not a hard constraint.
+
+Finally, the computed tablet count is compared with the current tablet count for each table, and if there is
+a difference, a table resize (split or merge) is executed.
+
 .. _tablets-enable-tablets: 
 
 Enabling Tablets
@@ -90,15 +141,15 @@ Enabling Tablets
 
 ScyllaDB now uses tablets by default for data distribution.
 Enabling tablets by default when creating new keyspaces is
-controlled by the :confval:`enable_tablets` option. However, tablets only work if
+controlled by the :confval:`tablets_mode_for_new_keyspaces` option. However, tablets only work if
 supported on all nodes within the cluster.
 
 When creating a new keyspace with tablets enabled by default, you can still opt-out
-on a per-keyspace basis. The recommended ``NetworkTopologyStrategy`` for keyspaces
-remains *required* even if tablets are disabled.
+on a per-keyspace basis using ``CREATE KEYSPACE <ks> WITH tablets = {'enabled': false}``,
+unless the :confval:`tablets_mode_for_new_keyspaces` option is set to ``enforced``.
 
-You can create a keyspace with tablets
-disabled with the ``tablets = {'enabled': false}`` option:
+Note: The recommended ``NetworkTopologyStrategy`` for keyspaces
+remains *required* even if tablets are disabled.
 
 .. code:: cql
 
@@ -146,25 +197,8 @@ Limitations and Unsupported Features
     throughout its lifetime. Failing to keep that invariant satisfied may result in data inconsistencies,
     performance problems, or other issues.
 
-The following ScyllaDB features are not supported if a keyspace has tablets
-enabled:
-
-* Counters
-* Change Data Capture (CDC)
-* Lightweight Transactions (LWT)
-* Alternator (as it uses LWT)
-
-If you plan to use any of the above features, CREATE your keyspace
-:ref:`with tablets disabled <tablets-enable-tablets>`.
-
-The following ScyllaDB features are disabled by default when used with a keyspace
-that has tablets enabled:
-
-* Materialized Views (MV)
-* Secondary indexes (SI, as it depends on MV)
-
-To enable MV and SI for tablet keyspaces, use the `--experimental-features=views-with-tablets`
-configuration option.  See :ref:`Views with tablets <admin-views-with-tablets>` for details.
+To enable materialized views and secondary indexes for tablet keyspaces, use
+the `--rf-rack-valid-keyspaces` See :ref:`Views with tablets <admin-views-with-tablets>` for details.
 
 Resharding in keyspaces with tablets enabled has the following limitations:
 

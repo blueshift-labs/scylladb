@@ -11,10 +11,11 @@
 #pragma once
 
 #include <variant>
+#include "cdc/log.hh"
 #include "inet_address_vectors.hh"
 #include "replica/database_fwd.hh"
 #include "message/messaging_service_fwd.hh"
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/execution_stage.hh>
 #include <seastar/core/scheduling_specific.hh>
 #include "db/read_repair_decision.hh"
@@ -25,7 +26,7 @@
 #include <seastar/rpc/rpc_types.hh>
 #include "storage_proxy_stats.hh"
 #include "service_permit.hh"
-#include "query-result.hh"
+#include "query/query-result.hh"
 #include "cdc/stats.hh"
 #include "locator/abstract_replication_strategy.hh"
 #include "db/hints/host_filter.hh"
@@ -38,6 +39,8 @@
 #include "locator/host_id.hh"
 #include "dht/token_range_endpoints.hh"
 #include "service/storage_service.hh"
+#include "service/cas_shard.hh"
+#include "service/storage_proxy_fwd.hh"
 
 class reconcilable_result;
 class frozen_mutation_and_schema;
@@ -69,6 +72,10 @@ class feature_service;
 
 namespace db {
 class system_keyspace;
+
+namespace view {
+struct view_building_state_machine;
+}
 }
 
 namespace service {
@@ -77,6 +84,7 @@ namespace paxos {
     class prepare_summary;
     class proposal;
     class promise;
+    class paxos_store;
     using prepare_response = std::variant<utils::UUID, promise>;
 }
 
@@ -87,6 +95,7 @@ class mutation_holder;
 class client_state;
 class migration_manager;
 struct hint_wrapper;
+struct batchlog_replay_mutation;
 struct read_repair_mutation;
 
 using replicas_per_token_range = std::unordered_map<dht::token_range, std::vector<locator::host_id>>;
@@ -119,19 +128,22 @@ public:
     tracing::trace_state_ptr trace_state = nullptr;
     replicas_per_token_range preferred_replicas;
     std::optional<db::read_repair_decision> read_repair_decision;
+    node_local_only node_local_only;
 
     storage_proxy_coordinator_query_options(storage_proxy_clock_type::time_point timeout,
             service_permit permit_,
             client_state& client_state_,
             tracing::trace_state_ptr trace_state = nullptr,
             replicas_per_token_range preferred_replicas = { },
-            std::optional<db::read_repair_decision> read_repair_decision = { })
+            std::optional<db::read_repair_decision> read_repair_decision = { },
+            service::node_local_only node_local_only_ = service::node_local_only::no)
         : _timeout(timeout)
         , permit(std::move(permit_))
         , cstate(client_state_)
         , trace_state(std::move(trace_state))
         , preferred_replicas(std::move(preferred_replicas))
-        , read_repair_decision(read_repair_decision) {
+        , read_repair_decision(read_repair_decision)
+        , node_local_only(node_local_only_) {
     }
 
     storage_proxy_clock_type::time_point timeout(storage_proxy& sp) const {
@@ -151,6 +163,11 @@ struct storage_proxy_coordinator_query_result {
         , last_replicas(std::move(last_replicas))
         , read_repair_decision(std::move(read_repair_decision)) {
     }
+};
+
+struct storage_proxy_coordinator_mutate_options {
+    cdc::per_request_options cdc_options;
+    node_local_only node_local_only = node_local_only::no;
 };
 
 class cas_request;
@@ -207,6 +224,7 @@ public:
 
     using coordinator_query_options = storage_proxy_coordinator_query_options;
     using coordinator_query_result = storage_proxy_coordinator_query_result;
+    using coordinator_mutate_options = storage_proxy_coordinator_mutate_options;
 
     // Holds  a list of endpoints participating in CAS request, for a given
     // consistency level, token, and state of joining/leaving nodes.
@@ -232,6 +250,7 @@ public:
     query::max_result_size get_max_result_size(const query::partition_slice& slice) const;
     query::tombstone_limit get_tombstone_limit() const;
     host_id_vector_replica_set get_live_endpoints(const locator::effective_replication_map& erm, const dht::token& token) const;
+    bool is_alive(const locator::effective_replication_map& erm, const locator::host_id&) const;
 
     void update_view_update_backlog();
 
@@ -245,10 +264,10 @@ public:
     // using gossip and by passing the information in each MUTATION_DONE rpc call response.
     db::view::update_backlog get_backlog_of(locator::host_id) const;
 
-    future<std::vector<dht::token_range_endpoints>> describe_ring(const sstring& keyspace, bool include_only_local_dc = false) const;
+    future<utils::chunked_vector<dht::token_range_endpoints>> describe_ring(const sstring& keyspace, bool include_only_local_dc = false) const;
 
 private:
-    distributed<replica::database>& _db;
+    sharded<replica::database>& _db;
     const locator::shared_token_metadata& _shared_token_metadata;
     locator::effective_replication_map_factory& _erm_factory;
     smp_service_group _read_smp_service_group;
@@ -285,20 +304,23 @@ private:
     inheriting_concrete_execution_stage<
             future<result<>>,
             storage_proxy*,
-            std::vector<mutation>,
+            utils::chunked_vector<mutation>,
             db::consistency_level,
             clock_type::time_point,
             tracing::trace_state_ptr,
             service_permit,
             bool,
             db::allow_per_partition_rate_limit,
-            lw_shared_ptr<cdc::operation_result_tracker>> _mutate_stage;
+            lw_shared_ptr<cdc::operation_result_tracker>,
+            coordinator_mutate_options> _mutate_stage;
     db::view::node_update_backlog& _max_view_update_backlog;
     std::unordered_map<locator::host_id, view_update_backlog_timestamped> _view_update_backlogs;
 
     //NOTICE(sarna): This opaque pointer is here just to avoid moving write handler class definitions from .cc to .hh. It's slow path.
     class cancellable_write_handlers_list;
     std::unique_ptr<cancellable_write_handlers_list> _cancellable_write_handlers_list;
+
+    gate _write_handlers_gate;
 
     /* This is a pointer to the shard-local part of the sharded cdc_service:
      * storage_proxy needs access to cdc_service to augment mutations.
@@ -318,8 +340,9 @@ private:
 
     cdc_stats _cdc_stats;
 
-    // Needed by sstable cleanup fiber to wait for all ongoing writes to complete
-    utils::phased_barrier _pending_writes_phaser;
+    locator::token_metadata::version_t _fence_version = 0;
+    std::map<locator::token_metadata::version_t, lw_shared_ptr<gate>> _pending_fenceable_writes;
+    shared_future<> _stale_pending_writes{make_ready_future<>()};
 private:
     future<result<coordinator_query_result>> query_singular(lw_shared_ptr<query::read_command> cmd,
             dht::partition_range_vector&& partition_ranges,
@@ -332,18 +355,36 @@ private:
     void got_failure_response(response_id_type id, locator::host_id from, size_t count, std::optional<db::view::update_backlog> backlog, error err, std::optional<sstring> msg);
     future<result<>> response_wait(response_id_type id, clock_type::time_point timeout);
     ::shared_ptr<abstract_write_response_handler>& get_write_response_handler(storage_proxy::response_id_type id);
+
+    // The `make_write_response_handler` function instantiates a concrete response handler
+    // for the given set of replicas.
+    //
+    // The various `create_write_response_handler` overloads share a similar signature
+    // to satisfy the requirements of `sp::mutate_prepare`. They differ only in the type
+    // of the first `mutation` parameter and dispatch accordingly:
+    // 
+    //   - `create_write_response_handler_helper`: selects the appropriate replica set
+    //     based on the token and schema, then delegates to `make_write_response_handler`.
+    // 
+    //   - `make_write_response_handler`: builds the final handler using the resolved replica set.
+    //
+    // In summary, the overloads abstract away mutation-type-specific logic while ensuring
+    // that replica selection and handler instantiation follow a consistent flow.
+
     result<response_id_type> create_write_response_handler_helper(schema_ptr s, const dht::token& token,
             std::unique_ptr<mutation_holder> mh, db::consistency_level cl, db::write_type type, tracing::trace_state_ptr tr_state,
-            service_permit permit, db::allow_per_partition_rate_limit allow_limit, is_cancellable);
-    result<response_id_type> create_write_response_handler(locator::effective_replication_map_ptr ermp, db::consistency_level cl, db::write_type type, std::unique_ptr<mutation_holder> m, host_id_vector_replica_set targets,
+            service_permit permit, db::allow_per_partition_rate_limit allow_limit, is_cancellable, coordinator_mutate_options options);
+    result<response_id_type> make_write_response_handler(locator::effective_replication_map_ptr ermp, db::consistency_level cl, db::write_type type, std::unique_ptr<mutation_holder> m, host_id_vector_replica_set targets,
             const host_id_vector_topology_change& pending_endpoints, host_id_vector_topology_change, tracing::trace_state_ptr tr_state, storage_proxy::write_stats& stats, service_permit permit, db::per_partition_rate_limit::info rate_limit_info, is_cancellable);
-    result<response_id_type> create_write_response_handler(const mutation&, db::consistency_level cl, db::write_type type, tracing::trace_state_ptr tr_state, service_permit permit, db::allow_per_partition_rate_limit allow_limit);
-    result<response_id_type> create_write_response_handler(const hint_wrapper&, db::consistency_level cl, db::write_type type, tracing::trace_state_ptr tr_state, service_permit permit, db::allow_per_partition_rate_limit allow_limit);
-    result<response_id_type> create_write_response_handler(const read_repair_mutation&, db::consistency_level cl, db::write_type type, tracing::trace_state_ptr tr_state, service_permit permit, db::allow_per_partition_rate_limit allow_limit);
+    result<response_id_type> create_write_response_handler(const mutation&, db::consistency_level cl, db::write_type type, tracing::trace_state_ptr tr_state, service_permit permit, db::allow_per_partition_rate_limit allow_limit, coordinator_mutate_options options);
+    result<response_id_type> create_write_response_handler(const hint_wrapper&, db::consistency_level cl, db::write_type type, tracing::trace_state_ptr tr_state, service_permit permit, db::allow_per_partition_rate_limit allow_limit, coordinator_mutate_options options);
+    result<response_id_type> create_write_response_handler(const batchlog_replay_mutation&, db::consistency_level cl, db::write_type type, tracing::trace_state_ptr tr_state, service_permit permit, db::allow_per_partition_rate_limit allow_limit, coordinator_mutate_options options);
+    result<response_id_type> create_write_response_handler(const read_repair_mutation&, db::consistency_level cl, db::write_type type, tracing::trace_state_ptr tr_state, service_permit permit, db::allow_per_partition_rate_limit allow_limit, coordinator_mutate_options options);
     result<response_id_type> create_write_response_handler(const std::tuple<lw_shared_ptr<paxos::proposal>, schema_ptr, shared_ptr<paxos_response_handler>, dht::token>& proposal,
-            db::consistency_level cl, db::write_type type, tracing::trace_state_ptr tr_state, service_permit permit, db::allow_per_partition_rate_limit allow_limit);
+            db::consistency_level cl, db::write_type type, tracing::trace_state_ptr tr_state, service_permit permit, db::allow_per_partition_rate_limit allow_limit, coordinator_mutate_options options);
     result<response_id_type> create_write_response_handler(const std::tuple<lw_shared_ptr<paxos::proposal>, schema_ptr, shared_ptr<paxos_response_handler>, dht::token, host_id_vector_replica_set>& meta,
-            db::consistency_level cl, db::write_type type, tracing::trace_state_ptr tr_state, service_permit permit, db::allow_per_partition_rate_limit allow_limit);
+            db::consistency_level cl, db::write_type type, tracing::trace_state_ptr tr_state, service_permit permit, db::allow_per_partition_rate_limit allow_limit, coordinator_mutate_options options);
+
     void register_cdc_operation_result_tracker(const storage_proxy::unique_response_handler_vector& ids, lw_shared_ptr<cdc::operation_result_tracker> tracker);
     template<typename Range>
     bool should_reject_due_to_view_backlog(const Range& targets, const schema_ptr& s) const;
@@ -357,11 +398,10 @@ private:
     bool hints_enabled(db::write_type type) const noexcept;
     db::hints::manager& hints_manager_for(db::write_type type);
     void sort_endpoints_by_proximity(const locator::effective_replication_map& erm, host_id_vector_replica_set& eps) const;
-    host_id_vector_replica_set get_endpoints_for_reading(const sstring& ks_name, const locator::effective_replication_map& erm, const dht::token& token) const;
+    host_id_vector_replica_set get_endpoints_for_reading(const schema& s,  const locator::effective_replication_map& erm, const dht::token& token, node_local_only node_local_only) const;
     host_id_vector_replica_set filter_replicas_for_read(db::consistency_level, const locator::effective_replication_map&, host_id_vector_replica_set live_endpoints, const host_id_vector_replica_set& preferred_endpoints, db::read_repair_decision, std::optional<locator::host_id>* extra, replica::column_family*) const;
     // As above with read_repair_decision=NONE, extra=nullptr.
     host_id_vector_replica_set filter_replicas_for_read(db::consistency_level, const locator::effective_replication_map&, const host_id_vector_replica_set& live_endpoints, const host_id_vector_replica_set& preferred_endpoints, replica::column_family*) const;
-    bool is_alive(const locator::effective_replication_map& erm, const locator::host_id&) const;
     result<::shared_ptr<abstract_read_executor>> get_read_executor(lw_shared_ptr<query::read_command> cmd,
             locator::effective_replication_map_ptr ermp,
             schema_ptr schema,
@@ -371,7 +411,8 @@ private:
             tracing::trace_state_ptr trace_state,
             const host_id_vector_replica_set& preferred_endpoints,
             bool& is_bounced_read,
-            service_permit permit);
+            service_permit permit,
+            node_local_only node_local_only);
     future<rpc::tuple<foreign_ptr<lw_shared_ptr<query::result>>, cache_temperature>> query_result_local(
             locator::effective_replication_map_ptr,
             schema_ptr,
@@ -404,22 +445,25 @@ private:
             uint64_t remaining_row_count,
             uint32_t remaining_partition_count,
             replicas_per_token_range preferred_replicas,
-            service_permit permit);
+            service_permit permit,
+            node_local_only node_local_only);
 
     future<result<coordinator_query_result>> do_query(schema_ptr,
         lw_shared_ptr<query::read_command> cmd,
         dht::partition_range_vector&& partition_ranges,
         db::consistency_level cl,
-        coordinator_query_options optional_params);
+        coordinator_query_options optional_params,
+        std::optional<cas_shard> cas_shard);
     future<coordinator_query_result> do_query_with_paxos(schema_ptr,
         lw_shared_ptr<query::read_command> cmd,
         dht::partition_range_vector&& partition_ranges,
         db::consistency_level cl,
-        coordinator_query_options optional_params);
+        coordinator_query_options optional_params,
+        cas_shard cas_shard);
     template<typename Range, typename CreateWriteHandler>
-    future<result<unique_response_handler_vector>> mutate_prepare(Range&& mutations, db::consistency_level cl, db::write_type type, service_permit permit, CreateWriteHandler handler);
+    future<result<unique_response_handler_vector>> mutate_prepare(Range&& mutations, CreateWriteHandler handler);
     template<typename Range>
-    future<result<unique_response_handler_vector>> mutate_prepare(Range&& mutations, db::consistency_level cl, db::write_type type, tracing::trace_state_ptr tr_state, service_permit permit, db::allow_per_partition_rate_limit allow_limit);
+    future<result<unique_response_handler_vector>> mutate_prepare(Range&& mutations, db::consistency_level cl, db::write_type type, tracing::trace_state_ptr tr_state, service_permit permit, db::allow_per_partition_rate_limit allow_limit, coordinator_mutate_options options);
     future<result<>> mutate_begin(unique_response_handler_vector ids, db::consistency_level cl, tracing::trace_state_ptr trace_state, std::optional<clock_type::time_point> timeout_opt = { });
     future<result<>> mutate_end(future<result<>> mutate_result, utils::latency_counter, write_stats& stats, tracing::trace_state_ptr trace_state);
     future<result<>> schedule_repair(locator::effective_replication_map_ptr ermp, mutations_per_partition_key_map diffs, db::consistency_level cl, tracing::trace_state_ptr trace_state, service_permit permit);
@@ -427,7 +471,7 @@ private:
     void unthrottle();
     void handle_read_error(std::variant<exceptions::coordinator_exception_container, std::exception_ptr> failure, bool range);
     template<typename Range>
-    future<result<>> mutate_internal(Range mutations, db::consistency_level cl, bool counter_write, tracing::trace_state_ptr tr_state, service_permit permit, std::optional<clock_type::time_point> timeout_opt = { }, lw_shared_ptr<cdc::operation_result_tracker> cdc_tracker = { }, db::allow_per_partition_rate_limit allow_limit = db::allow_per_partition_rate_limit::no);
+    future<result<>> mutate_internal(Range mutations, db::consistency_level cl, tracing::trace_state_ptr tr_state, service_permit permit, std::optional<clock_type::time_point> timeout_opt = { }, std::optional<db::write_type> type = { }, lw_shared_ptr<cdc::operation_result_tracker> cdc_tracker = { }, db::allow_per_partition_rate_limit allow_limit = db::allow_per_partition_rate_limit::no, coordinator_mutate_options options = {});
     future<rpc::tuple<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>> query_nonsingular_mutations_locally(
             schema_ptr s, lw_shared_ptr<query::read_command> cmd, const dht::partition_range_vector&& pr, tracing::trace_state_ptr trace_state,
             clock_type::time_point timeout);
@@ -435,14 +479,16 @@ private:
             schema_ptr s, lw_shared_ptr<query::read_command> cmd, const dht::partition_range_vector&& pr, query::result_options opts,
             tracing::trace_state_ptr trace_state, clock_type::time_point timeout);
 
-    future<> mutate_counters_on_leader(std::vector<frozen_mutation_and_schema> mutations, db::consistency_level cl, clock_type::time_point timeout,
-                                       tracing::trace_state_ptr trace_state, service_permit permit);
-    future<> mutate_counter_on_leader_and_replicate(const schema_ptr& s, frozen_mutation m, db::consistency_level cl, clock_type::time_point timeout,
-                                                    tracing::trace_state_ptr trace_state, service_permit permit);
+    future<> mutate_counters_on_leader(utils::chunked_vector<frozen_mutation_and_schema> mutations, db::consistency_level cl, clock_type::time_point timeout,
+                                       tracing::trace_state_ptr trace_state, service_permit permit,
+                                       fencing_token fence, locator::host_id caller);
+    future<> mutate_counter_on_leader_and_replicate(schema_ptr s, const frozen_mutation& m, db::consistency_level cl, clock_type::time_point timeout,
+                                                    tracing::trace_state_ptr trace_state, service_permit permit,
+                                                    fencing_token fence, locator::host_id caller);
 
     locator::host_id find_leader_for_counter_update(const mutation& m, const locator::effective_replication_map& erm, db::consistency_level cl);
 
-    future<result<>> do_mutate(std::vector<mutation> mutations, db::consistency_level cl, clock_type::time_point timeout, tracing::trace_state_ptr tr_state, service_permit permit, bool, db::allow_per_partition_rate_limit allow_limit, lw_shared_ptr<cdc::operation_result_tracker> cdc_tracker);
+    future<result<>> do_mutate(utils::chunked_vector<mutation> mutations, db::consistency_level cl, clock_type::time_point timeout, tracing::trace_state_ptr tr_state, service_permit permit, bool, db::allow_per_partition_rate_limit allow_limit, lw_shared_ptr<cdc::operation_result_tracker> cdc_tracker, coordinator_mutate_options options);
 
     future<> send_to_endpoint(
             std::unique_ptr<mutation_holder> m,
@@ -461,7 +507,7 @@ private:
     future<> mutate_counters(Range&& mutations, db::consistency_level cl, tracing::trace_state_ptr tr_state, service_permit permit, clock_type::time_point timeout);
 
     // Retires (times out) write response handlers which were constructed as `cancellable` and pass the given filter.
-    void cancel_write_handlers(noncopyable_function<bool(const abstract_write_response_handler&)> filter_fun);
+    future<> cancel_write_handlers(noncopyable_function<bool(const abstract_write_response_handler&)> filter_fun);
 
     /**
      * Returns whether for a range query doing a query against merged is likely
@@ -475,15 +521,15 @@ private:
         host_id_vector_replica_set& l2) const;
 
 public:
-    storage_proxy(distributed<replica::database>& db, config cfg, db::view::node_update_backlog& max_view_update_backlog,
+    storage_proxy(sharded<replica::database>& db, config cfg, db::view::node_update_backlog& max_view_update_backlog,
             scheduling_group_key stats_key, gms::feature_service& feat, const locator::shared_token_metadata& stm,
             locator::effective_replication_map_factory& erm_factory);
     ~storage_proxy();
 
-    const distributed<replica::database>& get_db() const {
+    const sharded<replica::database>& get_db() const {
         return _db;
     }
-    distributed<replica::database>& get_db() {
+    sharded<replica::database>& get_db() {
         return _db;
     }
     const replica::database& local_db() const noexcept {
@@ -503,6 +549,9 @@ public:
         return _cdc;
     }
 
+    db::system_keyspace& system_keyspace();
+    const db::view::view_building_state_machine& view_building_state_machine();
+
     response_id_type get_next_response_id() {
         auto next = _next_response_id++;
         if (next == 0) { // 0 is reserved for unique_response_handler
@@ -512,7 +561,7 @@ public:
     }
 
     // Start/stop the remote part of `storage_proxy` that is required for performing distributed queries.
-    void start_remote(netw::messaging_service&, gms::gossiper&, migration_manager&, sharded<db::system_keyspace>& sys_ks, raft_group0_client&, topology_state_machine&);
+    void start_remote(netw::messaging_service&, gms::gossiper&, migration_manager&, sharded<db::system_keyspace>& sys_ks, sharded<paxos::paxos_store>& paxos_store, raft_group0_client&, topology_state_machine&, const db::view::view_building_state_machine&);
     future<> stop_remote();
 
     gms::inet_address my_address() const noexcept;
@@ -520,6 +569,8 @@ public:
 
     bool is_me(gms::inet_address addr) const noexcept;
     bool is_me(const locator::effective_replication_map& erm, locator::host_id id) const noexcept;
+
+    future<> cancel_all_write_response_handlers();
 
 private:
     bool only_me(const locator::effective_replication_map& erm, const host_id_vector_replica_set& replicas) const noexcept;
@@ -537,26 +588,106 @@ private:
             smp_service_group smp_grp, db::per_partition_rate_limit::info rate_limit_info);
     // Applies mutations on this node.
     // Resolves with timed_out_error when timeout is reached.
-    future<> mutate_locally(std::vector<mutation> mutation, tracing::trace_state_ptr tr_state, clock_type::time_point timeout, smp_service_group smp_grp, db::per_partition_rate_limit::info rate_limit_info);
-    // Confirm whether the topology version from the token is greater than or equal
-    // to the current fencing_version sourced from shared_token_metadata.
-    // If it is not, the function will return an engaged optional.
-    template<typename ID>
-    std::optional<replica::stale_topology_exception> apply_fence(fencing_token token,
-        ID caller_address) const noexcept;
-    // Do the same when the future is resolved without exception.
-    template <typename T, typename ID>
-    future<T> apply_fence(future<T> future, fencing_token fence, ID caller_address) const;
+    future<> mutate_locally(utils::chunked_vector<mutation> mutation, tracing::trace_state_ptr tr_state, clock_type::time_point timeout, smp_service_group smp_grp, db::per_partition_rate_limit::info rate_limit_info);
+
+    // The functions below implement fencing support in storage_proxy.
+    //
+    // Workflow overview:
+    //   * A request coordinator (either regular CL-based or LWT) captures a strong pointer
+    //     to the current ERM (Effective Replication Map). Holding this reference prevents
+    //     topology changes from completing until the ongoing operation finishes, ensuring
+    //     a consistent replica topology during the request.
+    // *   The topology coordinator waits for request coordinators to release ERMs
+    //     from older topology versions. This is handled in global_token_metadata_barrier
+    //     via the barrier_and_drain command on replicas.
+    //   * The wait may fail (e.g., due to connectivity issues between the topology coordinator
+    //     and a request coordinator). In such cases, problematic nodes are "fenced out":
+    //     the fence_version on all other nodes is updated to the new, incremented topology version.
+    //   * When a request coordinator contacts replicas, it sends its topology version in a fencing_token.
+    //     The replica verifies that the token’s version is not older than the replicas' fencing version.
+    //     If it is older, this means the coordinator was fenced out, and the replica
+    //     must reject the request.
+    //   * Replicas must validate the fencing token both before and after accessing local data.
+    //     This ensures that if the coordinator is fenced out mid-request, the replica does not
+    //     return success, which would incorrectly contribute to achieving the target CL. Otherwise,
+    //     the user might observe successful writes that are not readable after the topology
+    //     operation completes.
+
+    // This is the main function that other functions call. It compares the version from the 
+    // fencing_token with the fence_version on the local node/shard and returns an instance of
+    // stale_topology_exception if the request coordinator is lagging behind.
+    std::optional<replica::stale_topology_exception> check_fence(fencing_token token,
+        locator::host_id caller_address) noexcept;
+
+    // Checks the fence_token when the future is ready.
+    //
+    // This function is used in cases where performing a fence check before local data access
+    // would be redundant:
+    //   * On coordinators: there is no need to check the fencing_token before execution because
+    //     the coordinator has just captured an ERM with the latest topology version, ensuring
+    //     that the node’s topology version cannot be smaller than its fence_version.
+    //   * In receive_mutation_handler: the fence_token is already checked once in handle_write
+    //     before execution. The "after" check should only run when applying mutations locally;
+    //     forwarded mutations perform their own fence_token checks.
+    template <typename T>
+    future<T> apply_fence_on_ready(future<T> future, fencing_token fence, locator::host_id caller_address);
+
+    // Checks the fence_token and, if it is stale, returns a failed future containing
+    // a stale_topology_exception.
+    // The function returns a future (instead of void) for two reasons:
+    //   * constructing a failed future is less expensive than throwing an exception
+    //   * it maintains consistency with other apply_fence functions
+    future<> apply_fence(std::optional<fencing_token> fence, locator::host_id caller_address);
+
+    // Checks the fence_token and, if it is stale, returns a stale_topology_exception
+    // wrapped in a replica::exception_variant.
+    // If T is a tuple containing replica::exception_variant, the function returns a
+    // default-constructed tuple with the exception assigned to the corresponding element.
+    template <typename T>
+    requires (
+        std::is_same_v<T, replica::exception_variant> ||
+        requires(T t) { std::get<replica::exception_variant>(t); }
+    )
+    std::optional<future<T>> apply_fence_result(std::optional<fencing_token> fence, locator::host_id caller_address);
+
     // Returns fencing_token based on effective_replication_map.
     static fencing_token get_fence(const locator::effective_replication_map& erm);
 
-    utils::phased_barrier::operation start_write() {
-        return _pending_writes_phaser.start();
+    // Fencing tokens are checked twice: once before performing a replica-local storage
+    // operation, and again after it completes. The second check ensures that if the
+    // request coordinator is fenced out while the replica is still executing the request — that is,
+    // when the topology coordinator distributes a new topology version across the cluster
+    // and increments the replica’s fence version — the request coordinator does not count this
+    // operation toward the target consistency level (CL).
+    //
+    // For writes, this creates a cleanup concern: if the coordinator is fenced out
+    // mid-operation, the write’s partial effects must be cleaned up before the range
+    // becomes visible again. Otherwise, data resurrection could occur. Cleanup is
+    // performed by ss::sstable_vnodes_cleanup_fiber for vnode-based tables.
+    //
+    // To ensure correctness, all potentially fenced-out writes must complete before
+    // cleanup runs. This function enforces that guarantee by holding a gate tied to
+    // the caller’s fencing_token version for the entire write operation. The vnode cleanup
+    // procedure waits for all gates with versions lower than the current fencing
+    // version to close().
+    //
+    // Whether the gate is needed depends on the replication strategy. For local and
+    // tablet-based tables, it is unnecessary: ss::sstable_vnodes_cleanup_fiber does
+    // not handle them. For tablets, table::cleanup_tablet() calls
+    // storage_group::stop(), which waits for all tablet operations to finish.
+    template <typename Func, typename F = futurize<std::invoke_result_t<Func>>>
+    requires requires (Func f) {
+        { f() } -> std::same_as<typename F::type>;
     }
+    F::type run_fenceable_write(const locator::abstract_replication_strategy& rs,
+        fencing_token caller_token, locator::host_id caller_id,
+        Func&& write_func);
 
-    mutation do_get_batchlog_mutation_for(schema_ptr schema, const std::vector<mutation>& mutations, const utils::UUID& id, int32_t version, db_clock::time_point now);
+    mutation do_get_batchlog_mutation_for(schema_ptr schema, const utils::chunked_vector<mutation>& mutations, const utils::UUID& id, int32_t version, db_clock::time_point now);
     future<> drain_on_shutdown();
 public:
+    void update_fence_version(locator::token_metadata::version_t fence_version);
+
     // Applies mutation on this node.
     // Resolves with timed_out_error when timeout is reached.
     future<> mutate_locally(const mutation& m, tracing::trace_state_ptr tr_state, db::commitlog::force_sync sync, clock_type::time_point timeout = clock_type::time_point::max(), db::per_partition_rate_limit::info rate_limit_info = std::monostate()) {
@@ -574,10 +705,10 @@ public:
     }
     // Applies mutations on this node.
     // Resolves with timed_out_error when timeout is reached.
-    future<> mutate_locally(std::vector<mutation> mutation, tracing::trace_state_ptr tr_state, clock_type::time_point timeout = clock_type::time_point::max(), db::per_partition_rate_limit::info rate_limit_info = std::monostate());
+    future<> mutate_locally(utils::chunked_vector<mutation> mutation, tracing::trace_state_ptr tr_state, clock_type::time_point timeout = clock_type::time_point::max(), db::per_partition_rate_limit::info rate_limit_info = std::monostate());
     // Applies a vector of frozen_mutation:s and their schemas on this node, in parallel.
     // Resolves with timed_out_error when timeout is reached.
-    future<> mutate_locally(std::vector<frozen_mutation_and_schema> mutations, tracing::trace_state_ptr tr_state, db::commitlog::force_sync sync, clock_type::time_point timeout = clock_type::time_point::max(), db::per_partition_rate_limit::info rate_limit_info = std::monostate());
+    future<> mutate_locally(utils::chunked_vector<frozen_mutation_and_schema> mutations, tracing::trace_state_ptr tr_state, db::commitlog::force_sync sync, clock_type::time_point timeout = clock_type::time_point::max(), db::per_partition_rate_limit::info rate_limit_info = std::monostate());
 
     future<> mutate_hint(const schema_ptr&, const frozen_mutation& m, tracing::trace_state_ptr tr_state, clock_type::time_point timeout = clock_type::time_point::max());
 
@@ -590,15 +721,16 @@ public:
     * @param mutations the mutations to be applied across the replicas
     * @param consistency_level the consistency level for the operation
     * @param tr_state trace state handle
+    * @param request_opts additional options passed to CDC for these mutations
     */
-    future<> mutate(std::vector<mutation> mutations, db::consistency_level cl, clock_type::time_point timeout, tracing::trace_state_ptr tr_state, service_permit permit, db::allow_per_partition_rate_limit allow_limit, bool raw_counters = false);
+    future<> mutate(utils::chunked_vector<mutation> mutations, db::consistency_level cl, clock_type::time_point timeout, tracing::trace_state_ptr tr_state, service_permit permit, db::allow_per_partition_rate_limit allow_limit, bool raw_counters = false, cdc::per_request_options request_opts = {});
 
     /**
     * See mutate. Does the same, but returns some exceptions
     * through the result<>, which allows for efficient inspection
     * of the exception on the exception handling path.
     */
-    future<result<>> mutate_result(std::vector<mutation> mutations, db::consistency_level cl, clock_type::time_point timeout, tracing::trace_state_ptr tr_state, service_permit permit, db::allow_per_partition_rate_limit allow_limit, bool raw_counters = false);
+    future<result<>> mutate_result(utils::chunked_vector<mutation> mutations, db::consistency_level cl, clock_type::time_point timeout, tracing::trace_state_ptr tr_state, service_permit permit, db::allow_per_partition_rate_limit allow_limit, bool raw_counters = false, coordinator_mutate_options options = {});
 
     paxos_participants
     get_paxos_participants(const sstring& ks_name, const locator::effective_replication_map& erm, const dht::token& token, db::consistency_level consistency_for_paxos);
@@ -606,9 +738,10 @@ public:
     future<> replicate_counter_from_leader(mutation m, db::consistency_level cl, tracing::trace_state_ptr tr_state,
                                            clock_type::time_point timeout, service_permit permit);
 
-    future<result<>> mutate_with_triggers(std::vector<mutation> mutations, db::consistency_level cl, clock_type::time_point timeout,
+    future<result<>> mutate_with_triggers(utils::chunked_vector<mutation> mutations, db::consistency_level cl, clock_type::time_point timeout,
                                           bool should_mutate_atomically, tracing::trace_state_ptr tr_state, service_permit permit,
-                                          db::allow_per_partition_rate_limit allow_limit, bool raw_counters = false);
+                                          db::allow_per_partition_rate_limit allow_limit, bool raw_counters = false,
+                                          coordinator_mutate_options options = {});
 
     /**
     * See mutate. Adds additional steps before and after writing a batch.
@@ -620,16 +753,18 @@ public:
     * @param consistency_level the consistency level for the operation
     * @param tr_state trace state handle
     */
-    future<> mutate_atomically(std::vector<mutation> mutations, db::consistency_level cl, clock_type::time_point timeout, tracing::trace_state_ptr tr_state, service_permit permit);
+    future<> mutate_atomically(utils::chunked_vector<mutation> mutations, db::consistency_level cl, clock_type::time_point timeout, tracing::trace_state_ptr tr_state, service_permit permit, coordinator_mutate_options options);
 
     /**
     * See mutate_atomically. Does the same, but returns some exceptions
     * through the result<>, which allows for efficient inspection
     * of the exception on the exception handling path.
     */
-    future<result<>> mutate_atomically_result(std::vector<mutation> mutations, db::consistency_level cl, clock_type::time_point timeout, tracing::trace_state_ptr tr_state, service_permit permit);
+    future<result<>> mutate_atomically_result(utils::chunked_vector<mutation> mutations, db::consistency_level cl, clock_type::time_point timeout, tracing::trace_state_ptr tr_state, service_permit permit, coordinator_mutate_options options);
 
     future<> send_hint_to_all_replicas(frozen_mutation_and_schema fm_a_s);
+
+    future<> send_batchlog_replay_to_all_replicas(utils::chunked_vector<mutation> mutations, clock_type::time_point timeout);
 
     // Send a mutation to one specific remote target.
     // Inspired by Cassandra's StorageProxy.sendToHintedEndpoints but without
@@ -641,7 +776,7 @@ public:
     // Send a mutation to a specific remote target as a hint.
     // Unlike regular mutations during write operations, hints are sent on the streaming connection
     // and use different RPC verb.
-    future<> send_hint_to_endpoint(frozen_mutation_and_schema fm_a_s, locator::effective_replication_map_ptr ermp, locator::host_id target);
+    future<> send_hint_to_endpoint(frozen_mutation_and_schema fm_a_s, locator::effective_replication_map_ptr ermp, locator::host_id target, host_id_vector_topology_change pending_endpoints);
 
     /**
      * Performs the truncate operatoin, which effectively deletes all data from
@@ -680,7 +815,8 @@ public:
         lw_shared_ptr<query::read_command> cmd,
         dht::partition_range_vector&& partition_ranges,
         db::consistency_level cl,
-        coordinator_query_options optional_params);
+        coordinator_query_options optional_params,
+        std::optional<cas_shard> cas_shard = {});
 
     future<rpc::tuple<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>> query_mutations_locally(
         schema_ptr, lw_shared_ptr<query::read_command> cmd, const dht::partition_range&,
@@ -693,18 +829,19 @@ public:
         clock_type::time_point timeout,
         tracing::trace_state_ptr trace_state = nullptr);
 
-    future<bool> cas(schema_ptr schema, shared_ptr<cas_request> request, lw_shared_ptr<query::read_command> cmd,
+    future<bool> cas(schema_ptr schema, cas_shard cas_shard, shared_ptr<cas_request> request, lw_shared_ptr<query::read_command> cmd,
             dht::partition_range_vector partition_ranges, coordinator_query_options query_options,
             db::consistency_level cl_for_paxos, db::consistency_level cl_for_learn,
-            clock_type::time_point write_timeout, clock_type::time_point cas_timeout, bool write = true);
+            clock_type::time_point write_timeout, clock_type::time_point cas_timeout, bool write = true, cdc::per_request_options cdc_opts = {});
 
-    mutation get_batchlog_mutation_for(const std::vector<mutation>& mutations, const utils::UUID& id, int32_t version, db_clock::time_point now);
+    mutation get_batchlog_mutation_for(const utils::chunked_vector<mutation>& mutations, const utils::UUID& id, int32_t version, db_clock::time_point now);
 
     future<> stop();
     future<> start_hints_manager();
     void allow_replaying_hints() noexcept;
     future<> drain_hints_for_left_nodes();
     future<> abort_view_writes();
+    future<> abort_batch_writes();
 
     future<> change_hints_host_filter(db::hints::host_filter new_filter);
     const db::hints::host_filter& get_hints_host_filter() const;
@@ -735,13 +872,12 @@ public:
         return _stats_key;
     }
 
-    static unsigned cas_shard(const schema& s, dht::token token);
-
-    future<> await_pending_writes() noexcept {
-        return _pending_writes_phaser.advance_and_await();
+    future<> await_stale_pending_writes() noexcept {
+        return _stale_pending_writes.get_future();
     }
 
     virtual void on_leave_cluster(const gms::inet_address& endpoint, const locator::host_id& hid) override;
+    virtual void on_released(const locator::host_id& hid) override;
     virtual void on_down(const gms::inet_address& endpoint, locator::host_id hid) override;
 
     friend class abstract_read_executor;

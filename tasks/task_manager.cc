@@ -19,6 +19,7 @@
 #include "db/timeout_clock.hh"
 #include "message/messaging_service.hh"
 #include "utils/assert.hh"
+#include "utils/chunked_vector.hh"
 #include "utils/overloaded_functor.hh"
 #include "service/storage_service.hh"
 #include "tasks/task_handler.hh"
@@ -121,32 +122,15 @@ future<std::optional<double>> task_manager::task::impl::expected_total_workload(
     return make_ready_future<std::optional<double>>(std::nullopt);
 }
 
-std::optional<double> task_manager::task::impl::expected_children_number() const {
-    return std::nullopt;
-}
-
-task_manager::task::progress task_manager::task::impl::get_binary_progress() const {
-    return tasks::task_manager::task::progress{
-        .completed = is_complete(),
-        .total = 1.0
-    };
-}
-
 future<task_manager::task::progress> task_manager::task::impl::get_progress() const {
-    auto children_num = _children.size();
-    if (children_num == 0) {
-        co_return get_binary_progress();
+    if (is_complete()) {
+        co_return co_await _children.get_progress(_status.progress_units);
     }
 
-    std::optional<double> expected_workload = std::nullopt;
-    auto expected_children_num = expected_children_number();
-    // When get_progress is called, the task can have some of its children unregistered yet.
-    // Then if total workload is not known, progress obtained from children may be deceiving.
-    // In such a situation it's safer to return binary progress value.
-    if (expected_children_num.value_or(0) != children_num && !(expected_workload = co_await expected_total_workload())) {
-        co_return get_binary_progress();
+    std::optional<double> expected_workload = co_await expected_total_workload();
+    if (!expected_workload && _children.size() == 0) {
+        co_return task_manager::task::progress{};
     }
-
     auto progress = co_await _children.get_progress(_status.progress_units);
     progress.total = expected_workload.value_or(progress.total);
     co_return progress;
@@ -199,7 +183,7 @@ bool task_manager::task::impl::is_done() const noexcept {
     return _status.state == tasks::task_manager::task_state::done;
 }
 
-future<std::vector<task_manager::task::task_essentials>> task_manager::task::impl::get_failed_children() const {
+future<utils::chunked_vector<task_manager::task::task_essentials>> task_manager::task::impl::get_failed_children() const {
     return _children.map_each_task<task_essentials>([] (const foreign_task_ptr&) { return std::nullopt; },
         [] (const task_essentials& child) -> std::optional<task_essentials> {
             if (child.task_status.state == task_state::failed || !child.failed_children.empty()) {
@@ -215,6 +199,18 @@ void task_manager::task::impl::set_virtual_parent() noexcept {
     _shutdown_subscription = _module->abort_source().subscribe([this] () noexcept {
         abort();
     });
+}
+
+task_id task_manager::task::impl::id() const noexcept {
+    return _status.id;
+}
+
+task_manager::task::status& task_manager::task::impl::get_status() noexcept {
+    return _status;
+}
+
+future<> task_manager::task::impl::done() const noexcept {
+    return _done.get_shared_future();
 }
 
 void task_manager::task::impl::run_to_completion() {
@@ -284,7 +280,7 @@ task_manager::task::task(task_impl_ptr&& impl, gate::holder gh) noexcept : _impl
 }
 
 task_id task_manager::task::id() {
-    return _impl->_status.id;
+    return _impl->id();
 }
 
 std::string task_manager::task::type() const {
@@ -292,7 +288,7 @@ std::string task_manager::task::type() const {
 }
 
 task_manager::task::status& task_manager::task::get_status() noexcept {
-    return _impl->_status;
+    return _impl->get_status();
 }
 
 uint64_t task_manager::task::get_sequence_number() const noexcept {
@@ -373,7 +369,7 @@ bool task_manager::task::abort_requested() const noexcept {
 }
 
 future<> task_manager::task::done() const noexcept {
-    return _impl->_done.get_shared_future();
+    return _impl->done();
 }
 
 void task_manager::task::register_task() {
@@ -392,7 +388,7 @@ bool task_manager::task::is_complete() const noexcept {
     return _impl->is_complete();
 }
 
-future<std::vector<task_manager::task::task_essentials>> task_manager::task::get_failed_children() const {
+future<utils::chunked_vector<task_manager::task::task_essentials>> task_manager::task::get_failed_children() const {
     return _impl->get_failed_children();
 }
 
@@ -404,7 +400,7 @@ task_manager::virtual_task::impl::impl(module_ptr module) noexcept
     : _module(std::move(module))
 {}
 
-future<std::vector<task_identity>> task_manager::virtual_task::impl::get_children(module_ptr module, task_id parent_id) {
+future<utils::chunked_vector<task_identity>> task_manager::virtual_task::impl::get_children(module_ptr module, task_id parent_id, std::function<bool(locator::host_id)> is_host_alive) {
     auto ms = module->get_task_manager()._messaging;
     if (!ms) {
         auto ids = co_await module->get_task_manager().get_virtual_task_children(parent_id);
@@ -413,20 +409,31 @@ future<std::vector<task_identity>> task_manager::virtual_task::impl::get_childre
                 .host_id = tm.get_host_id(),
                 .task_id = id
             };
-        }) | std::ranges::to<std::vector<task_identity>>();
+        }) | std::ranges::to<utils::chunked_vector<task_identity>>();
     }
 
     auto nodes = module->get_nodes();
-    co_return co_await map_reduce(nodes, [ms, parent_id] (auto host_id) -> future<std::vector<task_identity>> {
-        return ser::tasks_rpc_verbs::send_tasks_get_children(ms, host_id, parent_id).then([host_id] (auto resp) {
-            return resp | std::views::transform([host_id] (auto id) {
-                return task_identity{
-                    .host_id = host_id,
-                    .task_id = id
-                };
-            }) | std::ranges::to<std::vector<task_identity>>();
-        });
-    }, std::vector<task_identity>{}, concat<task_identity>);
+    co_await utils::get_local_injector().inject("tasks_vt_get_children", [] (auto& handler) -> future<> {
+        tmlogger.info("tasks_vt_get_children: waiting");
+        co_await handler.wait_for_message(std::chrono::steady_clock::now() + std::chrono::seconds{10});
+    });
+    co_return co_await map_reduce(nodes, [ms, parent_id, is_host_alive = std::move(is_host_alive)] (auto host_id) -> future<utils::chunked_vector<task_identity>> {
+        if (is_host_alive(host_id)) {
+            return ser::tasks_rpc_verbs::send_tasks_get_children(ms, host_id, parent_id).then([host_id] (auto resp) {
+                return resp | std::views::transform([host_id] (auto id) {
+                    return task_identity{
+                        .host_id = host_id,
+                        .task_id = id
+                    };
+                }) | std::ranges::to<utils::chunked_vector<task_identity>>();
+            });
+        } else {
+            return make_ready_future<utils::chunked_vector<task_identity>>();
+        }
+    }, utils::chunked_vector<task_identity>{}, [] (auto a, auto&& b) {
+        std::move(b.begin(), b.end(), std::back_inserter(a));
+        return a;
+    });
 }
 
 task_manager::module_ptr task_manager::virtual_task::impl::get_module() const noexcept {
@@ -479,7 +486,7 @@ future<std::vector<task_stats>> task_manager::virtual_task::get_stats() {
     return _impl->get_stats();
 }
 
-task_manager::module::module(task_manager& tm, std::string name) noexcept : _tm(tm), _name(std::move(name)) {
+task_manager::module::module(task_manager& tm, std::string name) noexcept : _tm(tm), _name(std::move(name)), _gate(fmt::format("task_manager::module[{}]", _name)) {
     _abort_subscription = _tm.abort_source().subscribe([this] () noexcept {
         abort_source().request_abort();
     });
@@ -501,7 +508,7 @@ abort_source& task_manager::module::abort_source() noexcept {
     return _as;
 }
 
-gate& task_manager::module::async_gate() noexcept {
+named_gate& task_manager::module::async_gate() noexcept {
     return _gate;
 }
 

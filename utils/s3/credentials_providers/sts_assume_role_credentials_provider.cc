@@ -11,8 +11,11 @@
 #include "utils/UUID.hh"
 #include "utils/http.hh"
 #include "utils/s3/client.hh"
+#include "utils/s3/default_aws_retry_strategy.hh"
+
 #include <rapidxml.h>
 #include <seastar/core/coroutine.hh>
+#include <seastar/http/client.hh>
 #include <seastar/http/request.hh>
 #include <seastar/util/short_streams.hh>
 
@@ -28,27 +31,21 @@ sts_assume_role_credentials_provider::sts_assume_role_credentials_provider(const
     : sts_host(seastar::format("sts.{}.amazonaws.com", _region)), role_arn(_role_arn) {
 }
 
-bool sts_assume_role_credentials_provider::is_time_to_refresh() const {
-    return seastar::lowres_clock::now() >= creds.expires_at;
-}
-
 future<> sts_assume_role_credentials_provider::reload() {
-    if (is_time_to_refresh() || !creds) {
-        co_await update_credentials();
-    }
+    co_await update_credentials();
 }
 
 future<> sts_assume_role_credentials_provider::update_credentials() {
     auto req = http::request::make("POST", sts_host, "/");
     // Just set this version
     // https://github.com/aws/aws-sdk-cpp/blob/8d68be52dcad85095753e069a4355e241f1edb1c/generated/src/aws-cpp-sdk-sts/source/model/AssumeRoleRequest.cpp#L143
-    req.query_parameters["Version"] = "2011-06-15";
-    req.query_parameters["DurationSeconds"] = format("{}", session_duration);
-    req.query_parameters["Action"] = "AssumeRole";
-    req.query_parameters["RoleSessionName"] = format("{}", utils::make_random_uuid());
-    req.query_parameters["RoleArn"] = role_arn;
-    auto factory = std::make_unique<utils::http::dns_connection_factory>(sts_host, port, is_secured, sts_logger);
-    retryable_http_client http_client(std::move(factory), 1, retryable_http_client::ignore_exception, http::experimental::client::retry_requests::yes, retry_strategy);
+    req.set_query_param("Version", "2011-06-15");
+    req.set_query_param("DurationSeconds", format("{}", session_duration));
+    req.set_query_param("Action", "AssumeRole");
+    req.set_query_param("RoleSessionName", format("{}", utils::make_random_uuid()));
+    req.set_query_param("RoleArn", role_arn);
+    http::experimental::client http_client(
+        std::make_unique<utils::http::dns_connection_factory>(sts_host, port, is_secured, sts_logger), 1, 1024, std::make_unique<default_aws_retry_strategy>());
     co_await http_client.make_request(
         std::move(req),
         [this](const http::reply&, input_stream<char>&& in) -> future<> {

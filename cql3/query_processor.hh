@@ -24,15 +24,17 @@
 #include "cql3/dialect.hh"
 #include "exceptions/exceptions.hh"
 #include "service/migration_listener.hh"
-#include "timestamp.hh"
+#include "mutation/timestamp.hh"
 #include "transport/messages/result_message.hh"
 #include "service/client_state.hh"
 #include "service/broadcast_tables/experimental/query_result.hh"
+#include "vector_search/vector_store_client.hh"
 #include "utils/assert.hh"
 #include "utils/observable.hh"
 #include "service/raft/raft_group0_client.hh"
 #include "types/types.hh"
 #include "db/auth_version.hh"
+#include "service/storage_proxy_fwd.hh"
 
 
 namespace lang { class manager; }
@@ -107,6 +109,7 @@ private:
     service::storage_proxy& _proxy;
     data_dictionary::database _db;
     service::migration_notifier& _mnotifier;
+    vector_search::vector_store_client& _vector_store_client;
     memory_config _mcfg;
     const cql_config& _cql_config;
 
@@ -146,7 +149,8 @@ public:
     static std::unique_ptr<statements::raw::parsed_statement> parse_statement(const std::string_view& query, dialect d);
     static std::vector<std::unique_ptr<statements::raw::parsed_statement>> parse_statements(std::string_view queries, dialect d);
 
-    query_processor(service::storage_proxy& proxy, data_dictionary::database db, service::migration_notifier& mn, memory_config mcfg, cql_config& cql_cfg, utils::loading_cache_config auth_prep_cache_cfg, lang::manager& langm);
+    query_processor(service::storage_proxy& proxy, data_dictionary::database db, service::migration_notifier& mn, vector_search::vector_store_client& vsc,
+            memory_config mcfg, cql_config& cql_cfg, utils::loading_cache_config auth_prep_cache_cfg, lang::manager& langm);
 
     ~query_processor();
 
@@ -175,6 +179,14 @@ public:
     }
 
     lang::manager& lang() { return _lang_manager; }
+
+    const vector_search::vector_store_client& vector_store_client() const noexcept {
+        return _vector_store_client;
+    }
+
+    vector_search::vector_store_client& vector_store_client() noexcept {
+        return _vector_store_client;
+    }
 
     db::auth_version_t auth_version;
 
@@ -384,7 +396,7 @@ public:
     // function enables putting multiple CQL queries into a single raft command
     // and vice versa, split mutations from one query into separate commands.
     // It supports write-only queries, read-modified-writes not supported.
-    future<std::vector<mutation>> get_mutations_internal(
+    future<utils::chunked_vector<mutation>> get_mutations_internal(
         const sstring query_string,
         service::query_state& query_state,
         api::timestamp_type timestamp,
@@ -463,15 +475,16 @@ public:
 
     bool topology_global_queue_empty();
 
-private:
-    // Keep the holder until you stop using the `remote` services.
-    std::pair<std::reference_wrapper<remote>, gate::holder> remote();
-
     query_options make_internal_options(
             const statements::prepared_statement::checked_weak_ptr& p,
             const std::vector<data_value_or_unset>& values,
             db::consistency_level,
-            int32_t page_size = -1) const;
+            int32_t page_size = -1,
+            service::node_local_only node_local_only = service::node_local_only::no) const;
+
+private:
+    // Keep the holder until you stop using the `remote` services.
+    std::pair<std::reference_wrapper<remote>, gate::holder> remote();
 
     future<::shared_ptr<cql_transport::messages::result_message>>
     process_authorized_statement(const ::shared_ptr<cql_statement> statement, service::query_state& query_state, const query_options& options, std::optional<service::group0_guard> guard);
@@ -517,57 +530,6 @@ private:
     future<::shared_ptr<cql_transport::messages::result_message>> execute_with_guard(
         std::function<future<::shared_ptr<cql_transport::messages::result_message>>(service::query_state&, ::shared_ptr<cql_statement>, const query_options&, std::optional<service::group0_guard>)> fn,
         ::shared_ptr<cql_statement> statement, service::query_state& query_state, const query_options& options);
-
-    ///
-    /// \tparam ResultMsgType type of the returned result message (CQL)
-    /// \tparam PreparedKeyGenerator a function that generates the prepared statement cache key for given query and
-    ///         keyspace
-    /// \tparam IdGetter a function that returns the corresponding prepared statement ID (CQL) for a given
-    ////        prepared statement cache key
-    /// \param query_string
-    /// \param client_state
-    /// \param id_gen prepared ID generator, called before the first deferring
-    /// \param id_getter prepared ID getter, passed to deferred context by reference. The caller must ensure its
-    ////       liveness.
-    /// \return
-    template <typename ResultMsgType, typename PreparedKeyGenerator, typename IdGetter>
-    future<::shared_ptr<cql_transport::messages::result_message::prepared>>
-    prepare_one(
-            sstring query_string,
-            const service::client_state& client_state,
-            dialect d,
-            PreparedKeyGenerator&& id_gen,
-            IdGetter&& id_getter) {
-        return do_with(
-                id_gen(query_string, client_state.get_raw_keyspace()),
-                std::move(query_string),
-                [this, &client_state, &id_getter, d](const prepared_cache_key_type& key, const sstring& query_string) {
-            return _prepared_cache.get(key, [this, &query_string, &client_state, d] {
-                auto prepared = get_statement(query_string, client_state, d);
-                auto bound_terms = prepared->statement->get_bound_terms();
-                if (bound_terms > std::numeric_limits<uint16_t>::max()) {
-                    throw exceptions::invalid_request_exception(
-                            format("Too many markers(?). {:d} markers exceed the allowed maximum of {:d}",
-                                   bound_terms,
-                                   std::numeric_limits<uint16_t>::max()));
-                }
-                SCYLLA_ASSERT(bound_terms == prepared->bound_names.size());
-                return make_ready_future<std::unique_ptr<statements::prepared_statement>>(std::move(prepared));
-            }).then([&key, &id_getter, &client_state] (auto prep_ptr) {
-                const auto& warnings = prep_ptr->warnings;
-                const auto msg =
-                        ::make_shared<ResultMsgType>(id_getter(key), std::move(prep_ptr),
-                            client_state.is_protocol_extension_set(cql_transport::cql_protocol_extension::LWT_ADD_METADATA_MARK));
-                for (const auto& w : warnings) {
-                    msg->add_warning(w);
-                }
-                return make_ready_future<::shared_ptr<cql_transport::messages::result_message::prepared>>(std::move(msg));
-            }).handle_exception_type([&query_string] (typename prepared_statements_cache::statement_is_too_big&) {
-                return make_exception_future<::shared_ptr<cql_transport::messages::result_message::prepared>>(
-                        prepared_statement_is_too_big(query_string));
-            });
-        });
-    };
 };
 
 class query_processor::migration_subscriber : public service::migration_listener {
@@ -589,7 +551,6 @@ public:
     virtual void on_update_function(const sstring& ks_name, const sstring& function_name) override;
     virtual void on_update_aggregate(const sstring& ks_name, const sstring& aggregate_name) override;
     virtual void on_update_view(const sstring& ks_name, const sstring& view_name, bool columns_changed) override;
-    virtual void on_update_tablet_metadata(const locator::tablet_metadata_change_hint&) override;
 
     virtual void on_drop_keyspace(const sstring& ks_name) override;
     virtual void on_drop_column_family(const sstring& ks_name, const sstring& cf_name) override;

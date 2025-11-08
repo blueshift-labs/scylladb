@@ -41,22 +41,26 @@ static const std::unordered_map<resource_kind, std::size_t> max_parts{
         {resource_kind::functions, 2}};
 
 static permission_set applicable_permissions(const data_resource_view& dv) {
-    if (dv.table()) {
-        return permission_set::of<
+    
+    // We only support VECTOR_SEARCH_INDEXING permission for ALL KEYSPACES.
+
+    auto set = permission_set::of<
                 permission::ALTER,
                 permission::DROP,
                 permission::SELECT,
                 permission::MODIFY,
                 permission::AUTHORIZE>();
+
+    if (!dv.table()) {
+        set.add(permission_set::of<permission::CREATE>());
     }
 
-    return permission_set::of<
-            permission::CREATE,
-            permission::ALTER,
-            permission::DROP,
-            permission::SELECT,
-            permission::MODIFY,
-            permission::AUTHORIZE>();
+    if (!dv.table() && !dv.keyspace()) {
+        set.add(permission_set::of<permission::VECTOR_SEARCH_INDEXING>());
+    }
+
+    return set;
+        
 }
 
 static permission_set applicable_permissions(const role_resource_view& rv) {
@@ -193,9 +197,7 @@ service_level_resource_view::service_level_resource_view(const resource &r) {
 
 sstring encode_signature(std::string_view name, std::vector<data_type> args) {
     return seastar::format("{}[{}]", name,
-            fmt::join(args | std::views::transform([] (const data_type t) {
-                return t->name();
-            }), "^"));
+            fmt::join(args | std::views::transform(&abstract_type::name), "^"));
 }
 
 std::pair<sstring, std::vector<data_type>> decode_signature(std::string_view encoded_signature) {
@@ -221,9 +223,7 @@ std::pair<sstring, std::vector<data_type>> decode_signature(std::string_view enc
 static sstring decoded_signature_string(std::string_view encoded_signature) {
     auto [function_name, arg_types] = decode_signature(encoded_signature);
     return seastar::format("{}({})", cql3::util::maybe_quote(sstring(function_name)),
-            fmt::join(arg_types | std::views::transform([] (data_type t) {
-                return t->cql3_type_name();
-            }), ", "));
+            fmt::join(arg_types | std::views::transform(&abstract_type::cql3_type_name), ", "));
 }
 
 resource make_functions_resource(const cql3::functions::function& f) {

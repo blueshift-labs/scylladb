@@ -35,7 +35,7 @@
 #include "cql3/query_processor.hh"
 #include "cql3/untyped_result_set.hh"
 #include "cql3/util.hh"
-#include "types/user.hh"
+#include "cql3/statements/property_definitions.hh"
 
 static seastar::logger mlogger("legacy_schema_migrator");
 
@@ -383,11 +383,11 @@ public:
             if (td.has("compaction_strategy_class")) {
                 auto strategy = td.get_as<sstring>("compaction_strategy_class");
                 try {
-                    builder.set_compaction_strategy(sstables::compaction_strategy::type(strategy));
+                    builder.set_compaction_strategy(compaction::compaction_strategy::type(strategy));
                 } catch (const exceptions::configuration_exception& e) {
                     // If compaction strategy class isn't supported, fallback to incremental.
                     mlogger.warn("Falling back to incremental compaction strategy after the problem: {}", e.what());
-                    builder.set_compaction_strategy(sstables::compaction_strategy_type::incremental);
+                    builder.set_compaction_strategy(compaction::compaction_strategy_type::incremental);
                 }
             }
             if (td.has("compaction_strategy_options")) {
@@ -449,7 +449,7 @@ public:
         auto query = fmt_query("SELECT * FROM {}.{} WHERE keyspace_name = ?", db::system_keyspace::legacy::USERTYPES);
         return _qp.execute_internal(query, {dst.name}, cql3::query_processor::cache_internal::yes).then([this, &dst](result_set_type result) {
             return parallel_for_each(*result, [this, &dst](row_type& row) {
-                auto name = row.get_blob("type_name");
+                auto name = row.get_blob_unfragmented("type_name");
                 auto columns = row.get_list<bytes>("field_names");
                 auto types = row.get_list<sstring>("field_types");
                 std::vector<data_type> field_types;
@@ -527,21 +527,22 @@ public:
     future<> drop_legacy_tables() {
         mlogger.info("Dropping legacy schema tables");
         auto with_snapshot = !_keyspaces.empty();
-        return parallel_for_each(legacy_schema_tables, [this, with_snapshot](const sstring& cfname) {
-            return replica::database::drop_table_on_all_shards(_db, _sys_ks, db::system_keyspace::NAME, cfname, with_snapshot);
-        });
+        for (const sstring& cfname : legacy_schema_tables) {
+            co_await replica::database::legacy_drop_table_on_all_shards(_db, _sys_ks, db::system_keyspace::NAME, cfname, with_snapshot);
+        }
     }
 
     future<> store_keyspaces_in_new_schema_tables() {
         mlogger.info("Moving {} keyspaces from legacy schema tables to the new schema keyspace ({})",
                         _keyspaces.size(), db::schema_tables::v3::NAME);
 
-        std::vector<mutation> mutations;
+        utils::chunked_vector<mutation> mutations;
 
         for (auto& ks : _keyspaces) {
             auto ksm = ::make_lw_shared<keyspace_metadata>(ks.name
                             , ks.replication_params["class"] // TODO, make ksm like c3?
-                            , ks.replication_params
+                            , cql3::statements::property_definitions::to_extended_map(ks.replication_params)
+                            , std::nullopt
                             , std::nullopt
                             , ks.durable_writes);
 

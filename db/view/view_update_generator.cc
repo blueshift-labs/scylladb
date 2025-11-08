@@ -19,7 +19,7 @@
 #include "readers/evictable.hh"
 #include "dht/partition_filter.hh"
 #include "utils/pretty_printers.hh"
-#include "readers/from_mutations_v2.hh"
+#include "readers/from_mutations.hh"
 #include "service/storage_proxy.hh"
 #include "db/config.hh"
 
@@ -138,44 +138,11 @@ future<> view_update_generator::start() {
                 uint64_t input_size = 0;
 
                 try {
-                    // Exploit the fact that sstables in the staging directory
-                    // are usually non-overlapping and use a partitioned set for
-                    // the read.
-                    auto ssts = make_lw_shared<sstables::sstable_set>(sstables::make_partitioned_sstable_set(s, false));
-                    for (auto& sst : sstables) {
-                        ssts->insert(sst);
-                        input_size += sst->data_size();
-                    }
-
-                    vug_logger.info("Processing {}.{}: {} in {} sstables",
-                                    s->ks_name(), s->cf_name(), utils::pretty_printed_data_size(input_size), sstables.size());
-
-                    auto permit = _db.obtain_reader_permit(*t, "view_update_generator", db::no_timeout, {}).get();
-                    auto ms = mutation_source([this, ssts] (
-                                schema_ptr s,
-                                reader_permit permit,
-                                const dht::partition_range& pr,
-                                const query::partition_slice& ps,
-                                tracing::trace_state_ptr ts,
-                                streamed_mutation::forwarding fwd_ms,
-                                mutation_reader::forwarding fwd_mr) {
-                        return ssts->make_range_sstable_reader(s, std::move(permit), pr, ps, std::move(ts), fwd_ms, fwd_mr, *_progress_tracker);
-                    });
-                    auto [staging_sstable_reader, staging_sstable_reader_handle] = make_manually_paused_evictable_reader_v2(
-                            std::move(ms),
-                            s,
-                            permit,
-                            query::full_partition_range,
-                            s->full_slice(),
-                            nullptr,
-                            ::mutation_reader::forwarding::no);
-                    auto close_sr = deferred_close(staging_sstable_reader);
-
-                    inject_failure("view_update_generator_consume_staging_sstable");
-                    auto result = staging_sstable_reader.consume_in_thread(view_updating_consumer(*this, s, std::move(permit), *t, sstables, _as, staging_sstable_reader_handle));
-                    if (result == stop_iteration::yes) {
+                    auto result = generate_updates_from_staging_sstables(t, sstables);
+                    if (result.first == stop_iteration::yes) {
                         break;
                     }
+                    input_size = result.second;
                 } catch (...) {
                     vug_logger.warn("Processing {} failed for table {}:{}. Will retry...", s->ks_name(), s->cf_name(), std::current_exception());
                     // Need to add sstables back to the set so we can retry later. By now it may
@@ -185,6 +152,7 @@ future<> view_update_generator::start() {
                     seastar::sleep(std::chrono::seconds(1)).get();
                     break;
                 }
+
                 try {
                     inject_failure("view_update_generator_collect_consumed_sstables");
                     _progress_tracker->on_sstables_deregistration(sstables);
@@ -217,6 +185,80 @@ future<> view_update_generator::start() {
         }
     });
     return make_ready_future<>();
+}
+
+// Must be called in a seastar thread.
+std::pair<stop_iteration, uint64_t> view_update_generator::generate_updates_from_staging_sstables(lw_shared_ptr<replica::table> table, std::vector<sstables::shared_sstable>& sstables) {
+    schema_ptr s = table->schema();
+    uint64_t input_size = 0;
+
+    // Exploit the fact that sstables in the staging directory
+    // are usually non-overlapping and use a partitioned set for
+    // the read.
+    // With tablets, it doesn't matter full range is fed into partitioned set since
+    // there will be usually one sstable to be processed per tablet, and sstables of
+    // different tablets are disjoint.
+    auto token_range = dht::token_range::make(dht::first_token(), dht::last_token());
+    auto ssts = make_lw_shared<sstables::sstable_set>(sstables::make_partitioned_sstable_set(s, std::move(token_range)));
+    for (auto& sst : sstables) {
+        ssts->insert(sst);
+        input_size += sst->data_size();
+    }
+
+    vug_logger.info("Processing {}.{}: {} in {} sstables",
+                    s->ks_name(), s->cf_name(), utils::pretty_printed_data_size(input_size), sstables.size());
+
+    auto permit = _db.obtain_reader_permit(*table, "view_update_generator", db::no_timeout, {}).get();
+    auto ms = mutation_source([this, ssts] (
+                schema_ptr s,
+                reader_permit permit,
+                const dht::partition_range& pr,
+                const query::partition_slice& ps,
+                tracing::trace_state_ptr ts,
+                streamed_mutation::forwarding fwd_ms,
+                mutation_reader::forwarding fwd_mr) {
+        return ssts->make_range_sstable_reader(s, std::move(permit), pr, ps, std::move(ts), fwd_ms, fwd_mr, *_progress_tracker);
+    });
+    auto [staging_sstable_reader, staging_sstable_reader_handle] = make_manually_paused_evictable_reader(
+            std::move(ms),
+            s,
+            permit,
+            query::full_partition_range,
+            s->full_slice(),
+            nullptr,
+            ::mutation_reader::forwarding::no);
+    auto close_sr = deferred_close(staging_sstable_reader);
+
+    inject_failure("view_update_generator_consume_staging_sstable");
+    auto result = staging_sstable_reader.consume_in_thread(view_updating_consumer(*this, s, std::move(permit), *table, sstables, _as, staging_sstable_reader_handle));
+    return std::make_pair(result, input_size);
+}
+
+future<> view_update_generator::process_staging_sstables(lw_shared_ptr<replica::table> table, std::vector<sstables::shared_sstable> sstables) {
+    return seastar::async([this, table = std::move(table), &sstables] {
+        for(auto& sst: sstables) {
+            _progress_tracker->on_sstable_registration(sst);
+        }
+
+        // Generate view updates from staging sstables
+        auto start_time = db_clock::now();
+        auto [result, input_size] = generate_updates_from_staging_sstables(table, sstables);
+        if (result == stop_iteration::yes) {
+            throw abort_requested_exception{};
+        }
+
+        _progress_tracker->on_sstables_deregistration(sstables);
+
+        auto end_time = db_clock::now();
+        auto duration = std::chrono::duration<float>(end_time - start_time);
+        schema_ptr s = table->schema();
+        vug_logger.info("Processed {}.{}: {} sstables in {}ms = {}", s->ks_name(), s->cf_name(), sstables.size(),
+                        std::chrono::duration_cast<std::chrono::milliseconds>(duration).count(),
+                        utils::pretty_printed_throughput(input_size, duration));
+        
+        // Move staging sstables to table's base directory
+        table->move_sstables_from_staging(sstables).get();
+    });
 }
 
 // The .do_abort() just kicks the v.u.g. background fiber to wrap up and it
@@ -298,6 +340,9 @@ void view_update_generator::setup_metrics() {
 
 void view_update_generator::discover_staging_sstables() {
     _db.get_tables_metadata().for_each_table([&] (table_id, lw_shared_ptr<replica::table> table) {
+        if (table->uses_tablets()) {
+            return;
+        }
         auto t = table->shared_from_this();
         for (auto sstables = t->get_sstables(); sstables::shared_sstable sst : *sstables) {
             if (sst->requires_view_building()) {
@@ -329,7 +374,7 @@ static size_t memory_usage_of(const utils::chunked_vector<frozen_mutation_and_sc
  * @return a future that resolves when the updates have been acknowledged by the view replicas
  */
 future<> view_update_generator::populate_views(const replica::table& table,
-        std::vector<view_and_base> views,
+        std::vector<view_ptr> views,
         dht::token base_token,
         mutation_reader&& reader,
         gc_clock::time_point now) {
@@ -351,16 +396,16 @@ future<> view_update_generator::populate_views(const replica::table& table,
                 break;
             }
             size_t update_size = memory_usage_of(*updates);
-            size_t units_to_wait_for = std::min(table.get_config().view_update_concurrency_semaphore_limit, update_size);
-            auto units = co_await seastar::get_units(_db.view_update_sem(), units_to_wait_for);
-            units.adopt(seastar::consume_units(_db.view_update_sem(), update_size - units_to_wait_for));
+            size_t units_to_wait_for = std::min(table.get_config().view_update_memory_semaphore_limit, update_size);
+            auto memory_units = co_await seastar::get_units(_db.view_update_memory_sem(), units_to_wait_for);
+            memory_units.adopt(seastar::consume_units(_db.view_update_memory_sem(), update_size - units_to_wait_for));
             if (utils::get_local_injector().enter("view_building_failure")) {
                 co_await seastar::sleep(std::chrono::seconds(1));
                 err = std::make_exception_ptr(std::runtime_error("Timeout a view building update"));
                 continue;
             }
             co_await mutate_MV(schema, base_token, std::move(*updates), table.view_stats(), *table.cf_stats(),
-                    tracing::trace_state_ptr(), std::move(units), service::allow_hints::no, wait_for_all_updates::yes);
+                    tracing::trace_state_ptr(), std::move(memory_units), service::allow_hints::no, wait_for_all_updates::yes);
         } catch (...) {
             if (!err) {
                 err = std::current_exception();
@@ -402,7 +447,7 @@ struct view_update_generation_timeout_exception : public seastar::timed_out_erro
 future<> view_update_generator::generate_and_propagate_view_updates(const replica::table& table,
         const schema_ptr& base,
         reader_permit permit,
-        std::vector<view_and_base>&& views,
+        std::vector<view_ptr>&& views,
         mutation&& m,
         mutation_reader_opt existings,
         tracing::trace_state_ptr tr_state,
@@ -415,7 +460,7 @@ future<> view_update_generator::generate_and_propagate_view_updates(const replic
             table,
             base,
             std::move(views),
-            make_mutation_reader_from_mutations_v2(std::move(m_schema), std::move(permit), std::move(m)),
+            make_mutation_reader_from_mutations(std::move(m_schema), std::move(permit), std::move(m)),
             std::move(existings),
             now);
 
@@ -432,8 +477,8 @@ future<> view_update_generator::generate_and_propagate_view_updates(const replic
             break;
         }
         tracing::trace(tr_state, "Generated {} view update mutations", updates->size());
-        auto units = seastar::consume_units(_db.view_update_sem(), memory_usage_of(*updates));
-        if (batch_num == 0 && _db.view_update_sem().current() == 0) {
+        auto memory_units = seastar::consume_units(_db.view_update_memory_sem(), memory_usage_of(*updates));
+        if (batch_num == 0 && _db.view_update_memory_sem().current() == 0) {
             // We don't have resources to propagate view updates for this write. If we reached this point, we failed to
             // throttle the client. The memory queue is already full, waiting on the semaphore would block view updates
             // that we've already started applying, and generating hints would ultimately result in the disk queue being
@@ -454,7 +499,7 @@ future<> view_update_generator::generate_and_propagate_view_updates(const replic
 
             co_await seastar::sleep(throttle_delay);
 
-            if (utils::get_local_injector().enter("view_update_limit") && _db.view_update_sem().current() == 0) {
+            if (utils::get_local_injector().enter("view_update_limit") && _db.view_update_memory_sem().current() == 0) {
                 err = std::make_exception_ptr(std::runtime_error("View update backlog exceeded the limit"));
                 break;
             }
@@ -467,7 +512,7 @@ future<> view_update_generator::generate_and_propagate_view_updates(const replic
 
         try {
             co_await mutate_MV(base, base_token, std::move(*updates), table.view_stats(), *table.cf_stats(), tr_state,
-                std::move(units), service::allow_hints::yes, wait_for_all_updates::no);
+                std::move(memory_units), service::allow_hints::yes, wait_for_all_updates::no);
         } catch (...) {
             // Ignore exceptions: any individual failure to propagate a view update will be reported
             // by a separate mechanism in mutate_MV() function. Moreover, we should continue trying

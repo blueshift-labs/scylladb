@@ -16,15 +16,18 @@
 #include "cdc/cdc_options.hh"
 #include "auth/service.hh"
 #include "db/config.hh"
+#include "db/view/view_build_status.hh"
+#include "mutation/tombstone.hh"
+#include "locator/abstract_replication_strategy.hh"
 #include "utils/log.hh"
 #include "schema/schema_builder.hh"
 #include "exceptions/exceptions.hh"
 #include "service/client_state.hh"
-#include "timestamp.hh"
+#include "mutation/timestamp.hh"
 #include "types/map.hh"
 #include "schema/schema.hh"
-#include "query-request.hh"
-#include "query-result-reader.hh"
+#include "query/query-request.hh"
+#include "query/query-result-reader.hh"
 #include "cql3/selection/selection.hh"
 #include "cql3/result_set.hh"
 #include "bytes.hh"
@@ -34,12 +37,10 @@
 #include "serialization.hh"
 #include "expressions.hh"
 #include "conditions.hh"
-#include "cql3/util.hh"
 #include <optional>
 #include "utils/assert.hh"
 #include "utils/overloaded_functor.hh"
-#include <seastar/json/json_elements.hh>
-#include "collection_mutation.hh"
+#include "mutation/collection_mutation.hh"
 #include "schema/schema.hh"
 #include "db/tags/extension.hh"
 #include "db/tags/utils.hh"
@@ -60,16 +61,54 @@
 #include "alternator/extract_from_attrs.hh"
 #include "types/types.hh"
 #include "db/system_keyspace.hh"
+#include "cql3/statements/ks_prop_defs.hh"
 
 using namespace std::chrono_literals;
 
 logging::logger elogger("alternator-executor");
 
 namespace alternator {
-// We write the provisioned read and write capacity on a table using the
-// tags RCU_TAG_KEY and WCU_TAG_KEY.
-static const sstring RCU_TAG_KEY("system:provisioned_rcu");
-static const sstring WCU_TAG_KEY("system:provisioned_wcu");
+
+// Alternator-specific table properties stored as hidden table tags:
+//
+// Alternator doesn't keep its own records of which Alternator tables exist
+// or how each one was configured. Instead, an Alternator table is created
+// as a CQL table - and that CQL table stores its own name, schema, views,
+// and so on. However, there are some Alternator-specific properties of a
+// table which are not part of a CQL schema but which we need to remember.
+// We store those extra properties as hidden "tags" on the CQL table, using
+// the schema's "tags extension". This extension provides a map<string,string>
+// for the table that is stored persistently on disk, but also readable
+// quickly from memory.
+// Alternator also uses the tags extension to store user-defined tags on
+// tables (the TagResource, UntagResource and ListTagsOfResource requests).
+// So the internal tags are kept hidden from the user by using the prefix
+// "system:" in their name (see tag_key_is_internal()).
+// The following is the list of these Alternator-specific hidden tags that
+// Alternator adds to tables:
+//
+// Tags storing the "ReadCapacityUnits" and "WriteCapacityUnits"
+// configured for a table with BillingMode=PROVISIONED.
+const sstring RCU_TAG_KEY("system:provisioned_rcu");
+const sstring WCU_TAG_KEY("system:provisioned_wcu");
+// Tag storing the table's original creation time, in milliseconds since the
+// Unix epoch. All tables get this tag when they are created, but it may be
+// missing in old tables created before this tag was introduced.
+const sstring TABLE_CREATION_TIME_TAG_KEY("system:table_creation_time");
+// If this tag is present, it stores the name of the attribute that was
+// configured by UpdateTimeToLive to be the expiration-time attribute for
+// this table.
+extern const sstring TTL_TAG_KEY("system:ttl_attribute");
+// This will be set to 1 in a case, where user DID NOT specify a range key.
+// The way GSI / LSI is implemented by Alternator assumes user specified keys will come first
+// in materialized view's key list. Then, if needed missing keys are added (current implementation
+// of materialized views requires that all base hash / range keys were added to the view as well).
+// Alternator allows only a single range key attribute to be specified by the user. So if
+// the SPURIOUS_RANGE_KEY_ADDED_TO_GSI_AND_USER_DIDNT_SPECIFY_RANGE_KEY_TAG_KEY is set the user didn't specify any key and
+// base table's keys were added as range keys. In all other cases either the first key is the user specified key,
+// following ones are base table's keys added as needed or range key list will be empty.
+static const sstring SPURIOUS_RANGE_KEY_ADDED_TO_GSI_AND_USER_DIDNT_SPECIFY_RANGE_KEY_TAG_KEY("system:spurious_range_key_added_to_gsi_and_user_didnt_specify_range_key");
+
 
 enum class table_status {
     active = 0,
@@ -79,7 +118,7 @@ enum class table_status {
 };
 
 static std::string_view table_status_to_sstring(table_status tbl_status) {
-    switch(tbl_status) {
+    switch (tbl_status) {
         case table_status::active:
             return "ACTIVE";
         case table_status::creating:
@@ -105,47 +144,93 @@ static const column_definition& attrs_column(const schema& schema) {
     return *cdef;
 }
 
-make_jsonable::make_jsonable(rjson::value&& value)
-    : _value(std::move(value))
-{}
-std::string make_jsonable::to_json() const {
-    return rjson::print(_value);
+
+static lw_shared_ptr<stats> get_stats_from_schema(service::storage_proxy& sp, const schema& schema) {
+    try {
+        replica::table& table = sp.local_db().find_column_family(schema.id());
+        if (!table.get_stats().alternator_stats) {
+            table.get_stats().alternator_stats = seastar::make_shared<table_stats>(schema.ks_name(), schema.cf_name());
+        }
+        return table.get_stats().alternator_stats->_stats;
+    } catch (std::runtime_error&) {
+        // If we're here it means that a table we are currently working on was deleted before the
+        // operation completed, returning a temporary object is fine, if the table get deleted so will its metrics
+        return make_lw_shared<stats>();
+    }
 }
 
-json::json_return_type make_streamed(rjson::value&& value) {
-    // CMH. json::json_return_type uses std::function, not noncopyable_function.
-    // Need to make a copyable version of value. Gah.
-    auto rs = make_shared<rjson::value>(std::move(value));
-    std::function<future<>(output_stream<char>&&)> func = [rs](output_stream<char>&& os) mutable -> future<> {
-        // move objects to coroutine frame.
-        auto los = std::move(os);
-        auto lrs = std::move(rs);
+executor::body_writer make_streamed(rjson::value&& value) {
+    return [value = std::move(value)](output_stream<char>&& _out) mutable -> future<> {
+        auto out = std::move(_out);
         std::exception_ptr ex;
         try {
-            co_await rjson::print(*lrs, los);
+            co_await rjson::print(value, out);
         } catch (...) {
-            // at this point, we cannot really do anything. HTTP headers and return code are
-            // already written, and quite potentially a portion of the content data.
-            // just log + rethrow. It is probably better the HTTP server closes connection
-            // abruptly or something...
             ex = std::current_exception();
-            elogger.error("Exception during streaming HTTP response: {}", ex);
         }
-        co_await los.close();
-        co_await rjson::destroy_gently(std::move(*lrs));
+        co_await out.close();
+        co_await rjson::destroy_gently(std::move(value));
         if (ex) {
             co_await coroutine::return_exception_ptr(std::move(ex));
         }
-        co_return;
     };
-    return func;
 }
 
-json_string::json_string(std::string&& value)
-    : _value(std::move(value))
-{}
-std::string json_string::to_json() const {
-    return _value;
+// make_streamed_with_extra_array() is variant of make_streamed() above, which
+// builds a streaming response (a function writing to an output stream) from a
+// JSON object (rjson::value) but adds to it at the end an additional array.
+// The extra array is given a separate chunked_vector to avoid putting it
+// inside the rjson::value - because RapidJSON does contiguous allocations for
+// arrays which we want to avoid for potentially long arrays in Query/Scan
+// responses (see #23535).
+// If we ever fix RapidJSON to avoid contiguous allocations for arrays, or
+// replace it entirely (#24458), we can remove this function and the function
+// rjson::print_with_extra_array() which it calls.
+executor::body_writer make_streamed_with_extra_array(rjson::value&& value,
+    std::string array_name, utils::chunked_vector<rjson::value>&& array) {
+    return [value = std::move(value), array_name = std::move(array_name), array = std::move(array)](output_stream<char>&& _out) mutable -> future<> {
+        auto out = std::move(_out);
+        std::exception_ptr ex;
+        try {
+            co_await rjson::print_with_extra_array(value, array_name, array, out);
+        } catch (...) {
+            ex = std::current_exception();
+        }
+        co_await out.close();
+        co_await rjson::destroy_gently(std::move(value));
+        // TODO: can/should we also destroy the array gently?
+        if (ex) {
+            co_await coroutine::return_exception_ptr(std::move(ex));
+        }
+    };
+}
+
+// This function throws api_error::validation if input value is not an object.
+static void validate_is_object(const rjson::value& value, const char* caller) {
+    if (!value.IsObject()) {
+        throw api_error::validation(fmt::format("{} must be an object", caller));
+    }
+}
+
+// This function assumes the given value is an object and returns requested member value.
+// If it is not possible an api_error::validation is thrown.
+static const rjson::value& get_member(const rjson::value& obj, const char* member_name, const char* caller) {
+    validate_is_object(obj, caller);
+    const rjson::value* ret = rjson::find(obj, member_name);
+    if (!ret) {
+       throw api_error::validation(fmt::format("{} is missing a mandatory member {}", caller, member_name));
+    }
+    return *ret;
+}
+
+
+// This function assumes the given value is an object with a single member, and returns this member.
+// In case the requirements are not met an api_error::validation is thrown.
+static const rjson::value::Member& get_single_member(const rjson::value& v, const char* caller) {
+    if (!v.IsObject() || v.MemberCount() != 1) {
+        throw api_error::validation(format("{}: expected an object with a single member.", caller));
+    }
+    return *(v.MemberBegin());
 }
 
 executor::executor(gms::gossiper& gossiper,
@@ -160,15 +245,42 @@ executor::executor(gms::gossiper& gossiper,
       _mm(mm),
       _sdks(sdks),
       _cdc_metadata(cdc_metadata),
-      _enforce_authorization(_proxy.data_dictionary().get_config().alternator_enforce_authorization()),
-      _ssg(ssg)
+      _enforce_authorization(_proxy.data_dictionary().get_config().alternator_enforce_authorization),
+      _warn_authorization(_proxy.data_dictionary().get_config().alternator_warn_authorization),
+      _ssg(ssg),
+      _parsed_expression_cache(std::make_unique<parsed::expression_cache>(
+        parsed::expression_cache::config{_proxy.data_dictionary().get_config().alternator_max_expression_cache_entries_per_shard},
+        _stats))
 {
     s_default_timeout_in_ms = std::move(default_timeout_in_ms);
+    register_metrics(_metrics, _stats);
 }
 
+executor::~executor() = default;
+
+static void set_table_creation_time(std::map<sstring, sstring>& tags_map, db_clock::time_point creation_time) {
+    auto tm = std::chrono::duration_cast<std::chrono::milliseconds>(creation_time.time_since_epoch()).count();
+    tags_map[TABLE_CREATION_TIME_TAG_KEY] = std::to_string(tm);
+}
+
+static double get_table_creation_time(const schema &schema) {
+    auto time = db::find_tag(schema, TABLE_CREATION_TIME_TAG_KEY);
+    if (time) {
+        try {
+            auto val = std::stoll(*time);
+            if (val > 0) {
+                return val / 1000.0;
+            }
+        }
+        catch(...) {}
+    }
+    return 0.0;
+}
 
 void executor::supplement_table_info(rjson::value& descr, const schema& schema, service::storage_proxy& sp) {
-    rjson::add(descr, "CreationDateTime", rjson::value(std::chrono::duration_cast<std::chrono::seconds>(gc_clock::now().time_since_epoch()).count()));
+    auto creation_time = get_table_creation_time(schema);
+
+    rjson::add(descr, "CreationDateTime", rjson::value(creation_time));
     rjson::add(descr, "TableStatus", "ACTIVE");
     rjson::add(descr, "TableId", rjson::from_string(schema.id().to_sstring()));
 
@@ -180,7 +292,19 @@ void executor::supplement_table_info(rjson::value& descr, const schema& schema, 
 // bytes (dash and UUID), and since directory names are limited to 255 bytes,
 // we need to limit table names to 222 bytes, instead of 255.
 // See https://github.com/scylladb/scylla/issues/4480
-static constexpr int max_table_name_length = 222;
+// We actually have two limits here,
+// * max_table_name_length is the limit that Alternator will impose on names
+//   of new Alternator tables.
+// * max_auxiliary_table_name_length is the potentially higher absolute limit
+//   that Scylla imposes on the names of auxiliary tables that Alternator
+//   wants to create internally - i.e. materialized views or CDC log tables.
+// The second limit might mean that it is not possible to add a GSI to an
+// existing table, because the name of the new auxiliary table may go over
+// the limit. The second limit is also one of the reasons why the first limit
+// is set lower than 222 - to have room to enable streams which add the extra
+// suffix "_scylla_cdc_log" to the table name.
+static constexpr int max_table_name_length = 192;
+static constexpr int max_auxiliary_table_name_length = 222;
 
 static bool valid_table_name_chars(std::string_view name) {
     for (auto c : name) {
@@ -196,11 +320,16 @@ static bool valid_table_name_chars(std::string_view name) {
     return true;
 }
 
+// validate_table_name() validates the TableName parameter in a request - it
+// should only be called in CreateTable or when a request looking for an
+// existing table failed to find it. validate_table_name() throws the
+// appropriate api_error if this validation fails.
 // The DynamoDB developer guide, https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.NamingRulesDataTypes.html#HowItWorks.NamingRules
-// specifies that table names "names must be between 3 and 255 characters long
-// and can contain only the following characters: a-z, A-Z, 0-9, _ (underscore), - (dash), . (dot)
-// validate_table_name throws the appropriate api_error if this validation fails.
-static void validate_table_name(const std::string& name) {
+// specifies that table "names must be between 3 and 255 characters long and
+// can contain only the following characters: a-z, A-Z, 0-9, _ (underscore),
+// - (dash), . (dot)". However, Alternator only allows max_table_name_length
+// characters (see above) - not 255.
+static void validate_table_name(std::string_view name) {
     if (name.length() < 3 || name.length() > max_table_name_length) {
         throw api_error::validation(
                 format("TableName must be at least 3 characters long and at most {} characters long", max_table_name_length));
@@ -208,6 +337,27 @@ static void validate_table_name(const std::string& name) {
     if (!valid_table_name_chars(name)) {
         throw api_error::validation(
                 "TableName must satisfy regular expression pattern: [a-zA-Z0-9_.-]+");
+    }
+}
+
+// Validate that a CDC log table could be created for the base table with a
+// given table_name, and if not, throw a user-visible api_error::validation.
+// It is not possible to create a CDC log table if the table name is so long
+// that adding the 15-character suffix "_scylla_cdc_log" (cdc_log_suffix)
+// makes it go over max_auxiliary_table_name_length.
+// Note that if max_table_name_length is set to less than 207 (which is
+// max_auxiliary_table_name_length-15), then this function will never
+// fail. However, it's still important to call it in UpdateTable, in case
+// we have pre-existing tables with names longer than this to avoid #24598.
+static void validate_cdc_log_name_length(std::string_view table_name) {
+    if (cdc::log_name(table_name).length() > max_auxiliary_table_name_length) {
+        // CDC will add cdc_log_suffix ("_scylla_cdc_log") to the table name
+        // to create its log table, and this will exceed the maximum allowed
+        // length. To provide a more helpful error message, we assume that
+        // cdc::log_name() always adds a suffix of the same length.
+        int suffix_len = cdc::log_name(table_name).length() - table_name.length();
+        throw api_error::validation(fmt::format("Streams cannot be enabled to a table whose name is longer than {} characters: {}",
+            max_auxiliary_table_name_length - suffix_len, table_name));
     }
 }
 
@@ -220,7 +370,7 @@ static void validate_table_name(const std::string& name) {
 // instead of each component individually as DynamoDB does.
 // The view_name() function assumes the table_name has already been validated
 // but validates the legality of index_name and the combination of both.
-static std::string view_name(std::string_view table_name, std::string_view index_name, const std::string& delim = ":") {
+static std::string view_name(std::string_view table_name, std::string_view index_name, const std::string& delim = ":", bool validate_len = true) {
     if (index_name.length() < 3) {
         throw api_error::validation("IndexName must be at least 3 characters long");
     }
@@ -229,16 +379,16 @@ static std::string view_name(std::string_view table_name, std::string_view index
                 fmt::format("IndexName '{}' must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", index_name));
     }
     std::string ret = std::string(table_name) + delim + std::string(index_name);
-    if (ret.length() > max_table_name_length) {
+    if (ret.length() > max_auxiliary_table_name_length && validate_len) {
         throw api_error::validation(
                 fmt::format("The total length of TableName ('{}') and IndexName ('{}') cannot exceed {} characters",
-                        table_name, index_name, max_table_name_length - delim.size()));
+                        table_name, index_name, max_auxiliary_table_name_length - delim.size()));
     }
     return ret;
 }
 
-static std::string lsi_name(std::string_view table_name, std::string_view index_name) {
-    return view_name(table_name, index_name, "!:");
+static std::string lsi_name(std::string_view table_name, std::string_view index_name, bool validate_len = true) {
+    return view_name(table_name, index_name, "!:", validate_len);
 }
 
 /** Extract table name from a request.
@@ -278,15 +428,19 @@ schema_ptr executor::find_table(service::storage_proxy& proxy, const rjson::valu
     if (!table_name) {
         return nullptr;
     }
+    return find_table(proxy, *table_name);
+}
+
+schema_ptr executor::find_table(service::storage_proxy& proxy, std::string_view table_name) {
     try {
-        return proxy.data_dictionary().find_schema(sstring(executor::KEYSPACE_NAME_PREFIX) + sstring(*table_name), *table_name);
+        return proxy.data_dictionary().find_schema(sstring(executor::KEYSPACE_NAME_PREFIX) + sstring(table_name), table_name);
     } catch(data_dictionary::no_such_column_family&) {
         // DynamoDB returns validation error even when table does not exist
         // and the table name is invalid.
-        validate_table_name(table_name.value());
+        validate_table_name(table_name);
 
         throw api_error::resource_not_found(
-                fmt::format("Requested resource not found: Table: {} not found", *table_name));
+                fmt::format("Requested resource not found: Table: {} not found", table_name));
     }
 }
 
@@ -300,24 +454,39 @@ schema_ptr get_table(service::storage_proxy& proxy, const rjson::value& request)
     return schema;
 }
 
-static std::tuple<bool, std::string_view, std::string_view> try_get_internal_table(data_dictionary::database db, std::string_view table_name) {
+// try_get_internal_table() handles the special case that the given table_name
+// begins with INTERNAL_TABLE_PREFIX (".scylla.alternator."). In that case,
+// this function assumes that the rest of the name refers to an internal
+// Scylla table (e.g., system table) and returns the schema of that table -
+// or an exception if it doesn't exist. Otherwise, if table_name does not
+// start with INTERNAL_TABLE_PREFIX, this function returns an empty schema_ptr
+// and the caller should look for a normal Alternator table with that name.
+static schema_ptr try_get_internal_table(data_dictionary::database db, std::string_view table_name) {
     size_t it = table_name.find(executor::INTERNAL_TABLE_PREFIX);
     if (it != 0) {
-        return {false, "", ""};
+        return schema_ptr{};
     }
     table_name.remove_prefix(executor::INTERNAL_TABLE_PREFIX.size());
     size_t delim = table_name.find_first_of('.');
     if (delim == std::string_view::npos) {
-        return {false, "", ""};
+        return schema_ptr{};
     }
     std::string_view ks_name = table_name.substr(0, delim);
     table_name.remove_prefix(ks_name.size() + 1);
     // Only internal keyspaces can be accessed to avoid leakage
     auto ks = db.try_find_keyspace(ks_name);
     if (!ks || !ks->is_internal()) {
-        return {false, "", ""};
+        return schema_ptr{};
     }
-    return {true, ks_name, table_name};
+    try {
+        return db.find_schema(ks_name, table_name);
+    } catch (data_dictionary::no_such_column_family&) {
+        // DynamoDB returns validation error even when table does not exist
+        // and the table name is invalid.
+        validate_table_name(table_name);
+        throw api_error::resource_not_found(
+            fmt::format("Requested resource not found: Internal table: {}.{} not found", ks_name, table_name));
+        }
 }
 
 // get_table_or_view() is similar to to get_table(), except it returns either
@@ -330,18 +499,8 @@ get_table_or_view(service::storage_proxy& proxy, const rjson::value& request) {
     table_or_view_type type = table_or_view_type::base;
     std::string table_name = get_table_name(request);
 
-    auto [is_internal_table, internal_ks_name, internal_table_name] = try_get_internal_table(proxy.data_dictionary(), table_name);
-    if (is_internal_table) {
-        try {
-            return { proxy.data_dictionary().find_schema(sstring(internal_ks_name), sstring(internal_table_name)), type };
-        } catch (data_dictionary::no_such_column_family&) {
-            // DynamoDB returns validation error even when table does not exist
-            // and the table name is invalid.
-            validate_table_name(table_name);
-
-            throw api_error::resource_not_found(
-                fmt::format("Requested resource not found: Internal table: {}.{} not found", internal_ks_name, internal_table_name));
-        }
+    if (schema_ptr s = try_get_internal_table(proxy.data_dictionary(), table_name)) {
+        return {s, type};
     }
 
     std::string keyspace_name = executor::KEYSPACE_NAME_PREFIX + table_name;
@@ -382,6 +541,24 @@ get_table_or_view(service::storage_proxy& proxy, const rjson::value& request) {
                 fmt::format("Requested resource not found: Table: {} not found", table_name));
         }
     }
+}
+
+// get_table_for_write() is similar to get_table(), but additionally, if the
+// configuration allows this, may also allow writing to system table with
+// prefix INTERNAL_TABLE_PREFIX. This is analogous to the function
+// get_table_or_view() above which allows *reading* internal tables.
+static schema_ptr get_table_for_write(service::storage_proxy& proxy, const rjson::value& request) {
+    std::string table_name = get_table_name(request);
+    if (schema_ptr s = try_get_internal_table(proxy.data_dictionary(), table_name)) {
+        if (!proxy.data_dictionary().get_config().alternator_allow_system_table_write()) {
+            throw api_error::resource_not_found(fmt::format(
+                "Table {} is an internal table, and writing to it is forbidden"
+                " by the alternator_allow_system_table_write configuration",
+                table_name));
+        }
+        return s;
+    }
+    return executor::find_table(proxy, table_name);
 }
 
 // Convenience function for getting the value of a string attribute, or a
@@ -431,8 +608,10 @@ static std::optional<int> get_int_attribute(const rjson::value& value, std::stri
 // attributes of the the given schema as being either HASH or RANGE keys.
 // Additionally, adds to a given map mappings between the key attribute
 // names and their type (as a DynamoDB type string).
-void executor::describe_key_schema(rjson::value& parent, const schema& schema, std::unordered_map<std::string,std::string>* attribute_types) {
+void executor::describe_key_schema(rjson::value& parent, const schema& schema, std::unordered_map<std::string,std::string>* attribute_types, const std::map<sstring, sstring> *tags) {
     rjson::value key_schema = rjson::empty_array();
+    const bool ignore_range_keys_as_spurious = tags != nullptr && tags->contains(SPURIOUS_RANGE_KEY_ADDED_TO_GSI_AND_USER_DIDNT_SPECIFY_RANGE_KEY_TAG_KEY);
+
     for (const column_definition& cdef : schema.partition_key_columns()) {
         rjson::value key = rjson::empty_object();
         rjson::add(key, "AttributeName", rjson::from_string(cdef.name_as_text()));
@@ -442,26 +621,27 @@ void executor::describe_key_schema(rjson::value& parent, const schema& schema, s
             (*attribute_types)[cdef.name_as_text()] = type_to_string(cdef.type);
         }
     }
-    for (const column_definition& cdef : schema.clustering_key_columns()) {
-        rjson::value key = rjson::empty_object();
-        rjson::add(key, "AttributeName", rjson::from_string(cdef.name_as_text()));
-        rjson::add(key, "KeyType", "RANGE");
-        rjson::push_back(key_schema, std::move(key));
-        if (attribute_types) {
-            (*attribute_types)[cdef.name_as_text()] = type_to_string(cdef.type);
+    if (!ignore_range_keys_as_spurious) {
+        // NOTE: user requested key (there can be at most one) will always come first.
+        // There might be more keys following it, which were added, but those were
+        // not requested by the user, so we ignore them.
+        for (const column_definition& cdef : schema.clustering_key_columns()) {
+            rjson::value key = rjson::empty_object();
+            rjson::add(key, "AttributeName", rjson::from_string(cdef.name_as_text()));
+            rjson::add(key, "KeyType", "RANGE");
+            rjson::push_back(key_schema, std::move(key));
+            if (attribute_types) {
+                (*attribute_types)[cdef.name_as_text()] = type_to_string(cdef.type);
+            }
+            break;
         }
-        // FIXME: this "break" can avoid listing some clustering key columns
-        // we added for GSIs just because they existed in the base table -
-        // but not in all cases. We still have issue #5320. See also
-        // reproducer in test_gsi_2_describe_table_schema.
-        break;
     }
     rjson::add(parent, "KeySchema", std::move(key_schema));
 
 }
 
-void executor::describe_key_schema(rjson::value& parent, const schema& schema, std::unordered_map<std::string,std::string>& attribute_types) {
-    describe_key_schema(parent, schema, &attribute_types);
+void executor::describe_key_schema(rjson::value& parent, const schema& schema, std::unordered_map<std::string,std::string>& attribute_types, const std::map<sstring, sstring> *tags) {
+    describe_key_schema(parent, schema, &attribute_types, tags);
 }
 
 static rjson::value generate_arn_for_table(const schema& schema) {
@@ -563,8 +743,9 @@ static future<rjson::value> fill_table_description(schema_ptr schema, table_stat
     auto tags_ptr = db::get_tags_of_table(schema);
 
     rjson::add(table_description, "TableName", rjson::from_string(schema->cf_name()));
-    // FIXME: take the tables creation time, not the current time!
-    size_t creation_date_seconds = std::chrono::duration_cast<std::chrono::seconds>(gc_clock::now().time_since_epoch()).count();
+
+    auto creation_timestamp = get_table_creation_time(*schema);
+
     // FIXME: In DynamoDB the CreateTable implementation is asynchronous, and
     // the table may be in "Creating" state until creating is finished.
     // We don't currently do this in Alternator - instead CreateTable waits
@@ -575,7 +756,7 @@ static future<rjson::value> fill_table_description(schema_ptr schema, table_stat
     rjson::add(table_description, "TableArn", generate_arn_for_table(*schema));
     rjson::add(table_description, "TableId", rjson::from_string(schema->id().to_sstring()));
     rjson::add(table_description, "BillingModeSummary", rjson::empty_object());
-    rjson::add(table_description["BillingModeSummary"], "LastUpdateToPayPerRequestDateTime", rjson::value(creation_date_seconds));
+    rjson::add(table_description["BillingModeSummary"], "LastUpdateToPayPerRequestDateTime", rjson::value(creation_timestamp));
     // In PAY_PER_REQUEST billing mode, provisioned capacity should return 0
     int rcu = 0;
     int wcu = 0;
@@ -610,10 +791,10 @@ static future<rjson::value> fill_table_description(schema_ptr schema, table_stat
     data_dictionary::table t = proxy.data_dictionary().find_column_family(schema);
 
     if (tbl_status != table_status::deleting) {
-        rjson::add(table_description, "CreationDateTime", rjson::value(creation_date_seconds));
+        rjson::add(table_description, "CreationDateTime", rjson::value(creation_timestamp));
         std::unordered_map<std::string,std::string> key_attribute_types;
         // Add base table's KeySchema and collect types for AttributeDefinitions:
-        executor::describe_key_schema(table_description, *schema, key_attribute_types);
+        executor::describe_key_schema(table_description, *schema, key_attribute_types, tags_ptr);
         if (!t.views().empty()) {
             rjson::value gsi_array = rjson::empty_array();
             rjson::value lsi_array = rjson::empty_array();
@@ -629,7 +810,7 @@ static future<rjson::value> fill_table_description(schema_ptr schema, table_stat
                 rjson::add(view_entry, "IndexName", rjson::from_string(index_name));
                 rjson::add(view_entry, "IndexArn", generate_arn_for_index(*schema, index_name));
                 // Add indexes's KeySchema and collect types for AttributeDefinitions:
-                executor::describe_key_schema(view_entry, *vptr, key_attribute_types);
+                executor::describe_key_schema(view_entry, *vptr, key_attribute_types, db::get_tags_of_table(vptr));
                 // Add projection type
                 rjson::value projection = rjson::empty_object();
                 rjson::add(projection, "ProjectionType", "ALL");
@@ -691,14 +872,34 @@ future<executor::request_return_type> executor::describe_table(client_state& cli
     elogger.trace("Describing table {}", request);
 
     schema_ptr schema = get_table(_proxy, request);
-
+    get_stats_from_schema(_proxy, *schema)->api_operations.describe_table++;
     tracing::add_table_name(trace_state, schema->ks_name(), schema->cf_name());
 
     rjson::value table_description = co_await fill_table_description(schema, table_status::active, _proxy, client_state, trace_state, permit);
     rjson::value response = rjson::empty_object();
     rjson::add(response, "Table", std::move(table_description));
     elogger.trace("returning {}", response);
-    co_return make_jsonable(std::move(response));
+    co_return rjson::print(std::move(response));
+}
+
+// This function increments the authorization_failures counter, and may also
+// log a warn-level message and/or throw an access_denied exception, depending
+// on what enforce_authorization and warn_authorization are set to.
+// Note that if enforce_authorization is false, this function will return
+// without throwing. So a caller that doesn't want to continue after an
+// authorization_error must explicitly return after calling this function.
+static void authorization_error(alternator::stats& stats, bool enforce_authorization, bool warn_authorization, std::string msg) {
+    stats.authorization_failures++;
+    if (enforce_authorization) {
+        if (warn_authorization) {
+            elogger.warn("alternator_warn_authorization=true: {}", msg);
+        }
+        throw api_error::access_denied(std::move(msg));
+    } else {
+        if (warn_authorization) {
+            elogger.warn("If you set alternator_enforce_authorization=true the following will be enforced: {}", msg);
+        }
+    }
 }
 
 // Check CQL's Role-Based Access Control (RBAC) permission_to_check (MODIFY,
@@ -706,32 +907,53 @@ future<executor::request_return_type> executor::describe_table(client_state& cli
 // appropriate user-readable api_error::access_denied is thrown.
 future<> verify_permission(
     bool enforce_authorization,
+    bool warn_authorization,
     const service::client_state& client_state,
     const schema_ptr& schema,
-    auth::permission permission_to_check) {
-    if (!enforce_authorization) {
+    auth::permission permission_to_check,
+    alternator::stats& stats) {
+    if (!enforce_authorization && !warn_authorization) {
         co_return;
     }
+    // Unfortunately, the fix for issue #23218 did not modify the function
+    // that we use here - check_has_permissions(). So if we want to allow
+    // writes to internal tables (from try_get_internal_table()) only to a
+    // superuser, we need to explicitly check it here.
+    if (permission_to_check == auth::permission::MODIFY && is_internal_keyspace(schema->ks_name())) {
+        if (!client_state.user() ||
+            !client_state.user()->name ||
+            !co_await client_state.get_auth_service()->underlying_role_manager().is_superuser(*client_state.user()->name)) {
+                sstring username = "<anonymous>";
+                if (client_state.user() && client_state.user()->name) {
+                    username = client_state.user()->name.value();
+                }
+                authorization_error(stats, enforce_authorization, warn_authorization, fmt::format(
+                    "Write access denied on internal table {}.{} to role {} because it is not a superuser",
+                    schema->ks_name(), schema->cf_name(), username));
+                co_return;
+        }
+    }
     auto resource = auth::make_data_resource(schema->ks_name(), schema->cf_name());
-    if (!co_await client_state.check_has_permission(auth::command_desc(permission_to_check, resource))) {
+    if (!client_state.user() || !client_state.user()->name ||
+        !co_await client_state.check_has_permission(auth::command_desc(permission_to_check, resource))) {
         sstring username = "<anonymous>";
         if (client_state.user() && client_state.user()->name) {
             username = client_state.user()->name.value();
         }
         // Using exceptions for errors makes this function faster in the
         // success path (when the operation is allowed).
-        throw api_error::access_denied(format(
-            "{} access on table {}.{} is denied to role {}",
+        authorization_error(stats, enforce_authorization, warn_authorization, fmt::format(
+            "{} access on table {}.{} is denied to role {}, client address {}",
             auth::permissions::to_string(permission_to_check),
-            schema->ks_name(), schema->cf_name(), username));
+            schema->ks_name(), schema->cf_name(), username, client_state.get_client_address()));
     }
 }
 
 // Similar to verify_permission() above, but just for CREATE operations.
 // Those do not operate on any specific table, so require permissions on
 // ALL KEYSPACES instead of any specific table.
-future<> verify_create_permission(bool enforce_authorization, const service::client_state& client_state) {
-    if (!enforce_authorization) {
+static future<> verify_create_permission(bool enforce_authorization, bool warn_authorization, const service::client_state& client_state, alternator::stats& stats) {
+    if (!enforce_authorization && !warn_authorization) {
         co_return;
     }
     auto resource = auth::resource(auth::resource_kind::data);
@@ -740,7 +962,7 @@ future<> verify_create_permission(bool enforce_authorization, const service::cli
         if (client_state.user() && client_state.user()->name) {
             username = client_state.user()->name.value();
         }
-        throw api_error::access_denied(format(
+        authorization_error(stats, enforce_authorization, warn_authorization, fmt::format(
             "CREATE access on ALL KEYSPACES is denied to role {}", username));
     }
 }
@@ -750,9 +972,6 @@ future<executor::request_return_type> executor::delete_table(client_state& clien
     elogger.trace("Deleting table {}", request);
 
     std::string table_name = get_table_name(request);
-    // DynamoDB returns validation error even when table does not exist
-    // and the table name is invalid.
-    validate_table_name(table_name);
 
     std::string keyspace_name = executor::KEYSPACE_NAME_PREFIX + table_name;
     tracing::add_table_name(trace_state, keyspace_name, table_name);
@@ -760,51 +979,65 @@ future<executor::request_return_type> executor::delete_table(client_state& clien
 
     schema_ptr schema = get_table(_proxy, request);
     rjson::value table_description = co_await fill_table_description(schema, table_status::deleting, _proxy, client_state, trace_state, permit);
-    co_await verify_permission(_enforce_authorization, client_state, schema, auth::permission::DROP);
+    co_await verify_permission(_enforce_authorization, _warn_authorization, client_state, schema, auth::permission::DROP, _stats);
     co_await _mm.container().invoke_on(0, [&, cs = client_state.move_to_other_shard()] (service::migration_manager& mm) -> future<> {
-        // FIXME: the following needs to be in a loop. If mm.announce() below
-        // fails, we need to retry the whole thing.
-        auto group0_guard = co_await mm.start_group0_operation();
+        size_t retries = mm.get_concurrent_ddl_retries();
+        for (;;) {
+            auto group0_guard = co_await mm.start_group0_operation();
 
-        std::optional<data_dictionary::table> tbl = p.local().data_dictionary().try_find_table(keyspace_name, table_name);
-        if (!tbl) {
-            throw api_error::resource_not_found(fmt::format("Requested resource not found: Table: {} not found", table_name));
-        }
+            std::optional<data_dictionary::table> tbl = p.local().data_dictionary().try_find_table(keyspace_name, table_name);
+            if (!tbl) {
+                // DynamoDB returns validation error even when table does not exist
+                // and the table name is invalid.
+                validate_table_name(table_name);
+                throw api_error::resource_not_found(fmt::format("Requested resource not found: Table: {} not found", table_name));
+            }
 
-        auto m = co_await service::prepare_column_family_drop_announcement(_proxy, keyspace_name, table_name, group0_guard.write_timestamp(), service::drop_views::yes);
-        auto m2 = co_await service::prepare_keyspace_drop_announcement(_proxy.local_db(), keyspace_name, group0_guard.write_timestamp());
+            auto m = co_await service::prepare_column_family_drop_announcement(_proxy, keyspace_name, table_name, group0_guard.write_timestamp(), service::drop_views::yes);
+            auto m2 = co_await service::prepare_keyspace_drop_announcement(_proxy, keyspace_name, group0_guard.write_timestamp());
 
-        std::move(m2.begin(), m2.end(), std::back_inserter(m));
+            std::move(m2.begin(), m2.end(), std::back_inserter(m));
 
-        // When deleting a table and its views, we need to remove this role's
-        // special permissions in those tables (undoing the "auto-grant" done
-        // by CreateTable). If we didn't do this, if a second role later
-        // recreates a table with the same name, the first role would still
-        // have permissions over the new table.
-        // To make things more robust we just remove *all* permissions for
-        // the deleted table (CQL's drop_table_statement also does this).
-        // Unfortunately, there is an API mismatch between this code (which
-        // uses separate group0_guard and vector<mutation>) and the function
-        // revoke_all() which uses a combined "group0_batch" structure - so
-        // we need to do some ugly back-and-forth conversions between the pair
-        // to the group0_batch and back to the pair :-(
-        service::group0_batch mc(std::move(group0_guard));
-        mc.add_mutations(std::move(m));
-        auto resource = auth::make_data_resource(schema->ks_name(), schema->cf_name());
-        co_await auth::revoke_all(*cs.get().get_auth_service(), resource, mc);
-        for (const view_ptr& v : tbl->views()) {
-            resource = auth::make_data_resource(v->ks_name(), v->cf_name());
+            // When deleting a table and its views, we need to remove this role's
+            // special permissions in those tables (undoing the "auto-grant" done
+            // by CreateTable). If we didn't do this, if a second role later
+            // recreates a table with the same name, the first role would still
+            // have permissions over the new table.
+            // To make things more robust we just remove *all* permissions for
+            // the deleted table (CQL's drop_table_statement also does this).
+            // Unfortunately, there is an API mismatch between this code (which
+            // uses separate group0_guard and vector<mutation>) and the function
+            // revoke_all() which uses a combined "group0_batch" structure - so
+            // we need to do some ugly back-and-forth conversions between the pair
+            // to the group0_batch and back to the pair :-(
+            service::group0_batch mc(std::move(group0_guard));
+            mc.add_mutations(std::move(m));
+            auto resource = auth::make_data_resource(schema->ks_name(), schema->cf_name());
             co_await auth::revoke_all(*cs.get().get_auth_service(), resource, mc);
-        }
-        std::tie(m, group0_guard) = co_await std::move(mc).extract();
+            for (const view_ptr& v : tbl->views()) {
+                resource = auth::make_data_resource(v->ks_name(), v->cf_name());
+                co_await auth::revoke_all(*cs.get().get_auth_service(), resource, mc);
+            }
+            std::tie(m, group0_guard) = co_await std::move(mc).extract();
 
-        co_await mm.announce(std::move(m), std::move(group0_guard), fmt::format("alternator-executor: delete {} table", table_name));
+            try {
+                co_await mm.announce(std::move(m), std::move(group0_guard), fmt::format("alternator-executor: delete {} table", table_name));
+                break;
+            } catch (const service::group0_concurrent_modification& ex) {
+                elogger.info("Failed to execute DeleteTable {} due to concurrent schema modifications. {}.",
+                        table_name, retries ? "Retrying" : "Number of retries exceeded, giving up");
+                if (retries--) {
+                    continue;
+                }
+                throw;
+            }
+        }
     });
 
     rjson::value response = rjson::empty_object();
     rjson::add(response, "TableDescription", std::move(table_description));
     elogger.trace("returning {}", response);
-    co_return make_jsonable(std::move(response));
+    co_return rjson::print(std::move(response));
 }
 
 static data_type parse_key_type(std::string_view type) {
@@ -856,7 +1089,7 @@ static void add_column(schema_builder& builder, const std::string& name, const r
 // the HASH key name, and the second one, if exists, must be a RANGE key name.
 // The function returns the two column names - the first is the hash key
 // and always present, the second is the range key and may be an empty string.
-static std::pair<std::string, std::string> parse_key_schema(const rjson::value& obj) {
+static std::pair<std::string, std::string> parse_key_schema(const rjson::value& obj, std::string_view supplementary_context) {
     const rjson::value *key_schema;
     if (!obj.IsObject() || !(key_schema = rjson::find(obj, "KeySchema"))) {
         throw api_error::validation("Missing KeySchema member");
@@ -875,6 +1108,7 @@ static std::pair<std::string, std::string> parse_key_schema(const rjson::value& 
     if (!v || !v->IsString()) {
         throw api_error::validation("First key in KeySchema must have string AttributeName");
     }
+    validate_attr_name_length(supplementary_context, v->GetStringLength(), true, "HASH key in KeySchema - ");
     std::string hash_key = v->GetString();
     std::string range_key;
     if (key_schema->Size() == 2) {
@@ -889,6 +1123,7 @@ static std::pair<std::string, std::string> parse_key_schema(const rjson::value& 
         if (!v || !v->IsString()) {
             throw api_error::validation("Second key in KeySchema must have string AttributeName");
         }
+        validate_attr_name_length(supplementary_context, v->GetStringLength(), true, "RANGE key in KeySchema - ");
         range_key = v->GetString();
     }
     return {hash_key, range_key};
@@ -921,7 +1156,7 @@ static schema_ptr get_table_from_arn(service::storage_proxy& proxy, std::string_
         // FIXME: remove sstring creation once find_schema gains a view-based interface
         return proxy.data_dictionary().find_schema(sstring(keyspace_name), sstring(table_name));
     } catch (const data_dictionary::no_such_column_family& e) {
-        throw api_error::access_denied("Incorrect resource identifier");
+        throw api_error::resource_not_found(fmt::format("ResourceArn '{}' not found", arn));
     } catch (const std::out_of_range& e) {
         throw api_error::access_denied("Incorrect resource identifier");
     }
@@ -993,6 +1228,17 @@ void rmw_operation::set_default_write_isolation(std::string_view value) {
     default_write_isolation = parse_write_isolation(value);
 }
 
+// Alternator uses tags whose keys start with the "system:" prefix for
+// internal purposes. Those should not be readable by ListTagsOfResource,
+// nor writable with TagResource or UntagResource (see #24098).
+// Only a few specific system tags, currently only system:write_isolation,
+// are deliberately intended to be set and read by the user, so are not
+// considered "internal".
+static bool tag_key_is_internal(std::string_view tag_key) {
+    return tag_key.starts_with("system:") &&
+        tag_key != rmw_operation::WRITE_ISOLATION_TAG_KEY;
+}
+
 enum class update_tags_action { add_tags, delete_tags };
 static void update_tags_map(const rjson::value& tags, std::map<sstring, sstring>& tags_map, update_tags_action action) {
     if (action == update_tags_action::add_tags) {
@@ -1017,6 +1263,9 @@ static void update_tags_map(const rjson::value& tags, std::map<sstring, sstring>
             if (!validate_legal_tag_chars(tag_key)) {
                 throw api_error::validation("A tag Key can only contain letters, spaces, and [+-=._:/]");
             }
+            if (tag_key_is_internal(tag_key)) {
+                throw api_error::validation(fmt::format("Tag key '{}' is reserved for internal use", tag_key));
+            }
             // Note tag values are limited similarly to tag keys, but have a
             // longer length limit, and *can* be empty.
             if (tag_value.size() > 256) {
@@ -1029,7 +1278,11 @@ static void update_tags_map(const rjson::value& tags, std::map<sstring, sstring>
         }
     } else if (action == update_tags_action::delete_tags) {
         for (auto it = tags.Begin(); it != tags.End(); ++it) {
-            tags_map.erase(sstring(it->GetString(), it->GetStringLength()));
+            auto tag_key = rjson::to_string_view(*it);
+            if (tag_key_is_internal(tag_key)) {
+                throw api_error::validation(fmt::format("Tag key '{}' is reserved for internal use", tag_key));
+            }
+            tags_map.erase(sstring(tag_key));
         }
     }
 
@@ -1056,6 +1309,7 @@ future<executor::request_return_type> executor::tag_resource(client_state& clien
         co_return api_error::access_denied("Incorrect resource identifier");
     }
     schema_ptr schema = get_table_from_arn(_proxy, rjson::to_string_view(*arn));
+    get_stats_from_schema(_proxy, *schema)->api_operations.tag_resource++;
     const rjson::value* tags = rjson::find(request, "Tags");
     if (!tags || !tags->IsArray()) {
         co_return api_error::validation("Cannot parse tags");
@@ -1063,11 +1317,11 @@ future<executor::request_return_type> executor::tag_resource(client_state& clien
     if (tags->Size() < 1) {
         co_return api_error::validation("The number of tags must be at least 1") ;
     }
-    co_await verify_permission(_enforce_authorization, client_state, schema, auth::permission::ALTER);
+    co_await verify_permission(_enforce_authorization, _warn_authorization, client_state, schema, auth::permission::ALTER, _stats);
     co_await db::modify_tags(_mm, schema->ks_name(), schema->cf_name(), [tags](std::map<sstring, sstring>& tags_map) {
         update_tags_map(*tags, tags_map, update_tags_action::add_tags);
     });
-    co_return json_string("");
+    co_return ""; // empty response
 }
 
 future<executor::request_return_type> executor::untag_resource(client_state& client_state, service_permit permit, rjson::value request) {
@@ -1083,11 +1337,12 @@ future<executor::request_return_type> executor::untag_resource(client_state& cli
     }
 
     schema_ptr schema = get_table_from_arn(_proxy, rjson::to_string_view(*arn));
-    co_await verify_permission(_enforce_authorization, client_state, schema, auth::permission::ALTER);
+    get_stats_from_schema(_proxy, *schema)->api_operations.untag_resource++;
+    co_await verify_permission(_enforce_authorization, _warn_authorization, client_state, schema, auth::permission::ALTER, _stats);
     co_await db::modify_tags(_mm, schema->ks_name(), schema->cf_name(), [tags](std::map<sstring, sstring>& tags_map) {
         update_tags_map(*tags, tags_map, update_tags_action::delete_tags);
     });
-    co_return json_string("");
+    co_return ""; // empty response
 }
 
 future<executor::request_return_type> executor::list_tags_of_resource(client_state& client_state, service_permit permit, rjson::value request) {
@@ -1097,20 +1352,23 @@ future<executor::request_return_type> executor::list_tags_of_resource(client_sta
         return make_ready_future<request_return_type>(api_error::access_denied("Incorrect resource identifier"));
     }
     schema_ptr schema = get_table_from_arn(_proxy, rjson::to_string_view(*arn));
-
+    get_stats_from_schema(_proxy, *schema)->api_operations.list_tags_of_resource++;
     auto tags_map = get_tags_of_table_or_throw(schema);
     rjson::value ret = rjson::empty_object();
     rjson::add(ret, "Tags", rjson::empty_array());
 
     rjson::value& tags = ret["Tags"];
     for (auto& tag_entry : tags_map) {
+        if (tag_key_is_internal(tag_entry.first)) {
+            continue;
+        }
         rjson::value new_entry = rjson::empty_object();
         rjson::add(new_entry, "Key", rjson::from_string(tag_entry.first));
         rjson::add(new_entry, "Value", rjson::from_string(tag_entry.second));
         rjson::push_back(tags, std::move(new_entry));
     }
 
-    return make_ready_future<executor::request_return_type>(make_jsonable(std::move(ret)));
+    return make_ready_future<executor::request_return_type>(rjson::print(std::move(ret)));
 }
 
 struct billing_mode_type {
@@ -1155,7 +1413,7 @@ static billing_mode_type verify_billing_mode(const rjson::value& request) {
 // Return the set of attribute names defined in AttributeDefinitions - this
 // set is useful for later verifying that all of them are used by some
 // KeySchema (issue #19784)
-static std::unordered_set<std::string> validate_attribute_definitions(const rjson::value& attribute_definitions){
+static std::unordered_set<std::string> validate_attribute_definitions(std::string_view supplementary_context, const rjson::value& attribute_definitions) {
     if (!attribute_definitions.IsArray()) {
         throw api_error::validation("AttributeDefinitions must be an array");
     }
@@ -1168,6 +1426,7 @@ static std::unordered_set<std::string> validate_attribute_definitions(const rjso
         if (!attribute_name->IsString()) {
             throw api_error::validation("AttributeName in AttributeDefinitions must be a string");
         }
+        validate_attr_name_length(supplementary_context, attribute_name->GetStringLength(), true, "in AttributeDefinitions - ");
         auto [it2, added] = seen_attribute_names.emplace(rjson::to_string_view(*attribute_name));
         if (!added) {
             throw api_error::validation(fmt::format("Duplicate AttributeName={} in AttributeDefinitions",
@@ -1185,8 +1444,8 @@ static std::unordered_set<std::string> validate_attribute_definitions(const rjso
 }
 
 // The following "extract_from_attrs_column_computation" implementation is
-// what allows Alternator GSIs to use in a materialized view's key a member
-// from the ":attrs" map instead of a real column in the schema:
+// what allows Alternator GSIs and LSIs to use in a materialized view's key a
+// member from the ":attrs" map instead of a real column in the schema:
 
 const bytes extract_from_attrs_column_computation::MAP_NAME = executor::ATTRS_COLUMN_NAME;
 
@@ -1264,8 +1523,25 @@ bytes extract_from_attrs_column_computation::compute_value(const schema&, const 
     on_internal_error(elogger, "extract_from_attrs_column_computation::compute_value called without row");
 }
 
+// Because `CreateTable` request creates GSI/LSI together with the base table (so the base table is empty),
+// we can skip view building process and immediately mark the view as built on all nodes.
+//
+// However, we can do this only for tablet-based views because `view_building_worker` will automatically propagate
+// this information to `system.built_views` table (see `view_building_worker::update_built_views()`).
+// For vnode-based views, `view_builder` will process the view and mark it as built.
+static future<> mark_view_schemas_as_built(utils::chunked_vector<mutation>& out, std::vector<schema_ptr> schemas, api::timestamp_type ts, service::storage_proxy& sp) {
+    auto token_metadata = sp.get_token_metadata_ptr();
+    for (auto& schema: schemas) {
+        if (schema->is_view()) {
+            for (auto& host_id: token_metadata->get_topology().get_all_host_ids()) {
+                auto view_status_mut = co_await sp.system_keyspace().make_view_build_status_mutation(ts, {schema->ks_name(), schema->cf_name()}, host_id, db::view::build_status::SUCCESS);
+                out.push_back(std::move(view_status_mut));
+            }
+        }
+    }
+}
 
-static future<executor::request_return_type> create_table_on_shard0(service::client_state&& client_state, tracing::trace_state_ptr trace_state, rjson::value request, service::storage_proxy& sp, service::migration_manager& mm, gms::gossiper& gossiper, bool enforce_authorization) {
+static future<executor::request_return_type> create_table_on_shard0(service::client_state&& client_state, tracing::trace_state_ptr trace_state, rjson::value request, service::storage_proxy& sp, service::migration_manager& mm, gms::gossiper& gossiper, bool enforce_authorization, bool warn_authorization, stats& stats) {
     SCYLLA_ASSERT(this_shard_id() == 0);
 
     // We begin by parsing and validating the content of the CreateTable
@@ -1288,12 +1564,12 @@ static future<executor::request_return_type> create_table_on_shard0(service::cli
     // any of its GSIs or LSIs. If anything remains in this set at the end of
     // this function, it's an error.
     std::unordered_set<std::string> unused_attribute_definitions =
-        validate_attribute_definitions(*attribute_definitions);
+        validate_attribute_definitions("", *attribute_definitions);
 
     tracing::add_table_name(trace_state, keyspace_name, table_name);
 
     schema_builder builder(keyspace_name, table_name);
-    auto [hash_key, range_key] = parse_key_schema(request);
+    auto [hash_key, range_key] = parse_key_schema(request, "");
     add_column(builder, hash_key, *attribute_definitions, column_kind::partition_key);
     unused_attribute_definitions.erase(hash_key);
     if (!range_key.empty()) {
@@ -1311,10 +1587,6 @@ static future<executor::request_return_type> create_table_on_shard0(service::cli
     // any table.
     std::vector<schema_builder> view_builders;
     std::unordered_set<std::string> index_names;
-    // Remember the attributes used for LSI keys. Since LSI must be created
-    // with the table, we make these attributes real schema columns, and need
-    // to remember this below if the same attributes are used as GSI keys.
-    std::unordered_set<std::string> lsi_range_keys;
 
     const rjson::value* lsi = rjson::find(request, "LocalSecondaryIndexes");
     if (lsi) {
@@ -1339,7 +1611,7 @@ static future<executor::request_return_type> create_table_on_shard0(service::cli
             // FIXME: read and handle "Projection" parameter. This will
             // require the MV code to copy just parts of the attrs map.
             schema_builder view_builder(keyspace_name, vname);
-            auto [view_hash_key, view_range_key] = parse_key_schema(l);
+            auto [view_hash_key, view_range_key] = parse_key_schema(l, "Local Secondary Index");
             if (view_hash_key != hash_key) {
                 co_return api_error::validation("LocalSecondaryIndex hash key must match the base table hash key");
             }
@@ -1351,15 +1623,12 @@ static future<executor::request_return_type> create_table_on_shard0(service::cli
             unused_attribute_definitions.erase(view_range_key);
             if (view_range_key == hash_key) {
                 co_return api_error::validation("LocalSecondaryIndex sort key cannot be the same as hash key");
-              }
-            if (view_range_key != range_key) {
-                add_column(builder, view_range_key, *attribute_definitions, column_kind::regular_column);
             }
-            add_column(view_builder, view_range_key, *attribute_definitions, column_kind::clustering_key);
+            add_column(view_builder, view_range_key, *attribute_definitions, column_kind::clustering_key, view_range_key != range_key);
             // Base key columns which aren't part of the index's key need to
             // be added to the view nonetheless, as (additional) clustering
             // key(s).
-            if  (!range_key.empty() && view_range_key != range_key) {
+            if (!range_key.empty() && view_range_key != range_key) {
                 add_column(view_builder, range_key, *attribute_definitions, column_kind::clustering_key);
             }
             view_builder.with_column(bytes(executor::ATTRS_COLUMN_NAME), attrs_type(), column_kind::regular_column);
@@ -1372,7 +1641,6 @@ static future<executor::request_return_type> create_table_on_shard0(service::cli
             std::map<sstring, sstring> tags_map = {{db::SYNCHRONOUS_VIEW_UPDATES_TAG_KEY, "true"}};
             view_builder.add_extension(db::tags_extension::NAME, ::make_shared<db::tags_extension>(tags_map));
             view_builders.emplace_back(std::move(view_builder));
-            lsi_range_keys.emplace(view_range_key);
         }
     }
 
@@ -1396,22 +1664,17 @@ static future<executor::request_return_type> create_table_on_shard0(service::cli
             // FIXME: read and handle "Projection" parameter. This will
             // require the MV code to copy just parts of the attrs map.
             schema_builder view_builder(keyspace_name, vname);
-            auto [view_hash_key, view_range_key] = parse_key_schema(g);
+            auto [view_hash_key, view_range_key] = parse_key_schema(g, "GlobalSecondaryIndexes");
 
             // If an attribute is already a real column in the base table
-            // (i.e., a key attribute) or we already made it a real column
-            // as an LSI key above, we can use it directly as a view key.
+            // (i.e., a key attribute), we can use it directly as a view key.
             // Otherwise, we need to add it as a "computed column", which
             // extracts and deserializes the attribute from the ":attrs" map.
-            bool view_hash_key_real_column =
-                partial_schema->get_column_definition(to_bytes(view_hash_key)) ||
-                lsi_range_keys.contains(view_hash_key);
+            bool view_hash_key_real_column = partial_schema->get_column_definition(to_bytes(view_hash_key));
             add_column(view_builder, view_hash_key, *attribute_definitions, column_kind::partition_key, !view_hash_key_real_column);
             unused_attribute_definitions.erase(view_hash_key);
             if (!view_range_key.empty()) {
-                bool view_range_key_real_column =
-                    partial_schema->get_column_definition(to_bytes(view_range_key)) ||
-                    lsi_range_keys.contains(view_range_key);
+                bool view_range_key_real_column = partial_schema->get_column_definition(to_bytes(view_range_key));
                 add_column(view_builder, view_range_key, *attribute_definitions, column_kind::clustering_key, !view_range_key_real_column);
                 if (!partial_schema->get_column_definition(to_bytes(view_range_key)) &&
                     !partial_schema->get_column_definition(to_bytes(view_hash_key))) {
@@ -1420,17 +1683,25 @@ static future<executor::request_return_type> create_table_on_shard0(service::cli
                 }
                 unused_attribute_definitions.erase(view_range_key);
             }
+
             // Base key columns which aren't part of the index's key need to
             // be added to the view nonetheless, as (additional) clustering
             // key(s).
-            if  (hash_key != view_hash_key && hash_key != view_range_key) {
+            // NOTE: DescribeTable's implementation depends on those keys being added AFTER user specified keys.
+            bool spurious_base_key_added_as_range_key = false;
+            if (hash_key != view_hash_key && hash_key != view_range_key) {
                 add_column(view_builder, hash_key, *attribute_definitions, column_kind::clustering_key);
+                spurious_base_key_added_as_range_key = true;
             }
-            if  (!range_key.empty() && range_key != view_hash_key && range_key != view_range_key) {
+            if (!range_key.empty() && range_key != view_hash_key && range_key != view_range_key) {
                 add_column(view_builder, range_key, *attribute_definitions, column_kind::clustering_key);
+                spurious_base_key_added_as_range_key = true;
             }
-            // GSIs have no tags:
-            view_builder.add_extension(db::tags_extension::NAME, ::make_shared<db::tags_extension>());
+            std::map<sstring, sstring> tags;
+            if (view_range_key.empty() && spurious_base_key_added_as_range_key) {
+                tags[SPURIOUS_RANGE_KEY_ADDED_TO_GSI_AND_USER_DIDNT_SPECIFY_RANGE_KEY_TAG_KEY] = "true";
+            }
+            view_builder.add_extension(db::tags_extension::NAME, ::make_shared<db::tags_extension>(std::move(tags)));
             view_builders.emplace_back(std::move(view_builder));
         }
     }
@@ -1457,7 +1728,9 @@ static future<executor::request_return_type> create_table_on_shard0(service::cli
 
     rjson::value* stream_specification = rjson::find(request, "StreamSpecification");
     if (stream_specification && stream_specification->IsObject()) {
-        executor::add_stream_options(*stream_specification, builder, sp);
+        if (executor::add_stream_options(*stream_specification, builder, sp)) {
+            validate_cdc_log_name_length(builder.cf_name());
+        }
     }
 
     // Parse the "Tags" parameter early, so we can avoid creating the table
@@ -1471,9 +1744,10 @@ static future<executor::request_return_type> create_table_on_shard0(service::cli
         tags_map[RCU_TAG_KEY] = std::to_string(bm.rcu);
         tags_map[WCU_TAG_KEY] = std::to_string(bm.wcu);
     }
+    set_table_creation_time(tags_map, db_clock::now());
     builder.add_extension(db::tags_extension::NAME, ::make_shared<db::tags_extension>(tags_map));
 
-    co_await verify_create_permission(enforce_authorization, client_state);
+    co_await verify_create_permission(enforce_authorization, warn_authorization, client_state, stats);
 
     schema_ptr schema = builder.build();
     for (auto& view_builder : view_builders) {
@@ -1486,91 +1760,97 @@ static future<executor::request_return_type> create_table_on_shard0(service::cli
             }
         }
         const bool include_all_columns = true;
-        view_builder.with_view_info(*schema, include_all_columns, ""/*where clause*/);
+        view_builder.with_view_info(schema, include_all_columns, ""/*where clause*/);
     }
 
-    // FIXME: the following needs to be in a loop. If mm.announce() below
-    // fails, we need to retry the whole thing.
-    auto group0_guard = co_await mm.start_group0_operation();
-    auto ts = group0_guard.write_timestamp();
-    std::vector<mutation> schema_mutations;
-    auto ksm = create_keyspace_metadata(keyspace_name, sp, gossiper, ts, tags_map, sp.features());
-    // Alternator Streams doesn't yet work when the table uses tablets (#16317)
-    if (stream_specification && stream_specification->IsObject()) {
-        auto stream_enabled = rjson::find(*stream_specification, "StreamEnabled");
-        if (stream_enabled && stream_enabled->IsBool() && stream_enabled->GetBool()) {
-            locator::replication_strategy_params params(ksm->strategy_options(), ksm->initial_tablets());
-            auto rs = locator::abstract_replication_strategy::create_replication_strategy(ksm->strategy_name(), params);
-            if (rs->uses_tablets()) {
-                co_return api_error::validation("Streams not yet supported on a table using tablets (issue #16317). "
-                "If you want to use streams, create a table with vnodes by setting the tag 'experimental:initial_tablets' set to 'none'.");
+    size_t retries = mm.get_concurrent_ddl_retries();
+    for (;;) {
+        auto group0_guard = co_await mm.start_group0_operation();
+        auto ts = group0_guard.write_timestamp();
+        utils::chunked_vector<mutation> schema_mutations;
+        auto ksm = create_keyspace_metadata(keyspace_name, sp, gossiper, ts, tags_map, sp.features());
+        // Alternator Streams doesn't yet work when the table uses tablets (#23838)
+        if (stream_specification && stream_specification->IsObject()) {
+            auto stream_enabled = rjson::find(*stream_specification, "StreamEnabled");
+            if (stream_enabled && stream_enabled->IsBool() && stream_enabled->GetBool()) {
+                locator::replication_strategy_params params(ksm->strategy_options(), ksm->initial_tablets(), ksm->consistency_option());
+                const auto& topo = sp.local_db().get_token_metadata().get_topology();
+                auto rs = locator::abstract_replication_strategy::create_replication_strategy(ksm->strategy_name(), params, topo);
+                if (rs->uses_tablets()) {
+                    co_return api_error::validation("Streams not yet supported on a table using tablets (issue #23838). "
+                    "If you want to use streams, create a table with vnodes by setting the tag 'experimental:initial_tablets' set to 'none'.");
+                }
             }
         }
-    }
-    try {
-        schema_mutations = service::prepare_new_keyspace_announcement(sp.local_db(), ksm, ts);
-    } catch (exceptions::already_exists_exception&) {
-        if (sp.data_dictionary().has_schema(keyspace_name, table_name)) {
-            co_return api_error::resource_in_use(fmt::format("Table {} already exists", table_name));
+        try {
+            schema_mutations = service::prepare_new_keyspace_announcement(sp.local_db(), ksm, ts);
+        } catch (exceptions::already_exists_exception&) {
+            if (sp.data_dictionary().has_schema(keyspace_name, table_name)) {
+                co_return api_error::resource_in_use(fmt::format("Table {} already exists", table_name));
+            }
         }
-    }
-    if (sp.data_dictionary().try_find_table(schema->id())) {
-        // This should never happen, the ID is supposed to be unique
-        co_return api_error::internal(format("Table with ID {} already exists", schema->id()));
-    }
-    co_await service::prepare_new_column_family_announcement(schema_mutations, sp, *ksm, schema, ts);
-    for (schema_builder& view_builder : view_builders) {
-        view_ptr view(view_builder.build());
-        db::schema_tables::add_table_or_view_to_schema_mutation(
-            view, ts, true, schema_mutations);
-        // add_table_or_view_to_schema_mutation() is a low-level function that
-        // doesn't call the callbacks that prepare_new_view_announcement()
-        // calls. So we need to call this callback here :-( If we don't, among
-        // other things *tablets* will not be created for the new view.
-        // These callbacks need to be called in a Seastar thread.
-        co_await seastar::async([&sp, &ksm, &view, &schema_mutations, ts] {
-            return sp.local_db().get_notifier().before_create_column_family(*ksm, *view, schema_mutations, ts);
-        });
+        if (sp.data_dictionary().try_find_table(schema->id())) {
+            // This should never happen, the ID is supposed to be unique
+            co_return api_error::internal(format("Table with ID {} already exists", schema->id()));
+        }
+        std::vector<schema_ptr> schemas;
+        schemas.push_back(schema);
+        for (schema_builder& view_builder : view_builders) {
+            schemas.push_back(view_builder.build());
+        }
+        co_await service::prepare_new_column_families_announcement(schema_mutations, sp, *ksm, schemas, ts);
+        if (ksm->uses_tablets()) {
+            co_await mark_view_schemas_as_built(schema_mutations, schemas, ts, sp);
+        }
 
-    }
-    // If a role is allowed to create a table, we must give it permissions to
-    // use (and eventually delete) the specific table it just created (and
-    // also the view tables). This is known as "auto-grant".
-    // Unfortunately, there is an API mismatch between this code (which uses
-    // separate group0_guard and vector<mutation>) and the function
-    // grant_applicable_permissions() which uses a combined "group0_batch"
-    // structure - so we need to do some ugly back-and-forth conversions
-    // between the pair to the group0_batch and back to the pair :-(
-    service::group0_batch mc(std::move(group0_guard));
-    mc.add_mutations(std::move(schema_mutations));
-    if (client_state.user()) {
-        auto resource = auth::make_data_resource(schema->ks_name(), schema->cf_name());
-        co_await auth::grant_applicable_permissions(
-            *client_state.get_auth_service(), *client_state.user(), resource, mc);
-        for (const schema_builder& view_builder : view_builders) {
-            resource = auth::make_data_resource(view_builder.ks_name(), view_builder.cf_name());
+        // If a role is allowed to create a table, we must give it permissions to
+        // use (and eventually delete) the specific table it just created (and
+        // also the view tables). This is known as "auto-grant".
+        // Unfortunately, there is an API mismatch between this code (which uses
+        // separate group0_guard and vector<mutation>) and the function
+        // grant_applicable_permissions() which uses a combined "group0_batch"
+        // structure - so we need to do some ugly back-and-forth conversions
+        // between the pair to the group0_batch and back to the pair :-(
+        service::group0_batch mc(std::move(group0_guard));
+        mc.add_mutations(std::move(schema_mutations));
+        if (client_state.user()) {
+            auto resource = auth::make_data_resource(schema->ks_name(), schema->cf_name());
             co_await auth::grant_applicable_permissions(
                 *client_state.get_auth_service(), *client_state.user(), resource, mc);
+            for (const schema_builder& view_builder : view_builders) {
+                resource = auth::make_data_resource(view_builder.ks_name(), view_builder.cf_name());
+                co_await auth::grant_applicable_permissions(
+                    *client_state.get_auth_service(), *client_state.user(), resource, mc);
+            }
+        }
+        std::tie(schema_mutations, group0_guard) = co_await std::move(mc).extract();
+        try {
+            co_await mm.announce(std::move(schema_mutations), std::move(group0_guard), fmt::format("alternator-executor: create {} table", table_name));
+            break;
+        }  catch (const service::group0_concurrent_modification& ex) {
+            elogger.info("Failed to execute CreateTable {} due to concurrent schema modifications. {}.",
+                    table_name, retries ? "Retrying" : "Number of retries exceeded, giving up");
+            if (retries--) {
+                continue;
+            }
+            throw;
         }
     }
-    std::tie(schema_mutations, group0_guard) = co_await std::move(mc).extract();
-
-    co_await mm.announce(std::move(schema_mutations), std::move(group0_guard), fmt::format("alternator-executor: create {} table", table_name));
 
     co_await mm.wait_for_schema_agreement(sp.local_db(), db::timeout_clock::now() + 10s, nullptr);
     rjson::value status = rjson::empty_object();
     executor::supplement_table_info(request, *schema, sp);
     rjson::add(status, "TableDescription", std::move(request));
-    co_return make_jsonable(std::move(status));
+    co_return rjson::print(std::move(status));
 }
 
 future<executor::request_return_type> executor::create_table(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
     _stats.api_operations.create_table++;
     elogger.trace("Creating table {}", request);
 
-    co_return co_await _mm.container().invoke_on(0, [&, tr = tracing::global_trace_state_ptr(trace_state), request = std::move(request), &sp = _proxy.container(), &g = _gossiper.container(), client_state_other_shard = client_state.move_to_other_shard(), enforce_authorization = bool(_enforce_authorization)]
+    co_return co_await _mm.container().invoke_on(0, [&, tr = tracing::global_trace_state_ptr(trace_state), request = std::move(request), &sp = _proxy.container(), &g = _gossiper.container(), client_state_other_shard = client_state.move_to_other_shard(), enforce_authorization = bool(_enforce_authorization), warn_authorization = bool(_warn_authorization)]
                                         (service::migration_manager& mm) mutable -> future<executor::request_return_type> {
-        co_return co_await create_table_on_shard0(client_state_other_shard.get(), tr, std::move(request), sp.local(), mm, g.local(), enforce_authorization);
+        co_return co_await create_table_on_shard0(client_state_other_shard.get(), tr, std::move(request), sp.local(), mm, g.local(), enforce_authorization, warn_authorization, _stats);
     });
 }
 
@@ -1623,212 +1903,224 @@ future<executor::request_return_type> executor::update_table(client_state& clien
         verify_billing_mode(request);
     }
 
-    co_return co_await _mm.container().invoke_on(0, [&p = _proxy.container(), request = std::move(request), gt = tracing::global_trace_state_ptr(std::move(trace_state)), enforce_authorization = bool(_enforce_authorization), client_state_other_shard = client_state.move_to_other_shard(), empty_request]
+    co_return co_await _mm.container().invoke_on(0, [&p = _proxy.container(), request = std::move(request), gt = tracing::global_trace_state_ptr(std::move(trace_state)), enforce_authorization = bool(_enforce_authorization), warn_authorization = bool(_warn_authorization), client_state_other_shard = client_state.move_to_other_shard(), empty_request, &e = this->container()]
                                                 (service::migration_manager& mm) mutable -> future<executor::request_return_type> {
-        // FIXME: the following needs to be in a loop. If mm.announce() below
-        // fails, we need to retry the whole thing.
-        auto group0_guard = co_await mm.start_group0_operation();
+        schema_ptr schema;
+        size_t retries = mm.get_concurrent_ddl_retries();
+        for (;;) {
+            auto group0_guard = co_await mm.start_group0_operation();
 
-        schema_ptr tab = get_table(p.local(), request);
+            schema_ptr tab = get_table(p.local(), request);
 
-        tracing::add_table_name(gt, tab->ks_name(), tab->cf_name());
+            tracing::add_table_name(gt, tab->ks_name(), tab->cf_name());
 
-        // the ugly but harmless conversion to string_view here is because
-        // Seastar's sstring is missing a find(std::string_view) :-()
-        if (std::string_view(tab->cf_name()).find(INTERNAL_TABLE_PREFIX) == 0) {
-            co_await coroutine::return_exception(api_error::validation(fmt::format("Prefix {} is reserved for accessing internal tables", INTERNAL_TABLE_PREFIX)));
-        }
-
-        schema_builder builder(tab);
-
-        rjson::value* stream_specification = rjson::find(request, "StreamSpecification");
-        if (stream_specification && stream_specification->IsObject()) {
-            empty_request = false;
-            add_stream_options(*stream_specification, builder, p.local());
-            // Alternator Streams doesn't yet work when the table uses tablets (#16317)
-            auto stream_enabled = rjson::find(*stream_specification, "StreamEnabled");
-            if (stream_enabled && stream_enabled->IsBool()) {
-                if (stream_enabled->GetBool()) {
-                    if (p.local().local_db().find_keyspace(tab->ks_name()).get_replication_strategy().uses_tablets()) {
-                    co_return api_error::validation("Streams not yet supported on a table using tablets (issue #16317). "
-                        "If you want to enable streams, re-create this table with vnodes (with the tag 'experimental:initial_tablets' set to 'none').");
-                    }
-                    if (tab->cdc_options().enabled()) {
-                        co_return api_error::validation("Table already has an enabled stream: TableName: " + tab->cf_name());
-                    }
-                }
-                else if (!tab->cdc_options().enabled()) {
-                    co_return api_error::validation("Table has no stream to disable: TableName: " + tab->cf_name());
-                }
+            // the ugly but harmless conversion to string_view here is because
+            // Seastar's sstring is missing a find(std::string_view) :-()
+            if (std::string_view(tab->cf_name()).find(INTERNAL_TABLE_PREFIX) == 0) {
+                co_await coroutine::return_exception(api_error::validation(fmt::format("Prefix {} is reserved for accessing internal tables", INTERNAL_TABLE_PREFIX)));
             }
-        }
 
-        auto schema = builder.build();
-        std::vector<view_ptr> new_views;
-        std::vector<std::string> dropped_views;
+            schema_builder builder(tab);
 
-        rjson::value* gsi_updates = rjson::find(request, "GlobalSecondaryIndexUpdates");
-        if (gsi_updates) {
-            if (!gsi_updates->IsArray()) {
-                co_return api_error::validation("GlobalSecondaryIndexUpdates must be an array");
-            }
-            if (gsi_updates->Size() > 1) {
-                // Although UpdateTable takes an array of operations and could
-                // support multiple Create and/or Delete operations in one
-                // command, DynamoDB doesn't actually allows this, and throws
-                // a LimitExceededException if this is attempted.
-                co_return api_error::limit_exceeded("GlobalSecondaryIndexUpdates only allows one index creation or deletion");
-            }
-            if (gsi_updates->Size() == 1) {
+            rjson::value* stream_specification = rjson::find(request, "StreamSpecification");
+            if (stream_specification && stream_specification->IsObject()) {
                 empty_request = false;
-                if (!(*gsi_updates)[0].IsObject() || (*gsi_updates)[0].MemberCount() != 1) {
-                    co_return api_error::validation("GlobalSecondaryIndexUpdates array must contain one object with a Create, Delete or Update operation");
+                if (add_stream_options(*stream_specification, builder, p.local())) {
+                    validate_cdc_log_name_length(builder.cf_name());
                 }
-                auto it = (*gsi_updates)[0].MemberBegin();
-                const std::string_view op = rjson::to_string_view(it->name);
-                if (!it->value.IsObject()) {
-                    co_return api_error::validation("GlobalSecondaryIndexUpdates entries must be objects");
-                }
-                const rjson::value* index_name_v = rjson::find(it->value, "IndexName");
-                if (!index_name_v || !index_name_v->IsString()) {
-                    co_return api_error::validation("GlobalSecondaryIndexUpdates operation must have IndexName");
-                }
-                std::string_view index_name = rjson::to_string_view(*index_name_v);
-                std::string_view table_name = schema->cf_name();
-                std::string_view keyspace_name = schema->ks_name();
-                std::string vname(view_name(table_name, index_name));
-                if (op == "Create") {
-                    const rjson::value* attribute_definitions = rjson::find(request, "AttributeDefinitions");
-                    if (!attribute_definitions) {
-                        co_return api_error::validation("GlobalSecondaryIndexUpdates Create needs AttributeDefinitions");
-                    }
-                    std::unordered_set<std::string> unused_attribute_definitions =
-                        validate_attribute_definitions(*attribute_definitions);
-                    check_attribute_definitions_conflicts(*attribute_definitions, *schema);
-                    for (auto& view : p.local().data_dictionary().find_column_family(tab).views()) {
-                        check_attribute_definitions_conflicts(*attribute_definitions, *view);
-                    }
-
-                    if (p.local().data_dictionary().has_schema(keyspace_name, vname)) {
-                        // Surprisingly, DynamoDB uses validation error here, not resource_in_use
-                        co_return api_error::validation(fmt::format(
-                            "GSI {} already exists in table {}", index_name, table_name));
-                    }
-                    if (p.local().data_dictionary().has_schema(keyspace_name, lsi_name(table_name, index_name))) {
-                        co_return api_error::validation(fmt::format(
-                            "LSI {} already exists in table {}, can't use same name for GSI", index_name, table_name));
-                    }
-
-                    elogger.trace("Adding GSI {}", index_name);
-                    // FIXME: read and handle "Projection" parameter. This will
-                    // require the MV code to copy just parts of the attrs map.
-                    schema_builder view_builder(keyspace_name, vname);
-                    auto [view_hash_key, view_range_key] = parse_key_schema(it->value);
-                    // If an attribute is already a real column in the base
-                    // table (i.e., a key attribute in the base table or LSI),
-                    // we can use it directly as a view key. Otherwise, we
-                    // need to add it as a "computed column", which extracts
-                    // and deserializes the attribute from the ":attrs" map.
-                    bool view_hash_key_real_column =
-                        schema->get_column_definition(to_bytes(view_hash_key));
-                    add_column(view_builder, view_hash_key, *attribute_definitions, column_kind::partition_key, !view_hash_key_real_column);
-                    unused_attribute_definitions.erase(view_hash_key);
-                    if (!view_range_key.empty()) {
-                        bool view_range_key_real_column =
-                            schema->get_column_definition(to_bytes(view_range_key));
-                        add_column(view_builder, view_range_key, *attribute_definitions, column_kind::clustering_key, !view_range_key_real_column);
-                        if (!schema->get_column_definition(to_bytes(view_range_key)) &&
-                            !schema->get_column_definition(to_bytes(view_hash_key))) {
-                            // FIXME: This warning should go away. See issue #6714
-                            elogger.warn("Only 1 regular column from the base table should be used in the GSI key in order to ensure correct liveness management without assumptions");
+                // Alternator Streams doesn't yet work when the table uses tablets (#23838)
+                auto stream_enabled = rjson::find(*stream_specification, "StreamEnabled");
+                if (stream_enabled && stream_enabled->IsBool()) {
+                    if (stream_enabled->GetBool()) {
+                        if (p.local().local_db().find_keyspace(tab->ks_name()).get_replication_strategy().uses_tablets()) {
+                        co_return api_error::validation("Streams not yet supported on a table using tablets (issue #23838). "
+                            "If you want to enable streams, re-create this table with vnodes (with the tag 'experimental:initial_tablets' set to 'none').");
                         }
-                        unused_attribute_definitions.erase(view_range_key);
-                    }
-                    // Surprisingly, although DynamoDB checks for unused
-                    // AttributeDefinitions in CreateTable, it does not
-                    // check it in UpdateTable. We decided to check anyway.
-                    if (!unused_attribute_definitions.empty()) {
-                        co_return api_error::validation(fmt::format(
-                            "AttributeDefinitions defines spurious attributes not used by any KeySchema: {}",
-                            unused_attribute_definitions));
-                    }
-                    // Base key columns which aren't part of the index's key need to
-                    // be added to the view nonetheless, as (additional) clustering
-                    // key(s).
-                    for (auto& def : schema->primary_key_columns()) {
-                        if  (def.name_as_text() != view_hash_key && def.name_as_text() != view_range_key) {
-                            view_builder.with_column(def.name(), def.type, column_kind::clustering_key);
+                        if (tab->cdc_options().enabled()) {
+                            co_return api_error::validation("Table already has an enabled stream: TableName: " + tab->cf_name());
                         }
                     }
-                    // GSIs have no tags:
-                    view_builder.add_extension(db::tags_extension::NAME, ::make_shared<db::tags_extension>());
-                    // Note below we don't need to add virtual columns, as all
-                    // base columns were copied to view. TODO: reconsider the need
-                    // for virtual columns when we support Projection.
-                    for (const column_definition& regular_cdef : schema->regular_columns()) {
-                        if (!view_builder.has_column(*cql3::to_identifier(regular_cdef))) {
-                            view_builder.with_column(regular_cdef.name(), regular_cdef.type, column_kind::regular_column);
-                        }
+                    else if (!tab->cdc_options().enabled()) {
+                        co_return api_error::validation("Table has no stream to disable: TableName: " + tab->cf_name());
                     }
-                    const bool include_all_columns = true;
-                    view_builder.with_view_info(*schema, include_all_columns, ""/*where clause*/);
-                    new_views.emplace_back(view_builder.build());
-                } else if (op == "Delete") {
-                    elogger.trace("Deleting GSI {}", index_name);
-                    if (!p.local().data_dictionary().has_schema(keyspace_name, vname)) {
-                        co_return api_error::resource_not_found(fmt::format("No GSI {} in table {}", index_name, table_name));
-                    }
-                    dropped_views.emplace_back(vname);
-                } else if (op == "Update") {
-                    co_return api_error::validation("GlobalSecondaryIndexUpdates Update not yet supported");
-                } else {
-                    co_return api_error::validation(fmt::format("GlobalSecondaryIndexUpdates supports a Create, Delete or Update operation, saw '{}'", op));
                 }
             }
-        }
 
-        if (empty_request) {
-            co_return api_error::validation("UpdateTable requires one of GlobalSecondaryIndexUpdates, StreamSpecification or BillingMode to be specified");
-        }
+            schema = builder.build();
+            std::vector<view_ptr> new_views;
+            std::vector<std::string> dropped_views;
 
-        co_await verify_permission(enforce_authorization, client_state_other_shard.get(), schema, auth::permission::ALTER);
-        auto m = co_await service::prepare_column_family_update_announcement(p.local(), schema, std::vector<view_ptr>(), group0_guard.write_timestamp());
-        for (view_ptr view : new_views) {
-            auto m2 = co_await service::prepare_new_view_announcement(p.local(), view, group0_guard.write_timestamp());
-            std::move(m2.begin(), m2.end(), std::back_inserter(m));
-        }
-        for (const std::string& view_name : dropped_views) {
-            auto m2 = co_await service::prepare_view_drop_announcement(p.local(), schema->ks_name(), view_name, group0_guard.write_timestamp());
-            std::move(m2.begin(), m2.end(), std::back_inserter(m));
-        }
-        // If a role is allowed to create a GSI, we should give it permissions
-        // to read the GSI it just created. This is known as "auto-grant".
-        // Also, when we delete a GSI we should revoke any permissions set on
-        // it - so if it's ever created again the old permissions wouldn't be
-        // remembered for the new GSI. This is known as "auto-revoke"
-        if (client_state_other_shard.get().user() && (!new_views.empty() || !dropped_views.empty())) {
-            service::group0_batch mc(std::move(group0_guard));
-            mc.add_mutations(std::move(m));
+            rjson::value* gsi_updates = rjson::find(request, "GlobalSecondaryIndexUpdates");
+            if (gsi_updates) {
+                if (!gsi_updates->IsArray()) {
+                    co_return api_error::validation("GlobalSecondaryIndexUpdates must be an array");
+                }
+                if (gsi_updates->Size() > 1) {
+                    // Although UpdateTable takes an array of operations and could
+                    // support multiple Create and/or Delete operations in one
+                    // command, DynamoDB doesn't actually allows this, and throws
+                    // a LimitExceededException if this is attempted.
+                    co_return api_error::limit_exceeded("GlobalSecondaryIndexUpdates only allows one index creation or deletion");
+                }
+                if (gsi_updates->Size() == 1) {
+                    empty_request = false;
+                    if (!(*gsi_updates)[0].IsObject() || (*gsi_updates)[0].MemberCount() != 1) {
+                        co_return api_error::validation("GlobalSecondaryIndexUpdates array must contain one object with a Create, Delete or Update operation");
+                    }
+                    auto it = (*gsi_updates)[0].MemberBegin();
+                    const std::string_view op = rjson::to_string_view(it->name);
+                    if (!it->value.IsObject()) {
+                        co_return api_error::validation("GlobalSecondaryIndexUpdates entries must be objects");
+                    }
+                    const rjson::value* index_name_v = rjson::find(it->value, "IndexName");
+                    if (!index_name_v || !index_name_v->IsString()) {
+                        co_return api_error::validation("GlobalSecondaryIndexUpdates operation must have IndexName");
+                    }
+                    std::string_view index_name = rjson::to_string_view(*index_name_v);
+                    std::string_view table_name = schema->cf_name();
+                    std::string_view keyspace_name = schema->ks_name();
+                    std::string vname(view_name(table_name, index_name));
+                    if (op == "Create") {
+                        const rjson::value* attribute_definitions = rjson::find(request, "AttributeDefinitions");
+                        if (!attribute_definitions) {
+                            co_return api_error::validation("GlobalSecondaryIndexUpdates Create needs AttributeDefinitions");
+                        }
+                        std::unordered_set<std::string> unused_attribute_definitions =
+                            validate_attribute_definitions("GlobalSecondaryIndexUpdates", *attribute_definitions);
+                        check_attribute_definitions_conflicts(*attribute_definitions, *schema);
+                        for (auto& view : p.local().data_dictionary().find_column_family(tab).views()) {
+                            check_attribute_definitions_conflicts(*attribute_definitions, *view);
+                        }
+
+                        if (p.local().data_dictionary().has_schema(keyspace_name, vname)) {
+                            // Surprisingly, DynamoDB uses validation error here, not resource_in_use
+                            co_return api_error::validation(fmt::format(
+                                "GSI {} already exists in table {}", index_name, table_name));
+                        }
+                        if (p.local().data_dictionary().has_schema(keyspace_name, lsi_name(table_name, index_name, false))) {
+                            co_return api_error::validation(fmt::format(
+                                "LSI {} already exists in table {}, can't use same name for GSI", index_name, table_name));
+                        }
+
+                        elogger.trace("Adding GSI {}", index_name);
+                        // FIXME: read and handle "Projection" parameter. This will
+                        // require the MV code to copy just parts of the attrs map.
+                        schema_builder view_builder(keyspace_name, vname);
+                        auto [view_hash_key, view_range_key] = parse_key_schema(it->value, "GlobalSecondaryIndexUpdates");
+                        // If an attribute is already a real column in the base
+                        // table (i.e., a key attribute in the base table),
+                        // we can use it directly as a view key. Otherwise, we
+                        // need to add it as a "computed column", which extracts
+                        // and deserializes the attribute from the ":attrs" map.
+                        bool view_hash_key_real_column =
+                            schema->get_column_definition(to_bytes(view_hash_key));
+                        add_column(view_builder, view_hash_key, *attribute_definitions, column_kind::partition_key, !view_hash_key_real_column);
+                        unused_attribute_definitions.erase(view_hash_key);
+                        if (!view_range_key.empty()) {
+                            bool view_range_key_real_column =
+                                schema->get_column_definition(to_bytes(view_range_key));
+                            add_column(view_builder, view_range_key, *attribute_definitions, column_kind::clustering_key, !view_range_key_real_column);
+                            if (!schema->get_column_definition(to_bytes(view_range_key)) &&
+                                !schema->get_column_definition(to_bytes(view_hash_key))) {
+                                // FIXME: This warning should go away. See issue #6714
+                                elogger.warn("Only 1 regular column from the base table should be used in the GSI key in order to ensure correct liveness management without assumptions");
+                            }
+                            unused_attribute_definitions.erase(view_range_key);
+                        }
+                        // Surprisingly, although DynamoDB checks for unused
+                        // AttributeDefinitions in CreateTable, it does not
+                        // check it in UpdateTable. We decided to check anyway.
+                        if (!unused_attribute_definitions.empty()) {
+                            co_return api_error::validation(fmt::format(
+                                "AttributeDefinitions defines spurious attributes not used by any KeySchema: {}",
+                                unused_attribute_definitions));
+                        }
+                        // Base key columns which aren't part of the index's key need to
+                        // be added to the view nonetheless, as (additional) clustering
+                        // key(s).
+                        for (auto& def : schema->primary_key_columns()) {
+                            if  (def.name_as_text() != view_hash_key && def.name_as_text() != view_range_key) {
+                                view_builder.with_column(def.name(), def.type, column_kind::clustering_key);
+                            }
+                        }
+                        // GSIs have no tags:
+                        view_builder.add_extension(db::tags_extension::NAME, ::make_shared<db::tags_extension>());
+                        // Note below we don't need to add virtual columns, as all
+                        // base columns were copied to view. TODO: reconsider the need
+                        // for virtual columns when we support Projection.
+                        for (const column_definition& regular_cdef : schema->regular_columns()) {
+                            if (!view_builder.has_column(*cql3::to_identifier(regular_cdef))) {
+                                view_builder.with_column(regular_cdef.name(), regular_cdef.type, column_kind::regular_column);
+                            }
+                        }
+                        const bool include_all_columns = true;
+                        view_builder.with_view_info(schema, include_all_columns, ""/*where clause*/);
+                        new_views.emplace_back(view_builder.build());
+                    } else if (op == "Delete") {
+                        elogger.trace("Deleting GSI {}", index_name);
+                        if (!p.local().data_dictionary().has_schema(keyspace_name, vname)) {
+                            co_return api_error::resource_not_found(fmt::format("No GSI {} in table {}", index_name, table_name));
+                        }
+                        dropped_views.emplace_back(vname);
+                    } else if (op == "Update") {
+                        co_return api_error::validation("GlobalSecondaryIndexUpdates Update not yet supported");
+                    } else {
+                        co_return api_error::validation(fmt::format("GlobalSecondaryIndexUpdates supports a Create, Delete or Update operation, saw '{}'", op));
+                    }
+                }
+            }
+
+            if (empty_request) {
+                co_return api_error::validation("UpdateTable requires one of GlobalSecondaryIndexUpdates, StreamSpecification or BillingMode to be specified");
+            }
+
+            co_await verify_permission(enforce_authorization, warn_authorization, client_state_other_shard.get(), schema, auth::permission::ALTER, e.local()._stats);
+            auto m = co_await service::prepare_column_family_update_announcement(p.local(), schema, std::vector<view_ptr>(), group0_guard.write_timestamp());
             for (view_ptr view : new_views) {
-                auto resource = auth::make_data_resource(view->ks_name(), view->cf_name());
-                co_await auth::grant_applicable_permissions(
-                    *client_state_other_shard.get().get_auth_service(), *client_state_other_shard.get().user(), resource, mc);
+                auto m2 = co_await service::prepare_new_view_announcement(p.local(), view, group0_guard.write_timestamp());
+                std::move(m2.begin(), m2.end(), std::back_inserter(m));
             }
-            for (const auto& view_name : dropped_views) {
-                auto resource = auth::make_data_resource(schema->ks_name(), view_name);
-                co_await auth::revoke_all(*client_state_other_shard.get().get_auth_service(), resource, mc);
+            for (const std::string& view_name : dropped_views) {
+                auto m2 = co_await service::prepare_view_drop_announcement(p.local(), schema->ks_name(), view_name, group0_guard.write_timestamp());
+                std::move(m2.begin(), m2.end(), std::back_inserter(m));
+            }
+            // If a role is allowed to create a GSI, we should give it permissions
+            // to read the GSI it just created. This is known as "auto-grant".
+            // Also, when we delete a GSI we should revoke any permissions set on
+            // it - so if it's ever created again the old permissions wouldn't be
+            // remembered for the new GSI. This is known as "auto-revoke"
+            if (client_state_other_shard.get().user() && (!new_views.empty() || !dropped_views.empty())) {
+                service::group0_batch mc(std::move(group0_guard));
+                mc.add_mutations(std::move(m));
+                for (view_ptr view : new_views) {
+                    auto resource = auth::make_data_resource(view->ks_name(), view->cf_name());
+                    co_await auth::grant_applicable_permissions(
+                        *client_state_other_shard.get().get_auth_service(), *client_state_other_shard.get().user(), resource, mc);
+                }
+                for (const auto& view_name : dropped_views) {
+                    auto resource = auth::make_data_resource(schema->ks_name(), view_name);
+                    co_await auth::revoke_all(*client_state_other_shard.get().get_auth_service(), resource, mc);
+                }
+                std::tie(m, group0_guard) = co_await std::move(mc).extract();
+            }
+            try {
+                co_await mm.announce(std::move(m), std::move(group0_guard), format("alternator-executor: update {} table", tab->cf_name()));
+                break;
+            } catch (const service::group0_concurrent_modification& ex) {
+                elogger.info("Failed to execute UpdateTable {} due to concurrent schema modifications. {}.",
+                        tab->cf_name(), retries ? "Retrying" : "Number of retries exceeded, giving up");
+                if (retries--) {
+                    continue;
+                }
+                throw;
+            }
         }
-            std::tie(m, group0_guard) = co_await std::move(mc).extract();
-        }
-
-        co_await mm.announce(std::move(m), std::move(group0_guard), format("alternator-executor: update {} table", tab->cf_name()));
-
         co_await mm.wait_for_schema_agreement(p.local().local_db(), db::timeout_clock::now() + 10s, nullptr);
 
         rjson::value status = rjson::empty_object();
         supplement_table_info(request, *schema, p.local());
         rjson::add(status, "TableDescription", std::move(request));
-        co_return make_jsonable(std::move(status));
+        co_return rjson::print(std::move(status));
     });
 }
 
@@ -1950,6 +2242,12 @@ public:
     uint64_t length_in_bytes() const noexcept {
         return _length_in_bytes;
     }
+    void set_length_in_bytes(uint64_t length) noexcept {
+        _length_in_bytes = length;
+    }
+    bool is_put_item() noexcept {
+        return _cells.has_value();
+    }
 };
 
 put_or_delete_item::put_or_delete_item(const rjson::value& key, schema_ptr schema, delete_item)
@@ -1991,9 +2289,9 @@ std::unordered_map<bytes, std::string> si_key_attributes(data_dictionary::table 
     return ret;
 }
 
-// When an attribute is a key (hash or sort) of one of the GSIs on a table,
-// DynamoDB refuses an update to that attribute with an unsuitable value.
-// Unsuitable values are:
+// When an attribute is a key (hash or sort) of one of the GSIs or LSIs on a
+// table, DynamoDB refuses an update to that attribute with an unsuitable
+// value. Unsuitable values are:
 //   1. An empty string (those are normally allowed as values, but not allowed
 //      as keys, including GSI keys).
 //   2. A value with a type different than that declared for the GSI key.
@@ -2009,9 +2307,9 @@ std::unordered_map<bytes, std::string> si_key_attributes(data_dictionary::table 
 // thrown. The checking here is similar to the checking done in
 // get_key_from_typed_value() for the base table's key columns.
 //
-// validate_value_if_gsi_key() should only be called after validate_value()
+// validate_value_if_index_key() should only be called after validate_value()
 // already validated that the value itself has a valid form.
-static inline void validate_value_if_gsi_key(
+static inline void validate_value_if_index_key(
         std::unordered_map<bytes, std::string> key_attributes,
         const bytes& attribute,
         const rjson::value& value) {
@@ -2031,13 +2329,13 @@ static inline void validate_value_if_gsi_key(
     std::string_view value_type = rjson::to_string_view(value.MemberBegin()->name);
     if (expected_type != value_type) {
         throw api_error::validation(fmt::format(
-            "Type mismatch: expected type {} for GSI key attribute {}, got type {}",
+            "Type mismatch: expected type {} for GSI or LSI key attribute {}, got type {}",
             expected_type, to_string_view(attribute), value_type));
     }
     std::string_view value_content = rjson::to_string_view(value.MemberBegin()->value);
     if (value_content.empty()) {
         throw api_error::validation(fmt::format(
-            "GSI key attribute {} cannot be set to an empty string", to_string_view(attribute)));
+            "GSI or LSI key attribute {} cannot be set to an empty string", to_string_view(attribute)));
     }
 }
 
@@ -2049,11 +2347,12 @@ put_or_delete_item::put_or_delete_item(const rjson::value& item, schema_ptr sche
         bytes column_name = to_bytes(it->name.GetString());
         validate_value(it->value, "PutItem");
         const column_definition* cdef = find_attribute(*schema, column_name);
+        validate_attr_name_length("", column_name.size(), cdef && cdef->is_primary_key());
         _length_in_bytes += column_name.size();
         if (!cdef) {
-            // This attribute may be a key column of one of the GSI, in which
-            // case there are some limitations on the value
-            validate_value_if_gsi_key(key_attributes, column_name, it->value);
+            // This attribute may be a key column of one of the GSI or LSI,
+            // in which case there are some limitations on the value.
+            validate_value_if_index_key(key_attributes, column_name, it->value);
             bytes value = serialize_item(it->value);
             if (value.size()) {
                 // ScyllaDB uses one extra byte compared to DynamoDB for the bytes length
@@ -2061,10 +2360,11 @@ put_or_delete_item::put_or_delete_item(const rjson::value& item, schema_ptr sche
             }
             _cells->push_back({std::move(column_name), serialize_item(it->value)});
         } else if (!cdef->is_primary_key()) {
-            // Fixed-type regular column can be used for LSI key
+            // Fixed-type regular columns were used for LSIs and also (in the
+            // slightly more distant past) GSIs, before they were moved to
+            // :attrs. We keep this branch for backward compatibility.
             bytes value = get_key_from_typed_value(it->value, *cdef);
-            _cells->push_back({std::move(column_name),
-                    value});
+            _cells->push_back({std::move(column_name), value});
             if (value.size()) {
                 // ScyllaDB uses one extra byte compared to DynamoDB for the bytes length
                 _length_in_bytes += value.size() - 1;
@@ -2108,23 +2408,39 @@ mutation put_or_delete_item::build(schema_ptr schema, api::timestamp_type ts) co
             row.cells().apply(*cdef, atomic_cell::make_live(*cdef->type, ts, std::move(c.value)));
         }
     }
+    auto attrs = attrs_column(*schema);
     if (!attrs_collector.empty()) {
         auto serialized_map = attrs_collector.to_mut().serialize(*attrs_type());
-        row.cells().apply(attrs_column(*schema), std::move(serialized_map));
+        row.cells().apply(attrs, std::move(serialized_map));
     }
     // To allow creation of an item with no attributes, we need a row marker.
     row.apply(row_marker(ts));
     // PutItem is supposed to completely replace the old item, so we need to
-    // also have a tombstone removing old cells. We can't use the timestamp
-    // ts, because when data and tombstone tie on timestamp, the tombstone
-    // wins. So we need to use ts-1. Note that we use this trick also in
-    // Scylla proper, to implement the operation to replace an entire
-    // collection ("UPDATE .. SET x = ..") - see
-    // cql3::update_parameters::make_tombstone_just_before().
-    if (use_partition_tombstone) {
-        m.partition().apply(tombstone(ts-1, gc_clock::now()));
-    } else {
-        row.apply(tombstone(ts-1, gc_clock::now()));
+    // also have a tombstone removing old cells. Important points:
+    // 1) Alternator's schema is dynamic, therefore we store data in a map
+    //    in column :attrs. Since we're replacing a row, invalidating only
+    //    :attrs is enough. Alternator base tables also had columns for LSI
+    //    keys and GSI keys. New tables no longer have such columns, but old
+    //    tables created in the past may still have them.
+    // 2) We use a collection tombstone for the :attrs column instead of a row
+    //    tombstone. While a row tombstone would also replace the data, it has
+    //    an undesirable side effect for CDC, which would report it as a
+    //    separate deletion event. To model PutItem's "replace" semantic, we
+    //    leverage a corner case: a collection tombstone at ts-1 paired with an
+    //    upsert at ts is not reported by CDC as a separate REMOVE event. We
+    //    can't use the timestamp ts, because when data and tombstone tie on
+    //    timestamp, the tombstone wins. These tricks were introduced in
+    //    Scylla to handle collection replacements in CQL (see #6084, PR #6491,
+    //    e.g. cql3::maps::setter::execute()) and we utilize it to avoid
+    //    emitting the REMOVE event (resolving #6930).
+    row.cells().apply(attrs, collection_mutation_description{tombstone{ts - 1, gc_clock::now()}}.serialize(*attrs.type));
+    // Note that for old tables created with regular LSI and GSI key columns,
+    // we must also delete the regular columns that are not part of the new
+    // schema consisting of pk, ck, and :attrs.
+    for (const auto& cdef : schema->regular_columns()) {
+        if (cdef.name_as_text() != executor::ATTRS_COLUMN_NAME) {
+            row.cells().apply(cdef, atomic_cell::make_dead(ts - 1, gc_clock::now()));
+        }
     }
     return m;
 }
@@ -2137,15 +2453,6 @@ thread_local utils::updateable_value<uint32_t> executor::s_default_timeout_in_ms
 db::timeout_clock::time_point executor::default_timeout() {
     return db::timeout_clock::now() + std::chrono::milliseconds(s_default_timeout_in_ms);
 }
-
-static future<std::unique_ptr<rjson::value>> get_previous_item(
-        service::storage_proxy& proxy,
-        service::client_state& client_state,
-        schema_ptr schema,
-        const partition_key& pk,
-        const clustering_key& ck,
-        service_permit permit,
-        alternator::stats& stats);
 
 static lw_shared_ptr<query::read_command> previous_item_read_command(service::storage_proxy& proxy,
         schema_ptr schema,
@@ -2161,7 +2468,7 @@ static lw_shared_ptr<query::read_command> previous_item_read_command(service::st
     // wildcard selection...) but here we read the entire item anyway. We
     // should take the column list from selection instead of building it here.
     auto regular_columns =
-            schema->regular_columns() | std::views::transform([] (const column_definition& cdef) { return cdef.id; })
+            schema->regular_columns() | std::views::transform(&column_definition::id)
             |  std::ranges::to<query::column_id_vector>();
     auto partition_slice = query::partition_slice(std::move(bounds), {}, std::move(regular_columns), selection->get_query_options());
     return ::make_lw_shared<query::read_command>(schema->id(), schema->version(), partition_slice, proxy.get_max_result_size(partition_slice),
@@ -2223,7 +2530,7 @@ rmw_operation::parse_returnvalues_on_condition_check_failure(const rjson::value&
 
 rmw_operation::rmw_operation(service::storage_proxy& proxy, rjson::value&& request)
     : _request(std::move(request))
-    , _schema(get_table(proxy, _request))
+    , _schema(get_table_for_write(proxy, _request))
     , _write_isolation(get_write_isolation_for_schema(_schema))
     , _consumed_capacity(_request)
     , _returnvalues(parse_returnvalues(_request))
@@ -2234,7 +2541,7 @@ rmw_operation::rmw_operation(service::storage_proxy& proxy, rjson::value&& reque
     // the request).
 }
 
-std::optional<mutation> rmw_operation::apply(foreign_ptr<lw_shared_ptr<query::result>> qr, const query::partition_slice& slice, api::timestamp_type ts) {
+std::optional<mutation> rmw_operation::apply(foreign_ptr<lw_shared_ptr<query::result>> qr, const query::partition_slice& slice, api::timestamp_type ts, cdc::per_request_options& cdc_opts) {
     if (qr->row_count()) {
         auto selection = cql3::selection::selection::wildcard(_schema);
         uint64_t item_length = 0;
@@ -2243,16 +2550,31 @@ std::optional<mutation> rmw_operation::apply(foreign_ptr<lw_shared_ptr<query::re
             _consumed_capacity._total_bytes = item_length;
         }
         if (previous_item) {
-            return apply(std::make_unique<rjson::value>(std::move(*previous_item)), ts);
+            if (should_fill_preimage()) {
+                cdc_opts.preimage = make_lw_shared<cql3::untyped_result_set>(*_schema, std::move(qr), *selection, slice);
+            }
+            return apply(std::make_unique<rjson::value>(std::move(*previous_item)), ts, cdc_opts);
         }
     }
-    return apply(std::unique_ptr<rjson::value>(), ts);
+    return apply(std::unique_ptr<rjson::value>(), ts, cdc_opts);
 }
 
 rmw_operation::write_isolation rmw_operation::get_write_isolation_for_schema(schema_ptr schema) {
-    const auto& tags = get_tags_of_table_or_throw(schema);
-    auto it = tags.find(WRITE_ISOLATION_TAG_KEY);
-    if (it == tags.end() || it->second.empty()) {
+    const auto tags_ptr = db::get_tags_of_table(schema);
+    if (!tags_ptr) {
+        // Tags missing entirely from this table. This can't happen for a
+        // normal Alternator table, but can happen if get_table_for_write()
+        // allowed writing to a non-Alternator table (e.g., an internal table).
+        // If it is a system table, LWT will not work (and is also pointless
+        // for non-distributed tables), so use UNSAFE_RMW.
+        if(is_internal_keyspace(schema->ks_name())) {
+            return write_isolation::UNSAFE_RMW;
+        } else {
+            return default_write_isolation;
+        }
+    }
+    auto it = tags_ptr->find(WRITE_ISOLATION_TAG_KEY);
+    if (it == tags_ptr->end() || it->second.empty()) {
         return default_write_isolation;
     }
     return parse_write_isolation(it->second);
@@ -2261,12 +2583,15 @@ rmw_operation::write_isolation rmw_operation::get_write_isolation_for_schema(sch
 // shard_for_execute() checks whether execute() must be called on a specific
 // other shard. Running execute() on a specific shard is necessary only if it
 // will use LWT (storage_proxy::cas()). This is because cas() can only be
-// called on the specific shard owning (as per cas_shard()) _pk's token.
+// called on the specific shard owning (as per get_cas_shard()) _pk's token.
 // Knowing if execute() will call cas() or not may depend on whether there is
 // a read-before-write, but not just on it - depending on configuration,
 // execute() may unconditionally use cas() for every write. Unfortunately,
 // this requires duplicating here a bit of logic from execute().
-std::optional<shard_id> rmw_operation::shard_for_execute(bool needs_read_before_write) {
+// The returned cas_shard must be passed to execute() to ensure
+// the tablet shard won't change. The caller must hold the returned object for
+// the duration of execution, even if we were already on the right shard - so it doesn't move.
+std::optional<service::cas_shard> rmw_operation::shard_for_execute(bool needs_read_before_write) {
     if (_write_isolation == write_isolation::FORBID_RMW ||
         (_write_isolation == write_isolation::LWT_RMW_ONLY && !needs_read_before_write) ||
         _write_isolation == write_isolation::UNSAFE_RMW) {
@@ -2274,12 +2599,8 @@ std::optional<shard_id> rmw_operation::shard_for_execute(bool needs_read_before_
     }
     // If we're still here, cas() *will* be called by execute(), so let's
     // find the appropriate shard to run it on:
-    auto token = dht::get_token(*_schema, _pk);
-    auto desired_shard = service::storage_proxy::cas_shard(*_schema, token);
-    if (desired_shard == this_shard_id()) {
-        return {};
-    }
-    return desired_shard;
+    const auto token = dht::get_token(*_schema, _pk);
+    return service::cas_shard(*_schema, token);
 }
 
 // Build the return value from the different RMW operations (UpdateItem,
@@ -2288,29 +2609,27 @@ std::optional<shard_id> rmw_operation::shard_for_execute(bool needs_read_before_
 static future<executor::request_return_type> rmw_operation_return(rjson::value&& attributes, const consumed_capacity_counter& consumed_capacity, uint64_t& metric) {
     rjson::value ret = rjson::empty_object();
     consumed_capacity.add_consumed_capacity_to_response_if_needed(ret);
-    metric += consumed_capacity.get_half_units();
+    metric += consumed_capacity.get_consumed_capacity_units();
     if (!attributes.IsNull()) {
         rjson::add(ret, "Attributes", std::move(attributes));
     }
-    return make_ready_future<executor::request_return_type>(make_jsonable(std::move(ret)));
+    return make_ready_future<executor::request_return_type>(rjson::print(std::move(ret)));
 }
 
 static future<std::unique_ptr<rjson::value>> get_previous_item(
-        service::storage_proxy& proxy,
-        service::client_state& client_state,
-        schema_ptr schema,
-        const partition_key& pk,
-        const clustering_key& ck,
-        service_permit permit,
-        alternator::stats& stats,
-        uint64_t& item_length)
-{
-    stats.reads_before_write++;
-    auto selection = cql3::selection::selection::wildcard(schema);
-    auto command = previous_item_read_command(proxy, schema, ck, selection);
-    command->allow_limit = db::allow_per_partition_rate_limit::yes;
-    auto cl = db::consistency_level::LOCAL_QUORUM;
-    return proxy.query(schema, command, to_partition_ranges(*schema, pk), cl, service::storage_proxy::coordinator_query_options(executor::default_timeout(), std::move(permit), client_state)).then(
+            service::storage_proxy& proxy,
+            service::client_state& client_state,
+            schema_ptr schema,
+            const partition_key& pk,
+            const clustering_key& ck,
+            service_permit permit,
+            db::consistency_level cl,
+            uint64_t& item_length)
+    {
+        auto selection = cql3::selection::selection::wildcard(schema);
+        auto command = previous_item_read_command(proxy, schema, ck, selection);
+        command->allow_limit = db::allow_per_partition_rate_limit::yes;
+        return proxy.query(schema, command, to_partition_ranges(*schema, pk), cl, service::storage_proxy::coordinator_query_options(executor::default_timeout(), std::move(permit), client_state)).then(
             [schema, command, selection = std::move(selection), &item_length] (service::storage_proxy::coordinator_query_result qr) {
         auto previous_item = executor::describe_single_item(schema, command->slice, *selection, *qr.query_result, {}, &item_length);
         if (previous_item) {
@@ -2321,49 +2640,88 @@ static future<std::unique_ptr<rjson::value>> get_previous_item(
     });
 }
 
+static future<std::unique_ptr<rjson::value>> get_previous_item(
+        service::storage_proxy& proxy,
+        service::client_state& client_state,
+        schema_ptr schema,
+        const partition_key& pk,
+        const clustering_key& ck,
+        service_permit permit,
+        alternator::stats& global_stats,
+        alternator::stats& per_table_stats,
+        uint64_t& item_length)
+{
+    global_stats.reads_before_write++;
+    per_table_stats.reads_before_write++;
+    return get_previous_item(proxy, client_state, schema, pk, ck, permit, db::consistency_level::LOCAL_QUORUM, item_length);
+}
+
+static future<uint64_t> get_previous_item_size(
+            service::storage_proxy& proxy,
+            service::client_state& client_state,
+            schema_ptr schema,
+            const partition_key& pk,
+            const clustering_key& ck,
+            service_permit permit) {
+    uint64_t item_length = 0;
+    // The use of get_previous_item here is for DynamoDB calculation compatibility mode,
+    // and the actual value is ignored. For performance reasons, we use CL_LOCAL_ONE.
+    co_await  get_previous_item(proxy, client_state, schema, pk, ck, permit, db::consistency_level::LOCAL_ONE, item_length);
+    co_return item_length;
+}
+
 future<executor::request_return_type> rmw_operation::execute(service::storage_proxy& proxy,
+        std::optional<service::cas_shard> cas_shard,
         service::client_state& client_state,
         tracing::trace_state_ptr trace_state,
         service_permit permit,
         bool needs_read_before_write,
-        stats& stats,
+        stats& global_stats,
+        stats& per_table_stats,
         uint64_t& wcu_total) {
+    auto cdc_opts = cdc::per_request_options{};
     if (needs_read_before_write) {
         if (_write_isolation == write_isolation::FORBID_RMW) {
             throw api_error::validation("Read-modify-write operations are disabled by 'forbid_rmw' write isolation policy. Refer to https://github.com/scylladb/scylla/blob/master/docs/alternator/alternator.md#write-isolation-policies for more information.");
         }
-        stats.reads_before_write++;
+        global_stats.reads_before_write++;
+        per_table_stats.reads_before_write++;
         if (_write_isolation == write_isolation::UNSAFE_RMW) {
             // This is the old, unsafe, read before write which does first
             // a read, then a write. TODO: remove this mode entirely.
-            return get_previous_item(proxy, client_state, schema(), _pk, _ck, permit, stats, _consumed_capacity._total_bytes).then(
-                    [this, &proxy, &wcu_total, trace_state, permit = std::move(permit)] (std::unique_ptr<rjson::value> previous_item) mutable {
-                std::optional<mutation> m = apply(std::move(previous_item), api::new_timestamp());
+            return get_previous_item(proxy, client_state, schema(), _pk, _ck, permit, global_stats, per_table_stats, _consumed_capacity._total_bytes).then(
+                    [this, &proxy, &wcu_total, trace_state, permit = std::move(permit), cdc_opts = std::move(cdc_opts)] (std::unique_ptr<rjson::value> previous_item) mutable {
+                std::optional<mutation> m = apply(std::move(previous_item), api::new_timestamp(), cdc_opts);
                 if (!m) {
                     return make_ready_future<executor::request_return_type>(api_error::conditional_check_failed("The conditional request failed", std::move(_return_attributes)));
                 }
-                return proxy.mutate(std::vector<mutation>{std::move(*m)}, db::consistency_level::LOCAL_QUORUM, executor::default_timeout(), trace_state, std::move(permit), db::allow_per_partition_rate_limit::yes).then([this,&wcu_total] () mutable {
+                return proxy.mutate(utils::chunked_vector<mutation>{std::move(*m)}, db::consistency_level::LOCAL_QUORUM, executor::default_timeout(), trace_state, std::move(permit), db::allow_per_partition_rate_limit::yes, false, std::move(cdc_opts)).then([this,&wcu_total] () mutable {
                     return rmw_operation_return(std::move(_return_attributes), _consumed_capacity, wcu_total);
                 });
             });
         }
     } else if (_write_isolation != write_isolation::LWT_ALWAYS) {
-        std::optional<mutation> m = apply(nullptr, api::new_timestamp());
+        std::optional<mutation> m = apply(nullptr, api::new_timestamp(), cdc_opts);
         SCYLLA_ASSERT(m); // !needs_read_before_write, so apply() did not check a condition
-        return proxy.mutate(std::vector<mutation>{std::move(*m)}, db::consistency_level::LOCAL_QUORUM, executor::default_timeout(), trace_state, std::move(permit), db::allow_per_partition_rate_limit::yes).then([this, &wcu_total] () mutable {
+        return proxy.mutate(utils::chunked_vector<mutation>{std::move(*m)}, db::consistency_level::LOCAL_QUORUM, executor::default_timeout(), trace_state, std::move(permit), db::allow_per_partition_rate_limit::yes, false, std::move(cdc_opts)).then([this, &wcu_total] () mutable {
             return rmw_operation_return(std::move(_return_attributes), _consumed_capacity, wcu_total);
         });
     }
+    if (!cas_shard) {
+        on_internal_error(elogger, "cas_shard is not set");
+    }
+
     // If we're still here, we need to do this write using LWT:
-    stats.write_using_lwt++;
+    global_stats.write_using_lwt++;
+    per_table_stats.write_using_lwt++;
     auto timeout = executor::default_timeout();
     auto selection = cql3::selection::selection::wildcard(schema());
     auto read_command = needs_read_before_write ?
             previous_item_read_command(proxy, schema(), _ck, selection) :
             nullptr;
-    return proxy.cas(schema(), shared_from_this(), read_command, to_partition_ranges(*schema(), _pk),
+    return proxy.cas(schema(), std::move(*cas_shard), shared_from_this(), read_command, to_partition_ranges(*schema(), _pk),
             {timeout, std::move(permit), client_state, trace_state},
-            db::consistency_level::LOCAL_SERIAL, db::consistency_level::LOCAL_QUORUM, timeout, timeout).then([this, read_command, &wcu_total] (bool is_applied) mutable {
+            db::consistency_level::LOCAL_SERIAL, db::consistency_level::LOCAL_QUORUM, timeout, timeout, true, std::move(cdc_opts)).then([this, read_command, &wcu_total] (bool is_applied) mutable {
         if (!is_applied) {
             return make_ready_future<executor::request_return_type>(api_error::conditional_check_failed("The conditional request failed", std::move(_return_attributes)));
         }
@@ -2371,7 +2729,7 @@ future<executor::request_return_type> rmw_operation::execute(service::storage_pr
     });
 }
 
-static parsed::condition_expression get_parsed_condition_expression(rjson::value& request) {
+static parsed::condition_expression get_parsed_condition_expression(parsed::expression_cache& parsed_expression_cache, rjson::value& request) {
     rjson::value* condition_expression = rjson::find(request, "ConditionExpression");
     if (!condition_expression) {
         // Returning an empty() condition_expression means no condition.
@@ -2384,7 +2742,7 @@ static parsed::condition_expression get_parsed_condition_expression(rjson::value
         throw api_error::validation("ConditionExpression must not be empty");
     }
     try {
-        return parse_condition_expression(rjson::to_string_view(*condition_expression), "ConditionExpression");
+        return parsed_expression_cache.parse_condition_expression(rjson::to_string_view(*condition_expression), "ConditionExpression");
     } catch(expressions_syntax_error& e) {
         throw api_error::validation(e.what());
     }
@@ -2418,7 +2776,7 @@ private:
     put_or_delete_item _mutation_builder;
 public:
     parsed::condition_expression _condition_expression;
-    put_item_operation(service::storage_proxy& proxy, rjson::value&& request)
+    put_item_operation(parsed::expression_cache& parsed_expression_cache, service::storage_proxy& proxy, rjson::value&& request)
         : rmw_operation(proxy, std::move(request))
         , _mutation_builder(rjson::get(_request, "Item"), schema(), put_or_delete_item::put_item{},
             si_key_attributes(proxy.data_dictionary().find_table(schema()->ks_name(), schema()->cf_name()))) {
@@ -2427,7 +2785,7 @@ public:
         if (_returnvalues != returnvalues::NONE && _returnvalues != returnvalues::ALL_OLD) {
             throw api_error::validation(format("PutItem supports only NONE or ALL_OLD for ReturnValues"));
         }
-        _condition_expression = get_parsed_condition_expression(_request);
+        _condition_expression = get_parsed_condition_expression(parsed_expression_cache, _request);
         const rjson::value* expression_attribute_names = rjson::find(_request, "ExpressionAttributeNames");
         const rjson::value* expression_attribute_values = rjson::find(_request, "ExpressionAttributeValues");
         if (!_condition_expression.empty()) {
@@ -2453,7 +2811,7 @@ public:
                check_needs_read_before_write(_condition_expression) ||
                _returnvalues == returnvalues::ALL_OLD;
     }
-    virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, api::timestamp_type ts) const override {
+    virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, api::timestamp_type ts, cdc::per_request_options& cdc_opts) const override {
         if (!verify_expected(_request, previous_item.get()) ||
             !verify_condition_expression(_condition_expression, previous_item.get())) {
             if (previous_item && _returnvalues_on_condition_check_failure ==
@@ -2480,31 +2838,39 @@ future<executor::request_return_type> executor::put_item(client_state& client_st
     auto start_time = std::chrono::steady_clock::now();
     elogger.trace("put_item {}", request);
 
-    auto op = make_shared<put_item_operation>(_proxy, std::move(request));
+    auto op = make_shared<put_item_operation>(*_parsed_expression_cache, _proxy, std::move(request));
     tracing::add_table_name(trace_state, op->schema()->ks_name(), op->schema()->cf_name());
     const bool needs_read_before_write = op->needs_read_before_write();
 
-    co_await verify_permission(_enforce_authorization, client_state, op->schema(), auth::permission::MODIFY);
+    co_await verify_permission(_enforce_authorization, _warn_authorization, client_state, op->schema(), auth::permission::MODIFY, _stats);
 
-    if (auto shard = op->shard_for_execute(needs_read_before_write); shard) {
+    auto cas_shard = op->shard_for_execute(needs_read_before_write);
+
+    if (cas_shard && !cas_shard->this_shard()) {
         _stats.api_operations.put_item--; // uncount on this shard, will be counted in other shard
         _stats.shard_bounce_for_lwt++;
-        co_return co_await container().invoke_on(*shard, _ssg,
+        co_return co_await container().invoke_on(cas_shard->shard(), _ssg,
                 [request = std::move(*op).move_request(), cs = client_state.move_to_other_shard(), gt = tracing::global_trace_state_ptr(trace_state), permit = std::move(permit)]
                 (executor& e) mutable {
             return do_with(cs.get(), [&e, request = std::move(request), trace_state = tracing::trace_state_ptr(gt)]
                                      (service::client_state& client_state) mutable {
-                //FIXME: A corresponding FIXME can be found in transport/server.cc when a message must be bounced
-                // to another shard - once it is solved, this place can use a similar solution. Instead of passing
-                // empty_service_permit() to the background operation, the current permit's lifetime should be prolonged,
-                // so that it's destructed only after all background operations are finished as well.
+                //FIXME: Instead of passing empty_service_permit() to the background operation,
+                // the current permit's lifetime should be prolonged, so that it's destructed
+                // only after all background operations are finished as well.
                 return e.put_item(client_state, std::move(trace_state), empty_service_permit(), std::move(request));
             });
         });
     }
-    co_return co_await op->execute(_proxy, client_state, trace_state, std::move(permit), needs_read_before_write, _stats, _stats.wcu_total[stats::wcu_types::PUT_ITEM]).finally([op, start_time, this] {
-        _stats.api_operations.put_item_latency.mark(std::chrono::steady_clock::now() - start_time);
-    });
+    lw_shared_ptr<stats> per_table_stats = get_stats_from_schema(_proxy, *(op->schema()));
+    per_table_stats->api_operations.put_item++;
+    uint64_t wcu_total = 0;
+    auto res = co_await op->execute(_proxy, std::move(cas_shard), client_state, trace_state, std::move(permit), needs_read_before_write, _stats, *per_table_stats, wcu_total);
+    per_table_stats->operation_sizes.put_item_op_size_kb.add(bytes_to_kb_ceil(op->consumed_capacity()._total_bytes));
+    per_table_stats->wcu_total[stats::wcu_types::PUT_ITEM] += wcu_total;
+    _stats.wcu_total[stats::wcu_types::PUT_ITEM] += wcu_total;
+    per_table_stats->api_operations.put_item_latency.mark(std::chrono::steady_clock::now() - start_time);
+    _stats.api_operations.put_item_latency.mark(std::chrono::steady_clock::now() - start_time);
+    co_return res;
 }
 
 class delete_item_operation : public rmw_operation {
@@ -2512,7 +2878,7 @@ private:
     put_or_delete_item _mutation_builder;
 public:
     parsed::condition_expression _condition_expression;
-    delete_item_operation(service::storage_proxy& proxy, rjson::value&& request)
+    delete_item_operation(parsed::expression_cache& parsed_expression_cache, service::storage_proxy& proxy, rjson::value&& request)
         : rmw_operation(proxy, std::move(request))
         , _mutation_builder(rjson::get(_request, "Key"), schema(), put_or_delete_item::delete_item{}) {
         _pk = _mutation_builder.pk();
@@ -2520,7 +2886,7 @@ public:
         if (_returnvalues != returnvalues::NONE && _returnvalues != returnvalues::ALL_OLD) {
             throw api_error::validation(format("DeleteItem supports only NONE or ALL_OLD for ReturnValues"));
         }
-        _condition_expression = get_parsed_condition_expression(_request);
+        _condition_expression = get_parsed_condition_expression(parsed_expression_cache, _request);
         const rjson::value* expression_attribute_names = rjson::find(_request, "ExpressionAttributeNames");
         const rjson::value* expression_attribute_values = rjson::find(_request, "ExpressionAttributeValues");
         if (!_condition_expression.empty()) {
@@ -2545,7 +2911,7 @@ public:
                 check_needs_read_before_write(_condition_expression) ||
                 _returnvalues == returnvalues::ALL_OLD;
     }
-    virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, api::timestamp_type ts) const override {
+    virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, api::timestamp_type ts, cdc::per_request_options& cdc_opts) const override {
         if (!verify_expected(_request, previous_item.get()) ||
             !verify_condition_expression(_condition_expression, previous_item.get())) {
             if (previous_item && _returnvalues_on_condition_check_failure ==
@@ -2575,39 +2941,52 @@ future<executor::request_return_type> executor::delete_item(client_state& client
     auto start_time = std::chrono::steady_clock::now();
     elogger.trace("delete_item {}", request);
 
-    auto op = make_shared<delete_item_operation>(_proxy, std::move(request));
+    auto op = make_shared<delete_item_operation>(*_parsed_expression_cache, _proxy, std::move(request));
+    lw_shared_ptr<stats> per_table_stats = get_stats_from_schema(_proxy, *(op->schema()));
     tracing::add_table_name(trace_state, op->schema()->ks_name(), op->schema()->cf_name());
-    const bool needs_read_before_write = op->needs_read_before_write();
+    const bool needs_read_before_write = _proxy.data_dictionary().get_config().alternator_force_read_before_write() || op->needs_read_before_write();
 
-    co_await verify_permission(_enforce_authorization, client_state, op->schema(), auth::permission::MODIFY);
+    co_await verify_permission(_enforce_authorization, _warn_authorization, client_state, op->schema(), auth::permission::MODIFY, _stats);
 
-    if (auto shard = op->shard_for_execute(needs_read_before_write); shard) {
+    auto cas_shard = op->shard_for_execute(needs_read_before_write);
+
+    if (cas_shard && !cas_shard->this_shard()) {
         _stats.api_operations.delete_item--; // uncount on this shard, will be counted in other shard
         _stats.shard_bounce_for_lwt++;
-        co_return co_await container().invoke_on(*shard, _ssg,
+        per_table_stats->shard_bounce_for_lwt++;
+        co_return co_await container().invoke_on(cas_shard->shard(), _ssg,
                 [request = std::move(*op).move_request(), cs = client_state.move_to_other_shard(), gt = tracing::global_trace_state_ptr(trace_state), permit = std::move(permit)]
                 (executor& e) mutable {
             return do_with(cs.get(), [&e, request = std::move(request), trace_state = tracing::trace_state_ptr(gt)]
                                      (service::client_state& client_state) mutable {
-                //FIXME: A corresponding FIXME can be found in transport/server.cc when a message must be bounced
-                // to another shard - once it is solved, this place can use a similar solution. Instead of passing
-                // empty_service_permit() to the background operation, the current permit's lifetime should be prolonged,
-                // so that it's destructed only after all background operations are finished as well.
+                //FIXME: Instead of passing  empty_service_permit() to the background operation,
+                // the current permit's lifetime should be prolonged, so that it's destructed
+                // only after all background operations are finished as well.
                 return e.delete_item(client_state, std::move(trace_state), empty_service_permit(), std::move(request));
             });
         });
     }
-    co_return co_await op->execute(_proxy, client_state, trace_state, std::move(permit), needs_read_before_write, _stats, _stats.wcu_total[stats::wcu_types::DELETE_ITEM]).finally([op, start_time, this] {
-        _stats.api_operations.delete_item_latency.mark(std::chrono::steady_clock::now() - start_time);
-    });
+    per_table_stats->api_operations.delete_item++;
+    uint64_t wcu_total = 0;
+    auto res = co_await op->execute(_proxy, std::move(cas_shard), client_state, trace_state, std::move(permit), needs_read_before_write, _stats, *per_table_stats, wcu_total);
+    if (op->consumed_capacity()._total_bytes > 1) {
+        per_table_stats->operation_sizes.delete_item_op_size_kb.add(bytes_to_kb_ceil(op->consumed_capacity()._total_bytes));
+    }
+    per_table_stats->wcu_total[stats::wcu_types::DELETE_ITEM] += wcu_total;
+    _stats.wcu_total[stats::wcu_types::DELETE_ITEM] += wcu_total;
+    per_table_stats->api_operations.delete_item_latency.mark(std::chrono::steady_clock::now() - start_time);
+    _stats.api_operations.delete_item_latency.mark(std::chrono::steady_clock::now() - start_time);
+    co_return res;
 }
 
 static schema_ptr get_table_from_batch_request(const service::storage_proxy& proxy, const rjson::value::ConstMemberIterator& batch_request) {
     sstring table_name = batch_request->name.GetString(); // JSON keys are always strings
-    validate_table_name(table_name);
     try {
         return proxy.data_dictionary().find_schema(sstring(executor::KEYSPACE_NAME_PREFIX) + table_name, table_name);
     } catch(data_dictionary::no_such_column_family&) {
+        // DynamoDB returns validation error even when table does not exist
+        // and the table name is invalid.
+        validate_table_name(table_name);
         throw api_error::resource_not_found(format("Requested resource not found: Table: {} not found", table_name));
     }
 }
@@ -2639,7 +3018,7 @@ public:
     put_or_delete_item_cas_request(schema_ptr s, std::vector<put_or_delete_item>&& b) :
         schema(std::move(s)), _mutation_builders(std::move(b)) { }
     virtual ~put_or_delete_item_cas_request() = default;
-    virtual std::optional<mutation> apply(foreign_ptr<lw_shared_ptr<query::result>> qr, const query::partition_slice& slice, api::timestamp_type ts) override {
+    virtual std::optional<mutation> apply(foreign_ptr<lw_shared_ptr<query::result>> qr, const query::partition_slice& slice, api::timestamp_type ts, cdc::per_request_options& cdc_opts) override {
         std::optional<mutation> ret;
         for (const put_or_delete_item& mutation_builder : _mutation_builders) {
             // We assume all these builders have the same partition.
@@ -2653,14 +3032,16 @@ public:
     }
 };
 
-static future<> cas_write(service::storage_proxy& proxy, schema_ptr schema, dht::decorated_key dk, std::vector<put_or_delete_item>&& mutation_builders,
+static future<> cas_write(service::storage_proxy& proxy, schema_ptr schema, service::cas_shard cas_shard, dht::decorated_key dk, std::vector<put_or_delete_item>&& mutation_builders,
         service::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit) {
     auto timeout = executor::default_timeout();
     auto op = seastar::make_shared<put_or_delete_item_cas_request>(schema, std::move(mutation_builders));
-    return proxy.cas(schema, op, nullptr, to_partition_ranges(dk),
+    auto cdc_opts = cdc::per_request_options{
+    };
+    return proxy.cas(schema, std::move(cas_shard), op, nullptr, to_partition_ranges(dk),
             {timeout, std::move(permit), client_state, trace_state},
             db::consistency_level::LOCAL_SERIAL, db::consistency_level::LOCAL_QUORUM,
-            timeout, timeout).discard_result();
+            timeout, timeout, true, std::move(cdc_opts)).discard_result();
     // We discarded cas()'s future value ("is_applied") because BatchWriteItems
     // does not need to support conditional updates.
 }
@@ -2703,7 +3084,7 @@ static future<> do_batch_write(service::storage_proxy& proxy,
     });
     if (!needs_lwt) {
         // Do a normal write, without LWT:
-        std::vector<mutation> mutations;
+        utils::chunked_vector<mutation> mutations;
         mutations.reserve(mutation_builders.size());
         api::timestamp_type now = api::new_timestamp();
         for (auto& b : mutation_builders) {
@@ -2714,7 +3095,9 @@ static future<> do_batch_write(service::storage_proxy& proxy,
                 executor::default_timeout(),
                 trace_state,
                 std::move(permit),
-                db::allow_per_partition_rate_limit::yes);
+                db::allow_per_partition_rate_limit::yes,
+                false,
+                cdc::per_request_options{});
     } else {
         // Do the write via LWT:
         // Multiple mutations may be destined for the same partition, adding
@@ -2729,12 +3112,12 @@ static future<> do_batch_write(service::storage_proxy& proxy,
         }
         return parallel_for_each(std::move(key_builders), [&proxy, &client_state, &stats, trace_state, ssg, permit = std::move(permit)] (auto& e) {
             stats.write_using_lwt++;
-            auto desired_shard = service::storage_proxy::cas_shard(*e.first.schema, e.first.dk.token());
-            if (desired_shard == this_shard_id()) {
-                return cas_write(proxy, e.first.schema, e.first.dk, std::move(e.second), client_state, trace_state, permit);
+            auto desired_shard = service::cas_shard(*e.first.schema, e.first.dk.token());
+            if (desired_shard.this_shard()) {
+                return cas_write(proxy, e.first.schema, std::move(desired_shard), e.first.dk, std::move(e.second), client_state, trace_state, permit);
             } else {
                 stats.shard_bounce_for_lwt++;
-                return proxy.container().invoke_on(desired_shard, ssg,
+                return proxy.container().invoke_on(desired_shard.shard(), ssg,
                             [cs = client_state.move_to_other_shard(),
                              mb = e.second,
                              dk = e.first.dk,
@@ -2747,13 +3130,19 @@ static future<> do_batch_write(service::storage_proxy& proxy,
                                               trace_state = tracing::trace_state_ptr(gt)]
                                               (service::client_state& client_state) mutable {
                         auto schema = proxy.data_dictionary().find_schema(ks, cf);
-                        //FIXME: A corresponding FIXME can be found in transport/server.cc when a message must be bounced
-                        // to another shard - once it is solved, this place can use a similar solution. Instead of passing
-                        // empty_service_permit() to the background operation, the current permit's lifetime should be prolonged,
-                        // so that it's destructed only after all background operations are finished as well.
-                        return cas_write(proxy, schema, dk, std::move(mb), client_state, std::move(trace_state), empty_service_permit());
+
+                        // The desired_shard on the original shard remains alive for the duration
+                        // of cas_write on this shard and prevents any tablet operations.
+                        // However, we need a local instance of cas_shard on this shard
+                        // to pass it to sp::cas, so we just create a new one.
+                        service::cas_shard cas_shard(*schema, dk.token());
+
+                        //FIXME: Instead of passing empty_service_permit() to the background operation,
+                        // the current permit's lifetime should be prolonged, so that it's destructed
+                        // only after all background operations are finished as well.
+                        return cas_write(proxy, schema, std::move(cas_shard), dk, std::move(mb), client_state, std::move(trace_state), empty_service_permit());
                     });
-                });
+                }).finally([desired_shard = std::move(desired_shard)]{});
             }
         });
     }
@@ -2761,37 +3150,65 @@ static future<> do_batch_write(service::storage_proxy& proxy,
 
 future<executor::request_return_type> executor::batch_write_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
     _stats.api_operations.batch_write_item++;
-    rjson::value& request_items = request["RequestItems"];
     auto start_time = std::chrono::steady_clock::now();
+    const rjson::value& request_items = get_member(request, "RequestItems", "BatchWriteItem content");
+    validate_is_object(request_items, "RequestItems");
+    if (request_items.ObjectEmpty()) {
+        co_return api_error::validation("RequestItems can't be empty");
+    }
 
+    const auto maximum_batch_write_size = _proxy.data_dictionary().get_config().alternator_max_items_in_batch_write();
+
+    size_t total_items = 0;
+    for (auto it = request_items.MemberBegin(); it != request_items.MemberEnd(); ++it) {
+        if (!it->value.IsArray() || it->value.Empty()) {
+            co_return api_error::validation("Member of RequestItems must be a non-empty array of WriteRequest objects");
+        }
+        total_items += it->value.Size();
+    }
+    if (total_items > maximum_batch_write_size) {
+        co_return api_error::validation(fmt::format("Invalid length of BatchWriteItem command, got {} items, "
+            "maximum is {} (from configuration variable alternator_max_items_in_batch_write)", total_items, maximum_batch_write_size));
+    }
+    bool should_add_wcu = wcu_consumed_capacity_counter::should_add_capacity(request);
+    rjson::value consumed_capacity = rjson::empty_array();
     std::vector<std::pair<schema_ptr, put_or_delete_item>> mutation_builders;
+    // WCU calculation is performed at the end of execution.
+    // We need to keep track of changes per table, both for internal metrics
+    // and to be able to return the values if should_add_wcu is true.
+    // For each table, we need its stats and schema.
+    std::vector<std::pair<lw_shared_ptr<stats>, schema_ptr>> per_table_wcu;
+
     mutation_builders.reserve(request_items.MemberCount());
-    uint batch_size = 0;
+    per_table_wcu.reserve(request_items.MemberCount());
     for (auto it = request_items.MemberBegin(); it != request_items.MemberEnd(); ++it) {
         schema_ptr schema = get_table_from_batch_request(_proxy, it);
+        lw_shared_ptr<stats> per_table_stats = get_stats_from_schema(_proxy, *(schema));
+        per_table_stats->api_operations.batch_write_item++;
+        per_table_stats->api_operations.batch_write_item_batch_total += it->value.Size();
+        per_table_stats->api_operations.batch_write_item_histogram.add(it->value.Size());
         tracing::add_table_name(trace_state, schema->ks_name(), schema->cf_name());
+
         std::unordered_set<primary_key, primary_key_hash, primary_key_equal> used_keys(
                 1, primary_key_hash{schema}, primary_key_equal{schema});
         for (auto& request : it->value.GetArray()) {
-            if (!request.IsObject() || request.MemberCount() != 1) {
-                co_return api_error::validation(format("Invalid BatchWriteItem request: {}", request));
-            }
-            auto r = request.MemberBegin();
-            const std::string r_name = r->name.GetString();
+            auto& r = get_single_member(request, "RequestItems element");
+            const auto r_name = rjson::to_string_view(r.name);
             if (r_name == "PutRequest") {
-                const rjson::value& put_request = r->value;
-                const rjson::value& item = put_request["Item"];
-                mutation_builders.emplace_back(schema, put_or_delete_item(
+                const rjson::value& item = get_member(r.value, "Item", "PutRequest");
+                validate_is_object(item, "Item in PutRequest");
+                auto&& put_item = put_or_delete_item(
                         item, schema, put_or_delete_item::put_item{},
-                        si_key_attributes(_proxy.data_dictionary().find_table(schema->ks_name(), schema->cf_name()))));
+                        si_key_attributes(_proxy.data_dictionary().find_table(schema->ks_name(), schema->cf_name())));
+                mutation_builders.emplace_back(schema, std::move(put_item));
                 auto mut_key = std::make_pair(mutation_builders.back().second.pk(), mutation_builders.back().second.ck());
                 if (used_keys.contains(mut_key)) {
                     co_return api_error::validation("Provided list of item keys contains duplicates");
                 }
                 used_keys.insert(std::move(mut_key));
-                batch_size++;
             } else if (r_name == "DeleteRequest") {
-                const rjson::value& key = (r->value)["Key"];
+                const rjson::value& key = get_member(r.value, "Key", "DeleteRequest");
+                validate_is_object(key, "Key in DeleteRequest");
                 mutation_builders.emplace_back(schema, put_or_delete_item(
                         key, schema, put_or_delete_item::delete_item{}));
                 auto mut_key = std::make_pair(mutation_builders.back().second.pk(),
@@ -2800,35 +3217,96 @@ future<executor::request_return_type> executor::batch_write_item(client_state& c
                     co_return api_error::validation("Provided list of item keys contains duplicates");
                 }
                 used_keys.insert(std::move(mut_key));
-                batch_size++;
             } else {
                 co_return api_error::validation(fmt::format("Unknown BatchWriteItem request type: {}", r_name));
             }
         }
+        per_table_wcu.emplace_back(std::make_pair(per_table_stats, schema));
     }
-
     for (const auto& b : mutation_builders) {
-        co_await verify_permission(_enforce_authorization, client_state, b.first, auth::permission::MODIFY);
+        co_await verify_permission(_enforce_authorization, _warn_authorization, client_state, b.first, auth::permission::MODIFY, _stats);
+    }
+    // If alternator_force_read_before_write is true we will first get the previous item size
+    // and only then do send the mutation.
+    if (_proxy.data_dictionary().get_config().alternator_force_read_before_write()) {
+        std::vector<future<uint64_t>> previous_items_sizes;
+        previous_items_sizes.reserve(mutation_builders.size());
+
+        // Parallel get all previous item sizes
+        for (const auto& b : mutation_builders) {
+            previous_items_sizes.emplace_back(get_previous_item_size(
+                _proxy,
+                client_state,
+                b.first,
+                b.second.pk(),
+                b.second.ck(),
+                permit));
+        }
+        size_t pos = 0;
+        // We are going to wait for all the requests
+        for (auto&& pi : previous_items_sizes) {
+            auto res = co_await std::move(pi);
+            if (mutation_builders[pos].second.length_in_bytes() < res) {
+                mutation_builders[pos].second.set_length_in_bytes(res);
+            }
+            pos++;
+        }
     }
 
-    _stats.api_operations.batch_write_item_batch_total += batch_size;
-    co_return co_await do_batch_write(_proxy, _ssg, std::move(mutation_builders), client_state, trace_state, std::move(permit), _stats).then([start_time, this] () {
-        // FIXME: Issue #5650: If we failed writing some of the updates,
-        // need to return a list of these failed updates in UnprocessedItems
-        // rather than fail the whole write (issue #5650).
-        rjson::value ret = rjson::empty_object();
-        rjson::add(ret, "UnprocessedItems", rjson::empty_object());
-        _stats.api_operations.batch_write_item_latency.mark(std::chrono::steady_clock::now() - start_time);
-        return make_ready_future<executor::request_return_type>(make_jsonable(std::move(ret)));
-    });
+
+    size_t wcu_put_units = 0;
+    size_t wcu_delete_units = 0;
+
+    size_t pos = 0;
+    size_t total_wcu;
+    // Here we calculate the per-table WCU.
+    // The size in the mutation is based either on the operation size,
+    // or, if we performed a read-before-write, on the larger of the operation size
+    // and the previous item's size.
+    for (const auto& w : per_table_wcu) {
+        total_wcu = 0;
+        // The following loop goes over all items from the same table
+        while(pos < mutation_builders.size() && w.second->id() == mutation_builders[pos].first->id()) {
+            uint64_t item_size = mutation_builders[pos].second.length_in_bytes();
+            size_t wcu = wcu_consumed_capacity_counter::get_units(item_size ? item_size : 1);
+            total_wcu += wcu;
+            if (mutation_builders[pos].second.is_put_item()) {
+                w.first->wcu_total[stats::PUT_ITEM] += wcu;
+                wcu_put_units += wcu;
+            } else {
+                w.first->wcu_total[stats::DELETE_ITEM] += wcu;
+                wcu_delete_units += wcu;
+            }
+            w.first->operation_sizes.batch_write_item_op_size_kb.add(bytes_to_kb_ceil(item_size));
+            pos++;
+        }
+        if (should_add_wcu) {
+            rjson::value entry = rjson::empty_object();
+            rjson::add(entry, "TableName", rjson::from_string(w.second->cf_name()));
+            rjson::add(entry, "CapacityUnits", total_wcu);
+            rjson::push_back(consumed_capacity, std::move(entry));
+        }
+    }
+    _stats.wcu_total[stats::PUT_ITEM] += wcu_put_units;
+    _stats.wcu_total[stats::DELETE_ITEM] += wcu_delete_units;
+    _stats.api_operations.batch_write_item_batch_total += total_items;
+    _stats.api_operations.batch_write_item_histogram.add(total_items);
+    co_await do_batch_write(_proxy, _ssg, std::move(mutation_builders), client_state, trace_state, std::move(permit), _stats);
+    // FIXME: Issue #5650: If we failed writing some of the updates,
+    // need to return a list of these failed updates in UnprocessedItems
+    // rather than fail the whole write (issue #5650).
+    rjson::value ret = rjson::empty_object();
+    rjson::add(ret, "UnprocessedItems", rjson::empty_object());
+    if (should_add_wcu) {
+        rjson::add(ret, "ConsumedCapacity", std::move(consumed_capacity));
+    }
+    _stats.api_operations.batch_write_item_latency.mark(std::chrono::steady_clock::now() - start_time);
+    co_return rjson::print(std::move(ret));
 }
 
-static std::string get_item_type_string(const rjson::value& v) {
-    if (!v.IsObject() || v.MemberCount() != 1) {
-        throw api_error::validation(format("Item has invalid format: {}", v));
-    }
-    auto it = v.MemberBegin();
-    return it->name.GetString();
+static const std::string_view get_item_type_string(const rjson::value& v) {
+    const rjson::value::Member& mem = get_single_member(v, "Item");
+    return rjson::to_string_view(mem.name);
 }
 
 // attrs_to_get saves for each top-level attribute an attrs_to_get_node,
@@ -3061,7 +3539,7 @@ static select_type parse_select(const rjson::value& request, table_or_view_type 
 // For example, if ProjectionExpression lists a.b and a.c[2], we
 // return one top-level attribute name, "a", with the value "{b, c[2]}".
 
-static std::optional<attrs_to_get> calculate_attrs_to_get(const rjson::value& req, std::unordered_set<std::string>& used_attribute_names, select_type select = select_type::regular) {
+static std::optional<attrs_to_get> calculate_attrs_to_get(const rjson::value& req, parsed::expression_cache& parsed_expression_cache, std::unordered_set<std::string>& used_attribute_names, select_type select = select_type::regular) {
     if (select == select_type::count) {
         // An empty map asks to retrieve no attributes. Note that this is
         // different from a disengaged optional which means retrieve all.
@@ -3079,6 +3557,7 @@ static std::optional<attrs_to_get> calculate_attrs_to_get(const rjson::value& re
         attrs_to_get ret;
         for (auto it = attributes_to_get.Begin(); it != attributes_to_get.End(); ++it) {
             attribute_path_map_add("AttributesToGet", ret, it->GetString());
+            validate_attr_name_length("AttributesToGet", it->GetStringLength(), false);
         }
         if (ret.empty()) {
             throw api_error::validation("Empty AttributesToGet is not allowed. Consider using Select=COUNT instead.");
@@ -3089,7 +3568,7 @@ static std::optional<attrs_to_get> calculate_attrs_to_get(const rjson::value& re
         const rjson::value* expression_attribute_names = rjson::find(req, "ExpressionAttributeNames");
         std::vector<parsed::path> paths_to_get;
         try {
-            paths_to_get = parse_projection_expression(rjson::to_string_view(projection_expression));
+            paths_to_get = parsed_expression_cache.parse_projection_expression(rjson::to_string_view(projection_expression));
         } catch(expressions_syntax_error& e) {
             throw api_error::validation(e.what());
         }
@@ -3219,14 +3698,17 @@ future<std::vector<rjson::value>> executor::describe_multi_item(schema_ptr schem
         const query::partition_slice&& slice,
         shared_ptr<cql3::selection::selection> selection,
         foreign_ptr<lw_shared_ptr<query::result>> query_result,
-        shared_ptr<const std::optional<attrs_to_get>> attrs_to_get) {
+        shared_ptr<const std::optional<attrs_to_get>> attrs_to_get,
+        noncopyable_function<void(uint64_t)> item_callback) {
     cql3::selection::result_set_builder builder(*selection, gc_clock::now());
     query::result_view::consume(*query_result, slice, cql3::selection::result_set_builder::visitor(builder, *schema, *selection));
     auto result_set = builder.build();
     std::vector<rjson::value> ret;
     for (auto& result_row : result_set->rows()) {
         rjson::value item = rjson::empty_object();
-        describe_single_item(*selection, result_row, *attrs_to_get, item);
+        uint64_t item_length_in_bytes = 0;
+        describe_single_item(*selection, result_row, *attrs_to_get, item, &item_length_in_bytes);
+        item_callback(item_length_in_bytes);
         ret.push_back(std::move(item));
         co_await coroutine::maybe_yield();
     }
@@ -3317,7 +3799,7 @@ static size_t estimate_value_size(const rjson::value& value) {
     return size;
 }
 
-class update_item_operation  : public rmw_operation {
+class update_item_operation : public rmw_operation {
 public:
     // Some information parsed during the constructor to check for input
     // errors, and cached to be used again during apply().
@@ -3328,18 +3810,28 @@ public:
     attribute_path_map<parsed::update_expression::action> _update_expression;
 
     // Saved list of GSI keys in the table being updated, used for
-    // validate_value_if_gsi_key()
+    // validate_value_if_index_key()
     std::unordered_map<bytes, std::string> _key_attributes;
 
     parsed::condition_expression _condition_expression;
 
-    update_item_operation(service::storage_proxy& proxy, rjson::value&& request);
+    update_item_operation(parsed::expression_cache& parsed_expression_cache, service::storage_proxy& proxy, rjson::value&& request);
     virtual ~update_item_operation() = default;
-    virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, api::timestamp_type ts) const override;
+    virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, api::timestamp_type ts, cdc::per_request_options& cdc_opts) const override;
     bool needs_read_before_write() const;
+
+private:
+    void delete_attribute(bytes&& column_name, const std::unique_ptr<rjson::value>& previous_item, const api::timestamp_type ts, deletable_row& row,
+            attribute_collector& modified_attrs) const;
+    void update_attribute(bytes&& column_name, const rjson::value& json_value, const std::unique_ptr<rjson::value>& previous_item, const api::timestamp_type ts,
+            deletable_row& row, attribute_collector& modified_attrs, const attribute_path_map_node<parsed::update_expression::action>* h = nullptr) const;
+    void apply_attribute_updates(const std::unique_ptr<rjson::value>& previous_item, const api::timestamp_type ts, deletable_row& row,
+            attribute_collector& modified_attrs, bool& any_updates, bool& any_deletes) const;
+    void apply_update_expression(const std::unique_ptr<rjson::value>& previous_item, const api::timestamp_type ts, deletable_row& row,
+            attribute_collector& modified_attrs, bool& any_updates, bool& any_deletes) const;
 };
 
-update_item_operation::update_item_operation(service::storage_proxy& proxy, rjson::value&& update_info)
+update_item_operation::update_item_operation(parsed::expression_cache& parsed_expression_cache, service::storage_proxy& proxy, rjson::value&& update_info)
     : rmw_operation(proxy, std::move(update_info))
 {
     const rjson::value* key = rjson::find(_request, "Key");
@@ -3361,13 +3853,10 @@ update_item_operation::update_item_operation(service::storage_proxy& proxy, rjso
             throw api_error::validation("UpdateExpression must be a string");
         }
         try {
-            parsed::update_expression expr = parse_update_expression(rjson::to_string_view(*update_expression));
+            parsed::update_expression expr = parsed_expression_cache.parse_update_expression(rjson::to_string_view(*update_expression));
             resolve_update_expression(expr,
                     expression_attribute_names, expression_attribute_values,
                     used_attribute_names, used_attribute_values);
-            if (expr.empty()) {
-                throw api_error::validation("Empty expression in UpdateExpression is not allowed");
-            }
             for (auto& action : expr.actions()) {
                 // Unfortunately we need to copy the action's path, because
                 // we std::move the action object.
@@ -3383,9 +3872,12 @@ update_item_operation::update_item_operation(service::storage_proxy& proxy, rjso
         if (!_attribute_updates->IsObject()) {
             throw api_error::validation("AttributeUpdates must be an object");
         }
+        for (auto it = std::as_const(*_attribute_updates).MemberBegin(); it != std::as_const(*_attribute_updates).MemberEnd(); ++it) {
+            validate_attr_name_length("AttributeUpdates", it->name.GetStringLength(), false);
+        }
     }
 
-    _condition_expression = get_parsed_condition_expression(_request);
+    _condition_expression = get_parsed_condition_expression(parsed_expression_cache, _request);
     resolve_condition_expression(_condition_expression,
             expression_attribute_names, expression_attribute_values,
             used_attribute_names, used_attribute_values);
@@ -3487,14 +3979,14 @@ static std::optional<rjson::value> action_result(
             // An ADD can be used to create a new attribute (when
             // v1.IsNull()) or to add to a pre-existing attribute:
             if (v1.IsNull()) {
-                std::string v2_type = get_item_type_string(v2);
+                const auto v2_type = get_item_type_string(v2);
                 if (v2_type == "N" || v2_type == "SS" || v2_type == "NS" || v2_type == "BS") {
                     result = v2;
                 } else {
                     throw api_error::validation(format("An operand in the update expression has an incorrect data type: {}", v2));
                 }
             } else {
-                std::string v1_type = get_item_type_string(v1);
+                const auto v1_type = get_item_type_string(v1);
                 if (v1_type == "N") {
                     if (get_item_type_string(v2) != "N") {
                         throw api_error::validation(fmt::format("Incorrect operand type for operator or function. Expected {}: {}", v1_type, rjson::print(v2)));
@@ -3657,15 +4149,228 @@ static bool hierarchy_actions(
     return true;
 }
 
-std::optional<mutation>
-update_item_operation::apply(std::unique_ptr<rjson::value> previous_item, api::timestamp_type ts) const {
+void update_item_operation::delete_attribute(bytes&& column_name, const std::unique_ptr<rjson::value>& previous_item, const api::timestamp_type ts,
+        deletable_row& row, attribute_collector& modified_attrs) const {
+    if (_returnvalues == returnvalues::ALL_NEW) {
+        rjson::remove_member(_return_attributes, to_string_view(column_name));
+    } else if (_returnvalues == returnvalues::UPDATED_OLD && previous_item) {
+        std::string_view cn = to_string_view(column_name);
+        const rjson::value* col = rjson::find(*previous_item, cn);
+        if (col) {
+            // In the UPDATED_OLD case the item starts empty and column
+            // names are unique, so we can use add()
+            rjson::add_with_string_name(_return_attributes, cn, rjson::copy(*col));
+        }
+    }
+    const column_definition* cdef = find_attribute(*_schema, column_name);
+    if (cdef) {
+        row.cells().apply(*cdef, atomic_cell::make_dead(ts, gc_clock::now()));
+    } else {
+        modified_attrs.del(std::move(column_name), ts);
+    }
+}
+
+void update_item_operation::update_attribute(bytes&& column_name, const rjson::value& json_value, const std::unique_ptr<rjson::value>& previous_item,
+        const api::timestamp_type ts, deletable_row& row, attribute_collector& modified_attrs,
+        const attribute_path_map_node<parsed::update_expression::action>* h) const {
+    if (_returnvalues == returnvalues::ALL_NEW) {
+        rjson::replace_with_string_name(_return_attributes, to_string_view(column_name), rjson::copy(json_value));
+    } else if (_returnvalues == returnvalues::UPDATED_NEW) {
+        rjson::value&& v = rjson::copy(json_value);
+        if (h) {
+            // If the operation was only on specific attribute paths,
+            // leave only them in _return_attributes.
+            if (hierarchy_filter(v, *h)) {
+                // In the UPDATED_NEW case, _return_attributes starts
+                // empty and the attribute names are unique, so we can
+                // use add().
+                rjson::add_with_string_name(_return_attributes, to_string_view(column_name), std::move(v));
+            }
+        } else {
+            rjson::add_with_string_name(_return_attributes, to_string_view(column_name), std::move(v));
+        }
+    } else if (_returnvalues == returnvalues::UPDATED_OLD && previous_item) {
+        std::string_view cn = to_string_view(column_name);
+        const rjson::value* col = rjson::find(*previous_item, cn);
+        if (col) {
+            rjson::value&& v = rjson::copy(*col);
+            if (h) {
+                if (hierarchy_filter(v, *h)) {
+                    // In the UPDATED_OLD case, _return_attributes starts
+                    // empty and the attribute names are unique, so we can
+                    // use add().
+                    rjson::add_with_string_name(_return_attributes, cn, std::move(v));
+                }
+            } else {
+                rjson::add_with_string_name(_return_attributes, cn, std::move(v));
+            }
+        }
+    }
+    const column_definition* cdef = find_attribute(*_schema, column_name);
+    if (cdef) {
+        bytes column_value = get_key_from_typed_value(json_value, *cdef);
+        row.cells().apply(*cdef, atomic_cell::make_live(*cdef->type, ts, column_value));
+    } else {
+        // This attribute may be a key column of one of the GSIs or LSIs,
+        // in which case there are some limitations on the value.
+        validate_value_if_index_key(_key_attributes, column_name, json_value);
+        modified_attrs.put(std::move(column_name), serialize_item(json_value), ts);
+    }
+}
+
+inline void update_item_operation::apply_attribute_updates(const std::unique_ptr<rjson::value>& previous_item, const api::timestamp_type ts, deletable_row& row,
+        attribute_collector& modified_attrs, bool& any_updates, bool& any_deletes) const {
+    for (auto it = _attribute_updates->MemberBegin(); it != _attribute_updates->MemberEnd(); ++it) {
+        // Note that it.key() is the name of the column, *it is the operation
+        bytes column_name = to_bytes(it->name.GetString());
+        const column_definition* cdef = _schema->get_column_definition(column_name);
+        if (cdef && cdef->is_primary_key()) {
+            throw api_error::validation(format("UpdateItem cannot update key column {}", it->name.GetString()));
+        }
+        std::string action = (it->value)["Action"].GetString();
+        if (action == "DELETE") {
+            // The DELETE operation can do two unrelated tasks. Without a
+            // "Value" option, it is used to delete an attribute. With a
+            // "Value" option, it is used to delete a set of elements from
+            // a set attribute of the same type.
+            if (it->value.HasMember("Value")) {
+                // Subtracting sets needs a read of previous_item, so
+                // check_needs_read_before_write_attribute_updates()
+                // returns true in this case, and previous_item is
+                // available to us when the item exists.
+                const rjson::value* v1 = previous_item ? rjson::find(*previous_item, to_string_view(column_name)) : nullptr;
+                const rjson::value& v2 = (it->value)["Value"];
+                validate_value(v2, "AttributeUpdates");
+                const auto v2_type = get_item_type_string(v2);
+                if (v2_type != "SS" && v2_type != "NS" && v2_type != "BS") {
+                    throw api_error::validation(fmt::format("AttributeUpdates DELETE operation with Value only valid for sets, got type {}", v2_type));
+                }
+                if (v1) {
+                    std::optional<rjson::value> result = set_diff(*v1, v2);
+                    if (result) {
+                        any_updates = true;
+                        update_attribute(std::move(column_name), *result, previous_item, ts, row, modified_attrs);
+                    } else {
+                        // DynamoDB does not allow empty sets - if the
+                        // result is empty, delete the attribute.
+                        any_deletes = true;
+                        delete_attribute(std::move(column_name), previous_item, ts, row, modified_attrs);
+                    }
+                } else {
+                    // if the attribute or item don't exist, the DELETE
+                    // operation should silently do nothing - and not
+                    // create an empty item. It's a waste to call
+                    // do_delete() on an attribute we already know is
+                    // deleted, so we can just mark any_deletes = true.
+                    any_deletes = true;
+                }
+            } else {
+                any_deletes = true;
+                delete_attribute(std::move(column_name), previous_item, ts, row, modified_attrs);
+            }
+        } else if (action == "PUT") {
+            const rjson::value& value = (it->value)["Value"];
+            validate_value(value, "AttributeUpdates");
+            any_updates = true;
+            update_attribute(std::move(column_name), value, previous_item, ts, row, modified_attrs);
+        } else if (action == "ADD") {
+            // Note that check_needs_read_before_write_attribute_updates()
+            // made sure we retrieved previous_item (if exists) when there
+            // is an ADD action.
+            const rjson::value* v1 = previous_item ? rjson::find(*previous_item, to_string_view(column_name)) : nullptr;
+            const rjson::value& v2 = (it->value)["Value"];
+            validate_value(v2, "AttributeUpdates");
+            // An ADD can be used to create a new attribute (when
+            // !v1) or to add to a pre-existing attribute:
+            if (!v1) {
+                const auto v2_type = get_item_type_string(v2);
+                if (v2_type == "N" || v2_type == "SS" || v2_type == "NS" || v2_type == "BS" || v2_type == "L") {
+                    any_updates = true;
+                    update_attribute(std::move(column_name), v2, previous_item, ts, row, modified_attrs);
+                } else {
+                    throw api_error::validation(format("An operand in the AttributeUpdates ADD has an incorrect data type: {}", v2));
+                }
+            } else {
+                const auto v1_type = get_item_type_string(*v1);
+                const auto v2_type = get_item_type_string(v2);
+                if (v2_type != v1_type) {
+                    throw api_error::validation(fmt::format("Operand type mismatch in AttributeUpdates ADD. Expected {}, got {}", v1_type, v2_type));
+                }
+                if (v1_type == "N") {
+                    any_updates = true;
+                    update_attribute(std::move(column_name), number_add(*v1, v2), previous_item, ts, row, modified_attrs);
+                } else if (v1_type == "SS" || v1_type == "NS" || v1_type == "BS") {
+                    any_updates = true;
+                    update_attribute(std::move(column_name), set_sum(*v1, v2), previous_item, ts, row, modified_attrs);
+                } else if (v1_type == "L") {
+                    // The DynamoDB documentation doesn't say it supports
+                    // lists in ADD operations, but it turns out that it
+                    // does. Interestingly, this is only true for
+                    // AttributeUpdates (this code) - the similar ADD
+                    // in UpdateExpression doesn't support lists.
+                    any_updates = true;
+                    update_attribute(std::move(column_name), list_concatenate(*v1, v2), previous_item, ts, row, modified_attrs);
+                } else {
+                    throw api_error::validation(format("An operand in the AttributeUpdates ADD has an incorrect data type: {}", *v1));
+                }
+            }
+        } else {
+            throw api_error::validation(fmt::format("Unknown Action value '{}' in AttributeUpdates", action));
+        }
+    }
+}
+
+inline void update_item_operation::apply_update_expression(const std::unique_ptr<rjson::value>& previous_item, const api::timestamp_type ts, deletable_row& row,
+        attribute_collector& modified_attrs, bool& any_updates, bool& any_deletes) const {
+    for (auto& actions : _update_expression) {
+        // The actions of _update_expression are grouped by top-level
+        // attributes. Here, all actions in actions.second share the same
+        // top-level attribute actions.first.
+        std::string column_name = actions.first;
+        const column_definition* cdef = _schema->get_column_definition(to_bytes(column_name));
+        if (cdef && cdef->is_primary_key()) {
+            throw api_error::validation(fmt::format("UpdateItem cannot update key column {}", column_name));
+        }
+        if (actions.second.has_value()) {
+            // An action on a top-level attribute column_name. The single
+            // action is actions.second.get_value(). We can simply invoke
+            // the action and replace the attribute with its result:
+            std::optional<rjson::value> result = action_result(actions.second.get_value(), previous_item.get());
+            if (result) {
+                any_updates = true;
+                update_attribute(to_bytes(column_name), *result, previous_item, ts, row, modified_attrs, &actions.second);
+            } else {
+                any_deletes = true;
+                delete_attribute(to_bytes(column_name), previous_item, ts, row, modified_attrs);
+            }
+        } else {
+            // We have actions on a path or more than one path in the same
+            // top-level attribute column_name - but not on the top-level
+            // attribute as a whole. We already read the full top-level
+            // attribute (see check_needs_read_before_write()), and now we
+            // need to modify pieces of it and write back the entire
+            // top-level attribute.
+            if (!previous_item) {
+                throw api_error::validation(format("UpdateItem cannot update nested document path on non-existent item"));
+            }
+            const rjson::value* toplevel = rjson::find(*previous_item, column_name);
+            if (!toplevel) {
+                throw api_error::validation(fmt::format("UpdateItem cannot update document path: missing attribute {}", column_name));
+            }
+            rjson::value result = rjson::copy(*toplevel);
+            any_updates = true;
+            hierarchy_actions(result, actions.second, previous_item.get());
+            update_attribute(to_bytes(column_name), std::move(result), previous_item, ts, row, modified_attrs, &actions.second);
+        }
+    }
+}
+
+std::optional<mutation> update_item_operation::apply(std::unique_ptr<rjson::value> previous_item, api::timestamp_type ts, cdc::per_request_options& cdc_opts) const {
     if (_consumed_capacity._total_bytes == 0) {
         _consumed_capacity._total_bytes = 1;
     }
-    if (!verify_expected(_request, previous_item.get()) ||
-        !verify_condition_expression(_condition_expression, previous_item.get())) {
-        if (previous_item && _returnvalues_on_condition_check_failure ==
-            returnvalues_on_condition_check_failure::ALL_OLD) {
+    if (!verify_expected(_request, previous_item.get()) || !verify_condition_expression(_condition_expression, previous_item.get())) {
+        if (previous_item && _returnvalues_on_condition_check_failure == returnvalues_on_condition_check_failure::ALL_OLD) {
             _return_attributes = std::move(*previous_item);
         }
         // If the update is to be cancelled because of an unfulfilled
@@ -3673,82 +4378,6 @@ update_item_operation::apply(std::unique_ptr<rjson::value> previous_item, api::t
         // efficient than throwing an exception.
         return {};
     }
-
-    mutation m(_schema, _pk);
-    auto& row = m.partition().clustered_row(*_schema, _ck);
-    attribute_collector attrs_collector;
-    bool any_updates = false;
-    auto do_update = [&] (bytes&& column_name, const rjson::value& json_value,
-                          const attribute_path_map_node<parsed::update_expression::action>* h = nullptr) {
-        any_updates = true;
-        if (_returnvalues == returnvalues::ALL_NEW) {
-            rjson::replace_with_string_name(_return_attributes,
-                to_string_view(column_name), rjson::copy(json_value));
-        } else if (_returnvalues == returnvalues::UPDATED_NEW) {
-            rjson::value&& v = rjson::copy(json_value);
-            if (h) {
-                // If the operation was only on specific attribute paths,
-                // leave only them in _return_attributes.
-                if (hierarchy_filter(v, *h)) {
-                    // In the UPDATED_NEW case, _return_attributes starts
-                    // empty and the attribute names are unique, so we can
-                    // use add().
-                    rjson::add_with_string_name(_return_attributes,
-                        to_string_view(column_name), std::move(v));
-                }
-            } else {
-                rjson::add_with_string_name(_return_attributes,
-                    to_string_view(column_name), std::move(v));
-            }
-        } else if (_returnvalues == returnvalues::UPDATED_OLD && previous_item) {
-            std::string_view cn =  to_string_view(column_name);
-            const rjson::value* col = rjson::find(*previous_item, cn);
-            if (col) {
-                rjson::value&& v = rjson::copy(*col);
-                if (h) {
-                    if (hierarchy_filter(v, *h)) {
-                        // In the UPDATED_OLD case, _return_attributes starts
-                        // empty and the attribute names are unique, so we can
-                        // use add().
-                        rjson::add_with_string_name(_return_attributes, cn, std::move(v));
-                    }
-                } else {
-                    rjson::add_with_string_name(_return_attributes, cn, std::move(v));
-                }
-            }
-        }
-        const column_definition* cdef = find_attribute(*_schema, column_name);
-        if (cdef) {
-            bytes column_value = get_key_from_typed_value(json_value, *cdef);
-            row.cells().apply(*cdef, atomic_cell::make_live(*cdef->type, ts, column_value));
-        } else {
-            // This attribute may be a key column of one of the GSIs, in which
-            // case there are some limitations on the value.
-            validate_value_if_gsi_key(_key_attributes, column_name, json_value);
-            attrs_collector.put(std::move(column_name), serialize_item(json_value), ts);
-        }
-    };
-    bool any_deletes = false;
-    auto do_delete = [&] (bytes&& column_name) {
-        any_deletes = true;
-        if (_returnvalues == returnvalues::ALL_NEW) {
-            rjson::remove_member(_return_attributes, to_string_view(column_name));
-        } else if (_returnvalues == returnvalues::UPDATED_OLD && previous_item) {
-            std::string_view cn =  to_string_view(column_name);
-            const rjson::value* col = rjson::find(*previous_item, cn);
-            if (col) {
-                // In the UPDATED_OLD case the item starts empty and column
-                // names are unique, so we can use add()
-                rjson::add_with_string_name(_return_attributes, cn, rjson::copy(*col));
-            }
-        }
-        const column_definition* cdef = find_attribute(*_schema, column_name);
-        if (cdef) {
-            row.cells().apply(*cdef, atomic_cell::make_dead(ts, gc_clock::now()));
-        } else {
-            attrs_collector.del(std::move(column_name), ts);
-        }
-    };
 
     // In the ReturnValues=ALL_NEW case, we make a copy of previous_item into
     // _return_attributes and parts of it will be overwritten by the new
@@ -3764,155 +4393,27 @@ update_item_operation::apply(std::unique_ptr<rjson::value> previous_item, api::t
             _return_attributes = rjson::copy(*previous_item);
         } else {
             // If there is no previous item, usually a new item is created
-            // and contains they given key. This may be cancelled at the end
+            // and contains the given key. This may be cancelled at the end
             // of this function if the update is just deletes.
-           _return_attributes = rjson::copy(rjson::get(_request, "Key"));
+            _return_attributes = rjson::copy(rjson::get(_request, "Key"));
         }
-    } else if (_returnvalues == returnvalues::UPDATED_OLD ||
-               _returnvalues == returnvalues::UPDATED_NEW) {
+    } else if (_returnvalues == returnvalues::UPDATED_OLD || _returnvalues == returnvalues::UPDATED_NEW) {
         _return_attributes = rjson::empty_object();
     }
 
+    mutation m(_schema, _pk);
+    bool any_updates = false;
+    bool any_deletes = false;
+    auto& row = m.partition().clustered_row(*_schema, _ck);
+    auto modified_attrs = attribute_collector();
     if (!_update_expression.empty()) {
-        for (auto& actions : _update_expression) {
-            // The actions of _update_expression are grouped by top-level
-            // attributes. Here, all actions in actions.second share the same
-            // top-level attribute actions.first.
-            std::string column_name = actions.first;
-            const column_definition* cdef = _schema->get_column_definition(to_bytes(column_name));
-            if (cdef && cdef->is_primary_key()) {
-                throw api_error::validation(fmt::format("UpdateItem cannot update key column {}", column_name));
-            }
-            if (actions.second.has_value()) {
-                // An action on a top-level attribute column_name. The single
-                // action is actions.second.get_value(). We can simply invoke
-                // the action and replace the attribute with its result:
-                std::optional<rjson::value> result = action_result(actions.second.get_value(), previous_item.get());
-                if (result) {
-                    do_update(to_bytes(column_name), *result);
-                } else {
-                    do_delete(to_bytes(column_name));
-                }
-            } else {
-                // We have actions on a path or more than one path in the same
-                // top-level attribute column_name - but not on the top-level
-                // attribute as a whole. We already read the full top-level
-                // attribute (see check_needs_read_before_write()), and now we
-                // need to modify pieces of it and write back the entire
-                // top-level attribute.
-                if (!previous_item) {
-                    throw api_error::validation(format("UpdateItem cannot update nested document path on non-existent item"));
-                }
-                const rjson::value *toplevel = rjson::find(*previous_item, column_name);
-                if (!toplevel) {
-                    throw api_error::validation(fmt::format("UpdateItem cannot update document path: missing attribute {}",
-                        column_name));
-                }
-                rjson::value result = rjson::copy(*toplevel);
-                hierarchy_actions(result, actions.second, previous_item.get());
-                do_update(to_bytes(column_name), std::move(result), &actions.second);
-            }
-        }
-    }
-    if (_returnvalues == returnvalues::ALL_OLD && previous_item) {
-        _return_attributes = std::move(*previous_item);
+        apply_update_expression(previous_item, ts, row, modified_attrs, any_updates, any_deletes);
     }
     if (_attribute_updates) {
-        for (auto it = _attribute_updates->MemberBegin(); it != _attribute_updates->MemberEnd(); ++it) {
-            // Note that it.key() is the name of the column, *it is the operation
-            bytes column_name = to_bytes(it->name.GetString());
-            const column_definition* cdef = _schema->get_column_definition(column_name);
-            if (cdef && cdef->is_primary_key()) {
-                throw api_error::validation(
-                        format("UpdateItem cannot update key column {}", it->name.GetString()));
-            }
-            std::string action = (it->value)["Action"].GetString();
-            if (action == "DELETE") {
-                // The DELETE operation can do two unrelated tasks. Without a
-                // "Value" option, it is used to delete an attribute. With a
-                // "Value" option, it is used to delete a set of elements from
-                // a set attribute of the same type.
-                if (it->value.HasMember("Value")) {
-                    // Subtracting sets needs a read of previous_item, so
-                    // check_needs_read_before_write_attribute_updates()
-                    // returns true in this case, and previous_item is
-                    // available to us when the item exists.
-                    const rjson::value* v1 = previous_item ? rjson::find(*previous_item, to_string_view(column_name)) : nullptr;
-                    const rjson::value& v2 = (it->value)["Value"];
-                    validate_value(v2, "AttributeUpdates");
-                    std::string v2_type = get_item_type_string(v2);
-                    if (v2_type != "SS" && v2_type != "NS" && v2_type != "BS") {
-                        throw api_error::validation(fmt::format("AttributeUpdates DELETE operation with Value only valid for sets, got type {}", v2_type));
-                    }
-                    if (v1) {
-                        std::optional<rjson::value> result = set_diff(*v1, v2);
-                        if (result) {
-                            do_update(std::move(column_name), *result);
-                        } else {
-                            // DynamoDB does not allow empty sets - if the
-                            // result is empty, delete the attribute.
-                            do_delete(std::move(column_name));
-                        }
-                    } else {
-                        // if the attribute or item don't exist, the DELETE
-                        // operation should silently do nothing - and not
-                        // create an empty item. It's a waste to call
-                        // do_delete() on an attribute we already know is
-                        // deleted, so we can just mark any_deletes = true.
-                        any_deletes = true;
-                    }
-                } else {
-                    do_delete(std::move(column_name));
-                }
-            } else if (action == "PUT") {
-                const rjson::value& value = (it->value)["Value"];
-                validate_value(value, "AttributeUpdates");
-                do_update(std::move(column_name), value);
-            } else if (action == "ADD") {
-                // Note that check_needs_read_before_write_attribute_updates()
-                // made sure we retrieved previous_item (if exists) when there
-                // is an ADD action.
-                const rjson::value* v1 = previous_item ? rjson::find(*previous_item, to_string_view(column_name)) : nullptr;
-                const rjson::value& v2 = (it->value)["Value"];
-                validate_value(v2, "AttributeUpdates");
-                // An ADD can be used to create a new attribute (when
-                // !v1) or to add to a pre-existing attribute:
-                if (!v1) {
-                    std::string v2_type = get_item_type_string(v2);
-                    if (v2_type == "N" || v2_type == "SS" || v2_type == "NS" || v2_type == "BS" || v2_type == "L") {
-                        do_update(std::move(column_name), v2);
-                    } else {
-                        throw api_error::validation(format("An operand in the AttributeUpdates ADD has an incorrect data type: {}", v2));
-                    }
-                } else {
-                    std::string v1_type = get_item_type_string(*v1);
-                    std::string v2_type = get_item_type_string(v2);
-                    if (v2_type != v1_type) {
-                        throw api_error::validation(fmt::format("Operand type mismatch in AttributeUpdates ADD. Expected {}, got {}", v1_type, v2_type));
-                    }
-                    if (v1_type == "N") {
-                        do_update(std::move(column_name), number_add(*v1, v2));
-                    } else if (v1_type == "SS" || v1_type == "NS" || v1_type == "BS") {
-                        do_update(std::move(column_name), set_sum(*v1, v2));
-                    } else if (v1_type == "L") {
-                        // The DynamoDB documentation doesn't say it supports
-                        // lists in ADD operations, but it turns out that it
-                        // does. Interestingly, this is only true for
-                        // AttributeUpdates (this code) - the similar ADD
-                        // in UpdateExpression doesn't support lists.
-                        do_update(std::move(column_name), list_concatenate(*v1, v2));
-                    } else {
-                        throw api_error::validation(format("An operand in the AttributeUpdates ADD has an incorrect data type: {}", *v1));
-                    }
-                }
-            } else {
-                throw api_error::validation(
-                        fmt::format("Unknown Action value '{}' in AttributeUpdates", action));
-            }
-        }
+        apply_attribute_updates(previous_item, ts, row, modified_attrs, any_updates, any_deletes);
     }
-    if (!attrs_collector.empty()) {
-        auto serialized_map = attrs_collector.to_mut().serialize(*attrs_type());
+    if (!modified_attrs.empty()) {
+        auto serialized_map = modified_attrs.to_mut().serialize(*attrs_type());
         row.cells().apply(attrs_column(*_schema), std::move(serialized_map));
     }
     // To allow creation of an item with no attributes, we need a row marker.
@@ -3925,6 +4426,9 @@ update_item_operation::apply(std::unique_ptr<rjson::value> previous_item, api::t
         // There was no pre-existing item, and we're not creating one, so
         // don't report the new item in the returned Attributes.
         _return_attributes = rjson::null_value();
+    }
+    if (_returnvalues == returnvalues::ALL_OLD && previous_item) {
+        _return_attributes = std::move(*previous_item);
     }
     // ReturnValues=UPDATED_OLD/NEW never return an empty Attributes field,
     // even if a new item was created. Instead it should be missing entirely.
@@ -3942,31 +4446,39 @@ future<executor::request_return_type> executor::update_item(client_state& client
     auto start_time = std::chrono::steady_clock::now();
     elogger.trace("update_item {}", request);
 
-    auto op = make_shared<update_item_operation>(_proxy, std::move(request));
+    auto op = make_shared<update_item_operation>(*_parsed_expression_cache, _proxy, std::move(request));
     tracing::add_table_name(trace_state, op->schema()->ks_name(), op->schema()->cf_name());
-    const bool needs_read_before_write = op->needs_read_before_write();
+    const bool needs_read_before_write = _proxy.data_dictionary().get_config().alternator_force_read_before_write() || op->needs_read_before_write();
 
-    co_await verify_permission(_enforce_authorization, client_state, op->schema(), auth::permission::MODIFY);
+    co_await verify_permission(_enforce_authorization, _warn_authorization, client_state, op->schema(), auth::permission::MODIFY, _stats);
 
-    if (auto shard = op->shard_for_execute(needs_read_before_write); shard) {
+    auto cas_shard = op->shard_for_execute(needs_read_before_write);
+
+    if (cas_shard && !cas_shard->this_shard()) {
         _stats.api_operations.update_item--; // uncount on this shard, will be counted in other shard
         _stats.shard_bounce_for_lwt++;
-        co_return co_await container().invoke_on(*shard, _ssg,
+        co_return co_await container().invoke_on(cas_shard->shard(), _ssg,
                 [request = std::move(*op).move_request(), cs = client_state.move_to_other_shard(), gt = tracing::global_trace_state_ptr(trace_state), permit = std::move(permit)]
                 (executor& e) mutable {
             return do_with(cs.get(), [&e, request = std::move(request), trace_state = tracing::trace_state_ptr(gt)]
                                      (service::client_state& client_state) mutable {
-                //FIXME: A corresponding FIXME can be found in transport/server.cc when a message must be bounced
-                // to another shard - once it is solved, this place can use a similar solution. Instead of passing
-                // empty_service_permit() to the background operation, the current permit's lifetime should be prolonged,
-                // so that it's destructed only after all background operations are finished as well.
+                //FIXME: Instead of passing empty_service_permit() to the background operation,
+                // the current permit's lifetime should be prolonged, so that it's destructed
+                // only after all background operations are finished as well.
                 return e.update_item(client_state, std::move(trace_state), empty_service_permit(), std::move(request));
             });
         });
     }
-    co_return co_await op->execute(_proxy, client_state, trace_state, std::move(permit), needs_read_before_write, _stats, _stats.wcu_total[stats::wcu_types::UPDATE_ITEM]).finally([op, start_time, this] {
-        _stats.api_operations.update_item_latency.mark(std::chrono::steady_clock::now() - start_time);
-    });
+    lw_shared_ptr<stats> per_table_stats = get_stats_from_schema(_proxy, *(op->schema()));
+    per_table_stats->api_operations.update_item++;
+    uint64_t wcu_total = 0;
+    auto res = co_await op->execute(_proxy, std::move(cas_shard), client_state, trace_state, std::move(permit), needs_read_before_write, _stats, *per_table_stats, wcu_total);
+    per_table_stats->operation_sizes.update_item_op_size_kb.add(bytes_to_kb_ceil(op->consumed_capacity()._total_bytes));
+    per_table_stats->wcu_total[stats::wcu_types::UPDATE_ITEM] += wcu_total;
+    _stats.wcu_total[stats::wcu_types::UPDATE_ITEM] += wcu_total;
+    per_table_stats->api_operations.update_item_latency.mark(std::chrono::steady_clock::now() - start_time);
+    _stats.api_operations.update_item_latency.mark(std::chrono::steady_clock::now() - start_time);
+    co_return res;
 }
 
 // Check according to the request's "ConsistentRead" field, which consistency
@@ -4014,7 +4526,8 @@ future<executor::request_return_type> executor::get_item(client_state& client_st
     elogger.trace("Getting item {}", request);
 
     schema_ptr schema = get_table(_proxy, request);
-
+    lw_shared_ptr<stats> per_table_stats = get_stats_from_schema(_proxy, *schema);
+    per_table_stats->api_operations.get_item++;
     tracing::add_table_name(trace_state, schema->ks_name(), schema->cf_name());
 
     rjson::value& query_key = request["Key"];
@@ -4034,7 +4547,7 @@ future<executor::request_return_type> executor::get_item(client_state& client_st
 
     //TODO(sarna): It would be better to fetch only some attributes of the map, not all
     auto regular_columns =
-            schema->regular_columns() | std::views::transform([] (const column_definition& cdef) { return cdef.id; })
+            schema->regular_columns() | std::views::transform(&column_definition::id)
             | std::ranges::to<query::column_id_vector>();
 
     auto selection = cql3::selection::selection::wildcard(schema);
@@ -4044,19 +4557,26 @@ future<executor::request_return_type> executor::get_item(client_state& client_st
             query::tombstone_limit(_proxy.get_tombstone_limit()));
 
     std::unordered_set<std::string> used_attribute_names;
-    auto attrs_to_get = calculate_attrs_to_get(request, used_attribute_names);
+    auto attrs_to_get = calculate_attrs_to_get(request, *_parsed_expression_cache, used_attribute_names);
     const rjson::value* expression_attribute_names = rjson::find(request, "ExpressionAttributeNames");
     verify_all_are_used(expression_attribute_names, used_attribute_names, "ExpressionAttributeNames", "GetItem");
     rcu_consumed_capacity_counter add_capacity(request, cl == db::consistency_level::LOCAL_QUORUM);
-    co_await verify_permission(_enforce_authorization, client_state, schema, auth::permission::SELECT);
-    co_return co_await _proxy.query(schema, std::move(command), std::move(partition_ranges), cl,
-            service::storage_proxy::coordinator_query_options(executor::default_timeout(), std::move(permit), client_state, trace_state)).then(
-            [this, schema, partition_slice = std::move(partition_slice), selection = std::move(selection), attrs_to_get = std::move(attrs_to_get), start_time = std::move(start_time), add_capacity=std::move(add_capacity)] (service::storage_proxy::coordinator_query_result qr) mutable {
-
-        _stats.api_operations.get_item_latency.mark(std::chrono::steady_clock::now() - start_time);
-
-        return make_ready_future<executor::request_return_type>(make_jsonable(describe_item(schema, partition_slice, *selection, *qr.query_result, std::move(attrs_to_get), add_capacity, _stats.rcu_total)));
-    });
+    co_await verify_permission(_enforce_authorization, _warn_authorization, client_state, schema, auth::permission::SELECT, _stats);
+    service::storage_proxy::coordinator_query_result qr =
+        co_await _proxy.query(
+            schema, std::move(command), std::move(partition_ranges), cl,
+            service::storage_proxy::coordinator_query_options(executor::default_timeout(), std::move(permit), client_state, trace_state));
+    per_table_stats->api_operations.get_item_latency.mark(std::chrono::steady_clock::now() - start_time);
+    _stats.api_operations.get_item_latency.mark(std::chrono::steady_clock::now() - start_time);
+    uint64_t rcu_half_units = 0;
+    rjson::value res = describe_item(schema, partition_slice, *selection, *qr.query_result, std::move(attrs_to_get), add_capacity, rcu_half_units);
+    per_table_stats->rcu_half_units_total += rcu_half_units;
+    _stats.rcu_half_units_total += rcu_half_units;
+    // Update item size metrics only if we found an item.
+    if (qr.query_result->row_count().value_or(0) > 0) {
+        per_table_stats->operation_sizes.get_item_op_size_kb.add(bytes_to_kb_ceil(add_capacity._total_bytes));
+    }
+    co_return rjson::print(std::move(res));
 }
 
 static void check_big_object(const rjson::value& val, int& size_left);
@@ -4127,6 +4647,7 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
     // listing all the request aimed at a single table. For efficiency, inside
     // each table_requests we further group together all reads going to the
     // same partition, so we can later send them together.
+    bool should_add_rcu = rcu_consumed_capacity_counter::should_add_capacity(request);
     struct table_requests {
         schema_ptr schema;
         db::consistency_level cl;
@@ -4159,7 +4680,7 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
         tracing::add_table_name(trace_state, sstring(executor::KEYSPACE_NAME_PREFIX) + rs.schema->cf_name(), rs.schema->cf_name());
         rs.cl = get_read_consistency(it->value);
         std::unordered_set<std::string> used_attribute_names;
-        rs.attrs_to_get = ::make_shared<const std::optional<attrs_to_get>>(calculate_attrs_to_get(it->value, used_attribute_names));
+        rs.attrs_to_get = ::make_shared<const std::optional<attrs_to_get>>(calculate_attrs_to_get(it->value, *_parsed_expression_cache, used_attribute_names));
         const rjson::value* expression_attribute_names = rjson::find(it->value, "ExpressionAttributeNames");
         verify_all_are_used(expression_attribute_names, used_attribute_names,"ExpressionAttributeNames", "GetItem");
         auto& keys = (it->value)["Keys"];
@@ -4172,17 +4693,21 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
     }
 
     for (const table_requests& tr : requests) {
-        co_await verify_permission(_enforce_authorization, client_state, tr.schema, auth::permission::SELECT);
+        co_await verify_permission(_enforce_authorization, _warn_authorization, client_state, tr.schema, auth::permission::SELECT, _stats);
     }
 
     _stats.api_operations.batch_get_item_batch_total += batch_size;
+    _stats.api_operations.batch_get_item_histogram.add(batch_size);
     // If we got here, all "requests" are valid, so let's start the
     // requests for the different partitions all in parallel.
     std::vector<future<std::vector<rjson::value>>> response_futures;
-    for (const auto& rs : requests) {
-        for (const auto &r : rs.requests) {
-            auto& pk = r.first;
-            auto& cks = r.second;
+    std::vector<uint64_t> consumed_rcu_half_units_per_table(requests.size());
+    for (size_t i = 0; i < requests.size(); i++) {
+        const table_requests& rs = requests[i];
+        bool is_quorum = rs.cl == db::consistency_level::LOCAL_QUORUM;
+        lw_shared_ptr<stats> per_table_stats = get_stats_from_schema(_proxy, *rs.schema);
+        per_table_stats->api_operations.batch_get_item_histogram.add(rs.requests.size());
+        for (const auto& [pk, cks] : rs.requests) {
             dht::partition_range_vector partition_ranges{dht::partition_range(dht::decorate_key(*rs.schema, pk))};
             std::vector<query::clustering_range> bounds;
             if (rs.schema->clustering_key_size() == 0) {
@@ -4193,18 +4718,25 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
                 }
             }
             auto regular_columns =
-                    rs.schema->regular_columns() | std::views::transform([] (const column_definition& cdef) { return cdef.id; })
+                    rs.schema->regular_columns() | std::views::transform(&column_definition::id)
                     | std::ranges::to<query::column_id_vector>();
             auto selection = cql3::selection::selection::wildcard(rs.schema);
             auto partition_slice = query::partition_slice(std::move(bounds), {}, std::move(regular_columns), selection->get_query_options());
             auto command = ::make_lw_shared<query::read_command>(rs.schema->id(), rs.schema->version(), partition_slice, _proxy.get_max_result_size(partition_slice),
                     query::tombstone_limit(_proxy.get_tombstone_limit()));
             command->allow_limit = db::allow_per_partition_rate_limit::yes;
+            const auto item_callback = [is_quorum, per_table_stats, &rcus_per_table = consumed_rcu_half_units_per_table[i]](uint64_t size) {
+                rcus_per_table += rcu_consumed_capacity_counter::get_half_units(size, is_quorum);
+                // Update item size only if the item exists.
+                if (size > 0) {
+                    per_table_stats->operation_sizes.batch_get_item_op_size_kb.add(bytes_to_kb_ceil(size));
+                }
+            };
             future<std::vector<rjson::value>> f = _proxy.query(rs.schema, std::move(command), std::move(partition_ranges), rs.cl,
                     service::storage_proxy::coordinator_query_options(executor::default_timeout(), permit, client_state, trace_state)).then(
-                    [schema = rs.schema, partition_slice = std::move(partition_slice), selection = std::move(selection), attrs_to_get = rs.attrs_to_get] (service::storage_proxy::coordinator_query_result qr) mutable {
+                    [schema = rs.schema, partition_slice = std::move(partition_slice), selection = std::move(selection), attrs_to_get = rs.attrs_to_get, item_callback = std::move(item_callback)] (service::storage_proxy::coordinator_query_result qr) mutable {
                 utils::get_local_injector().inject("alternator_batch_get_item", [] { throw std::runtime_error("batch_get_item injection"); });
-                return describe_multi_item(std::move(schema), std::move(partition_slice), std::move(selection), std::move(qr.query_result), std::move(attrs_to_get));
+                return describe_multi_item(std::move(schema), std::move(partition_slice), std::move(selection), std::move(qr.query_result), std::move(attrs_to_get), std::move(item_callback));
             });
             response_futures.push_back(std::move(f));
         }
@@ -4219,13 +4751,12 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
     rjson::value response = rjson::empty_object();
     rjson::add(response, "Responses", rjson::empty_object());
     rjson::add(response, "UnprocessedKeys", rjson::empty_object());
-
     auto fut_it = response_futures.begin();
-    for (const auto& rs : requests) {
-        auto table = table_name(*rs.schema);
-        for (const auto &r : rs.requests) {
-            auto& pk = r.first;
-            auto& cks = r.second;
+    rjson::value consumed_capacity = rjson::empty_array();
+    for (size_t i = 0; i < requests.size(); i++) {
+        const table_requests& rs = requests[i];
+        std::string table = table_name(*rs.schema);
+        for (const auto& [_, cks] : rs.requests) {
             auto& fut = *fut_it;
             ++fut_it;
             try {
@@ -4261,6 +4792,20 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
                 }
             }
         }
+        uint64_t rcu_half_units = consumed_rcu_half_units_per_table[i];
+        _stats.rcu_half_units_total += rcu_half_units;
+        lw_shared_ptr<stats> per_table_stats = get_stats_from_schema(_proxy, *rs.schema);
+        per_table_stats->rcu_half_units_total += rcu_half_units;
+        if (should_add_rcu) {
+            rjson::value entry = rjson::empty_object();
+            rjson::add(entry, "TableName", table);
+            rjson::add(entry, "CapacityUnits", rcu_half_units*0.5);
+            rjson::push_back(consumed_capacity, std::move(entry));
+        }
+    }
+
+    if (should_add_rcu) {
+        rjson::add(response, "ConsumedCapacity", std::move(consumed_capacity));
     }
     elogger.trace("Unprocessed keys: {}", response["UnprocessedKeys"]);
     if (!some_succeeded && eptr) {
@@ -4270,7 +4815,7 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
     if (is_big(response)) {
         co_return make_streamed(std::move(response));
     } else {
-        co_return make_jsonable(std::move(response));
+        co_return rjson::print(std::move(response));
     }
 }
 
@@ -4298,7 +4843,7 @@ public:
     enum class request_type { SCAN, QUERY };
     // Note that a filter does not store pointers to the query used to
     // construct it.
-    filter(const rjson::value& request, request_type rt,
+    filter(parsed::expression_cache& parsed_expression_cache, const rjson::value& request, request_type rt,
             std::unordered_set<std::string>& used_attribute_names,
             std::unordered_set<std::string>& used_attribute_values);
     bool check(const rjson::value& item) const;
@@ -4310,7 +4855,7 @@ public:
     operator bool() const { return bool(_imp); }
 };
 
-filter::filter(const rjson::value& request, request_type rt,
+filter::filter(parsed::expression_cache& parsed_expression_cache, const rjson::value& request, request_type rt,
         std::unordered_set<std::string>& used_attribute_names,
         std::unordered_set<std::string>& used_attribute_values) {
     const rjson::value* expression = rjson::find(request, "FilterExpression");
@@ -4338,7 +4883,7 @@ filter::filter(const rjson::value& request, request_type rt,
             throw api_error::validation("Cannot use both old-style and new-style parameters in same request: FilterExpression and AttributesToGet");
         }
         try {
-            auto parsed = parse_condition_expression(rjson::to_string_view(*expression), "FilterExpression");
+            auto parsed = parsed_expression_cache.parse_condition_expression(rjson::to_string_view(*expression), "FilterExpression");
             const rjson::value* expression_attribute_names = rjson::find(request, "ExpressionAttributeNames");
             const rjson::value* expression_attribute_values = rjson::find(request, "ExpressionAttributeValues");
             resolve_condition_expression(parsed,
@@ -4414,7 +4959,11 @@ class describe_items_visitor {
     const filter& _filter;
     typename columns_t::const_iterator _column_it;
     rjson::value _item;
-    rjson::value _items;
+    // _items is a chunked_vector<rjson::value> instead of a RapidJson array
+    // (rjson::value) because unfortunately RapidJson arrays are stored
+    // contiguously in memory, and cause large allocations when a Query/Scan
+    // returns a long list of short items (issue #23535).
+    utils::chunked_vector<rjson::value> _items;
     size_t _scanned_count;
 
 public:
@@ -4424,7 +4973,6 @@ public:
             , _filter(filter)
             , _column_it(columns.begin())
             , _item(rjson::empty_object())
-            , _items(rjson::empty_array())
             , _scanned_count(0)
     {
         // _filter.check() may need additional attributes not listed in
@@ -4503,13 +5051,13 @@ public:
                 rjson::remove_member(_item, attr);
             }
 
-            rjson::push_back(_items, std::move(_item));
+            _items.push_back(std::move(_item));
         }
         _item = rjson::empty_object();
         ++_scanned_count;
     }
 
-    rjson::value get_items() && {
+    utils::chunked_vector<rjson::value> get_items() && {
         return std::move(_items);
     }
 
@@ -4518,13 +5066,25 @@ public:
     }
 };
 
-static future<std::tuple<rjson::value, size_t>> describe_items(const cql3::selection::selection& selection, std::unique_ptr<cql3::result_set> result_set, std::optional<attrs_to_get>&& attrs_to_get, filter&& filter) {
+// describe_items() returns a JSON object that includes members "Count"
+// and "ScannedCount", but *not* "Items" - that is returned separately
+// as a chunked_vector to avoid large contiguous allocations which
+// RapidJSON does of its array. The caller should add "Items" to the
+// returned JSON object if needed, or print it separately.
+// The returned chunked_vector (the items) is std::optional<>, because
+// the user may have requested only to count items, and not return any
+// items - which is different from returning an empty list of items.
+static future<std::tuple<rjson::value, std::optional<utils::chunked_vector<rjson::value>>, size_t>> describe_items(
+        const cql3::selection::selection& selection,
+        std::unique_ptr<cql3::result_set> result_set,
+        std::optional<attrs_to_get>&& attrs_to_get,
+        filter&& filter) {
     describe_items_visitor visitor(selection.get_columns(), attrs_to_get, filter);
     co_await result_set->visit_gently(visitor);
     auto scanned_count = visitor.get_scanned_count();
-    rjson::value items = std::move(visitor).get_items();
+    utils::chunked_vector<rjson::value> items = std::move(visitor).get_items();
     rjson::value items_descr = rjson::empty_object();
-    auto size = items.Size();
+    auto size = items.size();
     rjson::add(items_descr, "Count", rjson::value(size));
     rjson::add(items_descr, "ScannedCount", rjson::value(scanned_count));
     // If attrs_to_get && attrs_to_get->empty(), this means the user asked not
@@ -4534,10 +5094,11 @@ static future<std::tuple<rjson::value, size_t>> describe_items(const cql3::selec
     // In that case, we currently build a list of empty items and here drop
     // it. We could just count the items and not bother with the empty items.
     // (However, remember that when we do have a filter, we need the items).
+    std::optional<utils::chunked_vector<rjson::value>> opt_items;
     if (!attrs_to_get || !attrs_to_get->empty()) {
-        rjson::add(items_descr, "Items", std::move(items));
+        opt_items = std::move(items);
     }
-    co_return std::tuple<rjson::value, size_t>{std::move(items_descr), size};
+    co_return std::tuple(std::move(items_descr), std::move(opt_items), size);
 }
 
 static rjson::value encode_paging_state(const schema& schema, const service::pager::paging_state& paging_state) {
@@ -4575,6 +5136,12 @@ static rjson::value encode_paging_state(const schema& schema, const service::pag
     return last_evaluated_key;
 }
 
+// RapidJSON allocates arrays contiguously in memory, so we want to avoid
+// returning a large number of items as a single rapidjson array, and use
+// a chunked_vector instead. The following constant is an arbitrary cutoff
+// point for when to switch from a rapidjson array to a chunked_vector.
+static constexpr int max_items_for_rapidjson_array = 256;
+
 static future<executor::request_return_type> do_query(service::storage_proxy& proxy,
         schema_ptr table_schema,
         const rjson::value* exclusive_start_key,
@@ -4586,10 +5153,11 @@ static future<executor::request_return_type> do_query(service::storage_proxy& pr
         filter filter,
         query::partition_slice::option_set custom_opts,
         service::client_state& client_state,
-        cql3::cql_stats& cql_stats,
+        alternator::stats& stats,
         tracing::trace_state_ptr trace_state,
         service_permit permit,
-        bool enforce_authorization) {
+        bool enforce_authorization,
+        bool warn_authorization) {
     lw_shared_ptr<service::pager::paging_state> old_paging_state = nullptr;
 
     tracing::trace(trace_state, "Performing a database query");
@@ -4616,13 +5184,13 @@ static future<executor::request_return_type> do_query(service::storage_proxy& pr
         old_paging_state = make_lw_shared<service::pager::paging_state>(pk, pos, query::max_partitions, query_id::create_null_id(), service::pager::paging_state::replicas_per_token_range{}, std::nullopt, 0);
     }
 
-    co_await verify_permission(enforce_authorization, client_state, table_schema, auth::permission::SELECT);
+    co_await verify_permission(enforce_authorization, warn_authorization, client_state, table_schema, auth::permission::SELECT, stats);
 
     auto regular_columns =
-            table_schema->regular_columns() | std::views::transform([] (const column_definition& cdef) { return cdef.id; })
+            table_schema->regular_columns() | std::views::transform(&column_definition::id)
             | std::ranges::to<query::column_id_vector>();
     auto static_columns =
-            table_schema->static_columns() | std::views::transform([] (const column_definition& cdef) { return cdef.id; })
+            table_schema->static_columns() | std::views::transform(&column_definition::id)
             | std::ranges::to<query::column_id_vector>();
     auto selection = cql3::selection::selection::wildcard(table_schema);
     query::partition_slice::option_set opts = selection->get_query_options();
@@ -4647,19 +5215,35 @@ static future<executor::request_return_type> do_query(service::storage_proxy& pr
     }
     auto paging_state = rs->get_metadata().paging_state();
     bool has_filter = filter;
-    auto [items, size] = co_await describe_items(*selection, std::move(rs), std::move(attrs_to_get), std::move(filter));
+    auto [items_descr, opt_items, size] = co_await describe_items(*selection, std::move(rs), std::move(attrs_to_get), std::move(filter));
     if (paging_state) {
-        rjson::add(items, "LastEvaluatedKey", encode_paging_state(*table_schema, *paging_state));
+        rjson::add(items_descr, "LastEvaluatedKey", encode_paging_state(*table_schema, *paging_state));
     }
-    if (has_filter){
-        cql_stats.filtered_rows_read_total += p->stats().rows_read_total;
+    if (has_filter) {
+        stats.cql_stats.filtered_rows_read_total += p->stats().rows_read_total;
         // update our "filtered_row_matched_total" for all the rows matched, despited the filter
-        cql_stats.filtered_rows_matched_total += size;
+        stats.cql_stats.filtered_rows_matched_total += size;
     }
-    if (is_big(items)) {
-        co_return executor::request_return_type(make_streamed(std::move(items)));
+    if (opt_items) {
+        if (opt_items->size() >= max_items_for_rapidjson_array) {
+            // There are many items, better print the JSON and the array of
+            // items (opt_items) separately to avoid RapidJSON's contiguous
+            // allocation of arrays.
+            co_return make_streamed_with_extra_array(std::move(items_descr), "Items", std::move(*opt_items));
+        }
+        // There aren't many items in the chunked vector opt_items,
+        // let's just insert them into the JSON object and print the
+        // full JSON normally.
+        rjson::value items_json = rjson::empty_array();
+        for (auto& item : *opt_items) {
+            rjson::push_back(items_json, std::move(item));
+        }
+        rjson::add(items_descr, "Items", std::move(items_json));
     }
-    co_return executor::request_return_type(make_jsonable(std::move(items)));
+    if (is_big(items_descr)) {
+        co_return make_streamed(std::move(items_descr));
+    }
+    co_return rjson::print(std::move(items_descr));
 }
 
 static dht::token token_for_segment(int segment, int total_segments) {
@@ -4695,7 +5279,7 @@ future<executor::request_return_type> executor::scan(client_state& client_state,
     elogger.trace("Scanning {}", request);
 
     auto [schema, table_type] = get_table_or_view(_proxy, request);
-
+    get_stats_from_schema(_proxy, *schema)->api_operations.scan++;
     auto segment = get_int_attribute(request, "Segment");
     auto total_segments = get_int_attribute(request, "TotalSegments");
     if (segment || total_segments) {
@@ -4730,7 +5314,7 @@ future<executor::request_return_type> executor::scan(client_state& client_state,
 
     std::unordered_set<std::string> used_attribute_names;
     std::unordered_set<std::string> used_attribute_values;
-    auto attrs_to_get = calculate_attrs_to_get(request, used_attribute_names, select);
+    auto attrs_to_get = calculate_attrs_to_get(request, *_parsed_expression_cache, used_attribute_names, select);
 
     dht::partition_range_vector partition_ranges;
     if (segment) {
@@ -4749,7 +5333,7 @@ future<executor::request_return_type> executor::scan(client_state& client_state,
     }
     std::vector<query::clustering_range> ck_bounds{query::clustering_range::make_open_ended_both_sides()};
 
-    filter filter(request, filter::request_type::SCAN, used_attribute_names, used_attribute_values);
+    filter filter(*_parsed_expression_cache, request, filter::request_type::SCAN, used_attribute_names, used_attribute_values);
     // Note: Unlike Query, Scan does allow a filter on the key attributes.
     // For some *specific* cases of key filtering, such an equality test on
     // partition key or comparison operator for the sort key, we could have
@@ -4762,7 +5346,7 @@ future<executor::request_return_type> executor::scan(client_state& client_state,
     verify_all_are_used(expression_attribute_values, used_attribute_values, "ExpressionAttributeValues", "Scan");
 
     return do_query(_proxy, schema, exclusive_start_key, std::move(partition_ranges), std::move(ck_bounds), std::move(attrs_to_get), limit, cl,
-            std::move(filter), query::partition_slice::option_set(), client_state, _stats.cql_stats, trace_state, std::move(permit), _enforce_authorization);
+            std::move(filter), query::partition_slice::option_set(), client_state, _stats, trace_state, std::move(permit), _enforce_authorization, _warn_authorization);
 }
 
 static dht::partition_range calculate_pk_bound(schema_ptr schema, const column_definition& pk_cdef, const rjson::value& comp_definition, const rjson::value& attrs) {
@@ -4964,7 +5548,8 @@ calculate_bounds_condition_expression(schema_ptr schema,
         const rjson::value* expression_attribute_values,
         std::unordered_set<std::string>& used_attribute_values,
         const rjson::value* expression_attribute_names,
-        std::unordered_set<std::string>& used_attribute_names)
+        std::unordered_set<std::string>& used_attribute_names,
+        parsed::expression_cache& parsed_expression_cache)
 {
     if (!expression.IsString()) {
         throw api_error::validation("KeyConditionExpression must be a string");
@@ -4980,7 +5565,7 @@ calculate_bounds_condition_expression(schema_ptr schema,
     // sort-key range.
     parsed::condition_expression p;
     try {
-        p = parse_condition_expression(rjson::to_string_view(expression), "KeyConditionExpression");
+        p = parsed_expression_cache.parse_condition_expression(rjson::to_string_view(expression), "KeyConditionExpression");
     } catch(expressions_syntax_error& e) {
         throw api_error::validation(e.what());
     }
@@ -5172,7 +5757,7 @@ future<executor::request_return_type> executor::query(client_state& client_state
     elogger.trace("Querying {}", request);
 
     auto [schema, table_type] = get_table_or_view(_proxy, request);
-
+    get_stats_from_schema(_proxy, *schema)->api_operations.query++;
     tracing::add_table_name(trace_state, schema->ks_name(), schema->cf_name());
 
     rjson::value* exclusive_start_key = rjson::find(request, "ExclusiveStartKey");
@@ -5211,9 +5796,9 @@ future<executor::request_return_type> executor::query(client_state& client_state
                         expression_attribute_values,
                         used_attribute_values,
                         expression_attribute_names,
-                        used_attribute_names);
+                        used_attribute_names, *_parsed_expression_cache);
 
-    filter filter(request, filter::request_type::QUERY,
+    filter filter(*_parsed_expression_cache, request, filter::request_type::QUERY,
             used_attribute_names, used_attribute_values);
 
     // A query is not allowed to filter on the partition key or the sort key.
@@ -5236,13 +5821,13 @@ future<executor::request_return_type> executor::query(client_state& client_state
 
     select_type select = parse_select(request, table_type);
 
-    auto attrs_to_get = calculate_attrs_to_get(request, used_attribute_names, select);
+    auto attrs_to_get = calculate_attrs_to_get(request, *_parsed_expression_cache, used_attribute_names, select);
     verify_all_are_used(expression_attribute_names, used_attribute_names, "ExpressionAttributeNames", "Query");
     verify_all_are_used(expression_attribute_values, used_attribute_values, "ExpressionAttributeValues", "Query");
     query::partition_slice::option_set opts;
     opts.set_if<query::partition_slice::option::reversed>(!forward);
     return do_query(_proxy, schema, exclusive_start_key, std::move(partition_ranges), std::move(ck_bounds), std::move(attrs_to_get), limit, cl,
-            std::move(filter), opts, client_state, _stats.cql_stats, std::move(trace_state), std::move(permit), _enforce_authorization);
+            std::move(filter), opts, client_state, _stats, std::move(trace_state), std::move(permit), _enforce_authorization, _warn_authorization);
 }
 
 future<executor::request_return_type> executor::list_tables(client_state& client_state, service_permit permit, rjson::value request) {
@@ -5254,7 +5839,7 @@ future<executor::request_return_type> executor::list_tables(client_state& client
     std::string exclusive_start = exclusive_start_json ? exclusive_start_json->GetString() : "";
     int limit = limit_json ? limit_json->GetInt() : 100;
     if (limit < 1 || limit > 100) {
-        return make_ready_future<request_return_type>(api_error::validation("Limit must be greater than 0 and no greater than 100"));
+        co_return api_error::validation("Limit must be greater than 0 and no greater than 100");
     }
 
     auto tables = _proxy.data_dictionary().get_tables(); // hold on to temporary, table_names isn't a container, it's a view
@@ -5296,7 +5881,7 @@ future<executor::request_return_type> executor::list_tables(client_state& client
         rjson::add(response, "LastEvaluatedTableName", rjson::copy(last_table_name));
     }
 
-    return make_ready_future<executor::request_return_type>(make_jsonable(std::move(response)));
+    co_return rjson::print(std::move(response));
 }
 
 future<executor::request_return_type> executor::describe_endpoints(client_state& client_state, service_permit permit, rjson::value request, std::string host_header) {
@@ -5307,8 +5892,8 @@ future<executor::request_return_type> executor::describe_endpoints(client_state&
     if (!override.empty()) {
         if (override == "disabled") {
             _stats.unsupported_operations++;
-            return make_ready_future<request_return_type>(api_error::unknown_operation(
-                "DescribeEndpoints disabled by configuration (alternator_describe_endpoints=disabled)"));
+            co_return api_error::unknown_operation(
+                "DescribeEndpoints disabled by configuration (alternator_describe_endpoints=disabled)");
         }
         host_header = std::move(override);
     }
@@ -5320,18 +5905,18 @@ future<executor::request_return_type> executor::describe_endpoints(client_state&
     // A "Host:" header includes both host name and port, exactly what we need
     // to return.
     if (host_header.empty()) {
-        return make_ready_future<request_return_type>(api_error::validation("DescribeEndpoints needs a 'Host:' header in request"));
+        co_return api_error::validation("DescribeEndpoints needs a 'Host:' header in request");
     }
     rjson::add(response, "Endpoints", rjson::empty_array());
     rjson::push_back(response["Endpoints"], rjson::empty_object());
     rjson::add(response["Endpoints"][0], "Address", rjson::from_string(host_header));
     rjson::add(response["Endpoints"][0], "CachePeriodInMinutes", rjson::value(1440));
-    return make_ready_future<executor::request_return_type>(make_jsonable(std::move(response)));
+    co_return rjson::print(std::move(response));
 }
 
-static std::map<sstring, sstring> get_network_topology_options(service::storage_proxy& sp, gms::gossiper& gossiper, int rf) {
-    std::map<sstring, sstring> options;
-    for (const auto& dc : sp.get_token_metadata_ptr()->get_topology().get_datacenters()) {
+static locator::replication_strategy_config_options get_network_topology_options(service::storage_proxy& sp, gms::gossiper& gossiper, int rf) {
+    locator::replication_strategy_config_options options;
+    for (const auto& dc : sp.get_token_metadata_ptr()->get_datacenter_racks_token_owners() | std::views::keys) {
         options.emplace(dc, std::to_string(rf));
     }
     return options;
@@ -5361,7 +5946,7 @@ future<executor::request_return_type> executor::describe_continuous_backups(clie
     rjson::add(desc, "PointInTimeRecoveryDescription", std::move(pitr));
     rjson::value response = rjson::empty_object();
     rjson::add(response, "ContinuousBackupsDescription", std::move(desc));
-    co_return make_jsonable(std::move(response));
+    co_return rjson::print(std::move(response));
 }
 
 // Create the metadata for the keyspace in which we put the alternator
@@ -5371,15 +5956,6 @@ future<executor::request_return_type> executor::describe_continuous_backups(clie
 // A smaller cluster (presumably, a test only), gets RF=1. The user may
 // manually create the keyspace to override this predefined behavior.
 static lw_shared_ptr<keyspace_metadata> create_keyspace_metadata(std::string_view keyspace_name, service::storage_proxy& sp, gms::gossiper& gossiper, api::timestamp_type ts, const std::map<sstring, sstring>& tags_map, const gms::feature_service& feat) {
-    int endpoint_count = gossiper.num_endpoints();
-    int rf = 3;
-    if (endpoint_count < rf) {
-        rf = 1;
-        elogger.warn("Creating keyspace '{}' for Alternator with unsafe RF={} because cluster only has {} nodes.",
-                keyspace_name, rf, endpoint_count);
-    }
-    auto opts = get_network_topology_options(sp, gossiper, rf);
-
     // Even if the "tablets" experimental feature is available, we currently
     // do not enable tablets by default on Alternator tables because LWT is
     // not yet fully supported with tablets.
@@ -5404,12 +5980,31 @@ static lw_shared_ptr<keyspace_metadata> create_keyspace_metadata(std::string_vie
             // initial_tablets to a disengaged optional.
             try {
                 initial_tablets = std::stol(tags_map.at(INITIAL_TABLETS_TAG_KEY));
-            } catch(...) {
+            } catch (...) {
                 initial_tablets = std::nullopt;
             }
         }
     }
-    return keyspace_metadata::new_keyspace(keyspace_name, "org.apache.cassandra.locator.NetworkTopologyStrategy", std::move(opts), initial_tablets);
+
+    int endpoint_count = gossiper.num_endpoints();
+    int rf = 3;
+    if (endpoint_count < rf) {
+        rf = 1;
+        elogger.warn("Creating keyspace '{}' for Alternator with unsafe RF={} because cluster only has {} nodes.",
+                     keyspace_name, rf, endpoint_count);
+    }
+    auto opts = get_network_topology_options(sp, gossiper, rf);
+    cql3::statements::ks_prop_defs props;
+    opts["class"] = sstring("NetworkTopologyStrategy");
+    props.add_property(cql3::statements::ks_prop_defs::KW_REPLICATION, opts);
+    std::map<sstring, sstring> tablet_opts;
+    if (initial_tablets) {
+        tablet_opts["initial"] = std::to_string(*initial_tablets);
+    }
+    tablet_opts["enabled"] = initial_tablets ? "true" : "false";
+    props.add_property(cql3::statements::ks_prop_defs::KW_TABLETS, std::move(tablet_opts));
+    props.validate();
+    return props.as_ks_metadata(sstring(keyspace_name), *sp.get_token_metadata_ptr(), feat, sp.local_db().get_config());
 }
 
 future<> executor::start() {
@@ -5418,4 +6013,10 @@ future<> executor::start() {
     return make_ready_future<>();
 }
 
+future<> executor::stop() {
+    // disconnect from the value source, but keep the value unchanged.
+    s_default_timeout_in_ms = utils::updateable_value<uint32_t>{s_default_timeout_in_ms()};
+    return _parsed_expression_cache->stop();
 }
+
+} // namespace alternator

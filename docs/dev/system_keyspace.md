@@ -121,6 +121,29 @@ SELECT * FROM system.large_cells;
 SELECT * FROM system.large_cells WHERE keyspace_name = 'ks1' and table_name = 'standard1';
 ~~~
 
+## system.corrupt\_data
+
+Stores data found to be corrupt during internal operations. This data cannot be written to sstables because then it will be spread around by repair and compaction. It will also possibly cause failures in sstable parsing.
+At the same time, the data should be kept around so that it can be inspected and possibly restored by the database operator.
+This table is used to store such data. Data is saved at the mutation-fragment level.
+
+Schema:
+```cql
+CREATE TABLE system.corrupt_data (
+    keyspace_name text,              # keyspace name of source table
+    table_name text,                 # table name of source table
+    id timeuuid,                     # id of the corrupt mutation fragment, assigned by the database when the corrupt data entry is created
+    partition_key blob,              # partition key of partition in the source table, can be incomplete or null due to corruption
+    clustering_key text,             # clustering key of mutation-fragment in the source table, can be null for some mutation-fragment kinds, can be incomplete or null due to corruption
+    mutation_fragment_kind text,     # kind of the mutation fragment, one of 'partition start', 'partition end', 'static row', 'clustering row', 'range tombstone change'; only the latter two can have clustering_key set
+    frozen_mutation_fragment blob,   # the serialized mutation fragment itself
+    origin text,                     # the name of the process that found the corruption, e.g. 'sstable-writer'
+    sstable_name text,               # the name of the sstable that contains the corrupt data, if known; sstable is not kept around, it could be compacted or deleted
+    PRIMARY KEY ((keyspace_name, table_name), id)
+) WITH CLUSTERING ORDER BY (id ASC)
+    AND gc_grace_seconds = 0;
+```
+
 ## system.raft
 
 Holds information about Raft
@@ -198,21 +221,27 @@ Holds information about all tablets in the cluster.
 Schema:
 ~~~
 CREATE TABLE system.tablets (
-    keyspace_name text,
     table_id uuid,
     last_token bigint,
+    base_table uuid STATIC,
+    keyspace_name text STATIC,
+    repair_scheduler_config frozen<repair_scheduler_config> STATIC,
+    resize_seq_number bigint STATIC,
+    resize_task_info frozen<tablet_task_info> STATIC,
+    resize_type text STATIC,
+    table_name text STATIC,
+    tablet_count int STATIC,
+    migration_task_info frozen<tablet_task_info>,
     new_replicas frozen<list<frozen<tuple<uuid, int>>>>,
-    replicas frozen<list<frozen<tuple<uuid, int>>>>,
-    stage text,
-    transition text,
-    table_name text static,
-    tablet_count int static,
-    resize_type text static,
-    resize_seq_number bigint static,
-    repair_scheduler_config frozen<repair_scheduler_config> static,
     repair_task_info frozen<tablet_task_info>,
     repair_time timestamp,
-    PRIMARY KEY ((keyspace_name, table_id), last_token)
+    replicas frozen<list<frozen<tuple<uuid, int>>>>,
+    session uuid,
+    stage text,
+    transition text,
+    sstables_repaired_at bigint,
+    repair_incremental_mode text,
+    PRIMARY KEY (table_id, last_token)
 )
 
 CREATE TYPE system.repair_scheduler_config (
@@ -231,12 +260,15 @@ CREATE TYPE system.tablet_task_info (
 )
 ~~~
 
-Each partition (keyspace_name, table_id) represents a tablet map of a given table.
+Each partition (table_id) represents a tablet map of a given table.
 
 Only tables which use tablet-based replication strategy have an entry here.
 
 `tablet_count` is the number of tablets in the map.
 `table_name` is the name of the table, provided for convenience.
+
+`base_table` is optionally set with the table_id of another table that this table is co-located with, meaning they always have the same tablet count and tablet replicas, and are migrated and resized together as a group.
+ When base_table is set then the rest of the tablet map is empty, and the tablet map of base_table should be read instead.
 
 `resize_type` is the resize decision type that spans all tablets of a given table, which can be one of: `merge`, `split` or `none`.
 
@@ -250,6 +282,13 @@ Only tables which use tablet-based replication strategy have an entry here.
 ```
 
 `repair_time` is the last time the tablet has been repaired.
+
+`sstables_repaired_at` is the reapired_at number for the tablet. When repaired_at <= sstables_repaired_at (repaired_at is the on disk field of a SSTable), it means the sstable is repaired.
+
+`repair_incremental_mode` - The mode for incremental repair. Can be 'disabled', 'regular', or 'full'.
+  * `regular`: The incremental repair logic is enabled. Unrepaired sstables will be included for repair. Repaired sstables will be skipped. The incremental repair states will be updated after repair.
+  * `full`: The incremental repair logic is enabled. Both repaired and unrepaired sstables will be included for repair. The incremental repair states will be updated after repair.
+  * `disabled`: The incremental repair logic is disabled completely. The incremental repair states, e.g., `repaired_at` in sstables and `sstables_repaired_at` in the `system.tablets` table, will not be updated after repair.
 
 `repair_task_info` contains the metadata for the task manager. It contains the following values:
   * `request_type` - The type of the request. It could be user_repair and auto_repair.
@@ -306,6 +345,35 @@ CREATE TABLE system.cluster_status (
 ```
 
 Implemented by `cluster_status_table` in `db/system_keyspace.cc`.
+
+## system.load_per_node
+
+Contains information about the current tablet load with node granularity.
+Can be queried on any node, but the data comes from the group0 leader.
+Reads wait for group0 leader to be elected and load balancer stats to become available.
+
+Schema:
+```cql
+CREATE TABLE system.load_per_node (
+    node uuid PRIMARY KEY,
+    dc text,
+    rack text,
+    storage_allocated_load bigint,
+    storage_allocated_utilization double,
+    storage_capacity bigint,
+    tablets_allocated bigint,
+    tablets_allocated_per_shard double
+);
+```
+
+Columns:
+* `dc` - The name of the data center to which the node belongs.
+* `rack` - The name of the rack to which the node belongs.
+* `storage_allocated_load` - Disk space allocated for tablets, assuming each tablet has a fixed size (target_tablet_size).
+* `storage_allocated_utilization` - Fraction of node's disk capacity taken for `storage_allocated_load`, where 1.0 means full utilization.
+* `storage_capacity` - Total disk capacity in bytes. Used to compute `storage_allocated_utilization`. By default equal to file system's capacity.
+* `tablets_allocated` - Number of tablet replicas on the node. Migrating tablets are accounted as if migration already finished.
+* `tablets_allocated_per_shard` - `tablets_allocated` divided by shard count on the node.
 
 ## system.protocol_servers
 
@@ -477,6 +545,7 @@ CREATE TABLE system.clients (
     ssl_enabled boolean,
     ssl_protocol text,
     username text,
+    scheduling_group text,
     PRIMARY KEY (address, port, client_type)
 ) WITH CLUSTERING ORDER BY (port ASC, client_type ASC)
 ~~~

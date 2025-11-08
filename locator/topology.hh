@@ -40,6 +40,8 @@ using node_holder = std::unique_ptr<node>;
 
 using shard_id = seastar::shard_id;
 
+using rack_list = std::vector<sstring>;
+
 class node {
 public:
     using this_node = bool_class<struct this_node_tag>;
@@ -427,10 +429,7 @@ private:
 
     bool _sort_by_proximity = true;
 
-    // pre-calculated
     std::unordered_set<sstring> _datacenters;
-
-    void calculate_datacenters();
 
     mutable random_engine_type _random_engine;
 

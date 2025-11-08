@@ -11,19 +11,23 @@
 #include <boost/functional/hash.hpp>
 #include <boost/icl/interval_map.hpp>
 #include <fmt/ranges.h>
+#include <ranges>
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/core/on_internal_error.hh>
 #include "system_keyspace.hh"
 #include "cql3/untyped_result_set.hh"
 #include "cql3/query_processor.hh"
+#include "locator/host_id.hh"
+#include "locator/tablets.hh"
 #include "partition_slice_builder.hh"
 #include "db/config.hh"
 #include "gms/feature_service.hh"
 #include "system_keyspace_view_types.hh"
 #include "schema/schema_builder.hh"
-#include "timestamp.hh"
+#include "mutation/timestamp.hh"
 #include "utils/assert.hh"
 #include "utils/hashers.hh"
 #include "utils/log.hh"
@@ -36,8 +40,9 @@
 #include "db/schema_tables.hh"
 #include "gms/generation-number.hh"
 #include "service/storage_service.hh"
+#include "service/storage_proxy.hh"
 #include "service/paxos/paxos_state.hh"
-#include "query-result-set.hh"
+#include "query/query-result-set.hh"
 #include "idl/frozen_mutation.dist.hh"
 #include "idl/frozen_mutation.dist.impl.hh"
 #include "service/topology_state_machine.hh"
@@ -47,12 +52,16 @@
 #include "replica/query.hh"
 #include "types/types.hh"
 #include "service/raft/raft_group0_client.hh"
-#include "utils/shared_dict.hh"
+#include "message/shared_dict.hh"
 #include "replica/database.hh"
+#include "db/compaction_history_entry.hh"
 
 #include <unordered_map>
 
 using days = std::chrono::duration<int, std::ratio<24 * 3600>>;
+
+static thread_local auto sstableinfo_type = user_type_impl::get_instance(
+        "system", "sstableinfo", {"generation", "origin", "size"}, {uuid_type, utf8_type, long_type}, false);
 
 namespace db {
 namespace {
@@ -92,12 +101,15 @@ namespace {
             system_keyspace::COMMITLOG_CLEANUPS,
             system_keyspace::SERVICE_LEVELS_V2,
             system_keyspace::VIEW_BUILD_STATUS_V2,
+            system_keyspace::CDC_STREAMS_STATE,
+            system_keyspace::CDC_STREAMS_HISTORY,
             system_keyspace::ROLES,
             system_keyspace::ROLE_MEMBERS,
             system_keyspace::ROLE_ATTRIBUTES,
             system_keyspace::ROLE_PERMISSIONS,
             system_keyspace::v3::CDC_LOCAL,
-            system_keyspace::DICTS
+            system_keyspace::DICTS,
+            system_keyspace::VIEW_BUILDING_TASKS,
         };
         if (ks_name == system_keyspace::NAME && tables.contains(cf_name)) {
             props.enable_schema_commitlog();
@@ -116,12 +128,15 @@ namespace {
                 system_keyspace::TABLETS,
                 system_keyspace::SERVICE_LEVELS_V2,
                 system_keyspace::VIEW_BUILD_STATUS_V2,
+                system_keyspace::CDC_STREAMS_STATE,
+                system_keyspace::CDC_STREAMS_HISTORY,
                 // auth tables
                 system_keyspace::ROLES,
                 system_keyspace::ROLE_MEMBERS,
                 system_keyspace::ROLE_ATTRIBUTES,
                 system_keyspace::ROLE_PERMISSIONS,
                 system_keyspace::DICTS,
+                system_keyspace::VIEW_BUILDING_TASKS,
             };
             if (ks_name == system_keyspace::NAME && tables.contains(cf_name)) {
                 props.is_group0_table = true;
@@ -256,8 +271,8 @@ schema_ptr system_keyspace::topology() {
             .with_column("request_id", timeuuid_type)
             .with_column("ignore_nodes", set_type_impl::get_instance(uuid_type, true), column_kind::static_column)
             .with_column("new_cdc_generation_data_uuid", timeuuid_type, column_kind::static_column)
-            .with_column("new_keyspace_rf_change_ks_name", utf8_type, column_kind::static_column)
-            .with_column("new_keyspace_rf_change_data", map_type_impl::get_instance(utf8_type, utf8_type, false), column_kind::static_column)
+            .with_column("new_keyspace_rf_change_ks_name", utf8_type, column_kind::static_column) // deprecated
+            .with_column("new_keyspace_rf_change_data", map_type_impl::get_instance(utf8_type, utf8_type, false), column_kind::static_column) // deprecated
             .with_column("version", long_type, column_kind::static_column)
             .with_column("fence_version", long_type, column_kind::static_column)
             .with_column("transition_state", utf8_type, column_kind::static_column)
@@ -269,6 +284,7 @@ schema_ptr system_keyspace::topology() {
             .with_column("session", uuid_type, column_kind::static_column)
             .with_column("tablet_balancing_enabled", boolean_type, column_kind::static_column)
             .with_column("upgrade_state", utf8_type, column_kind::static_column)
+            .with_column("global_requests", set_type_impl::get_instance(timeuuid_type, true), column_kind::static_column)
             .set_comment("Current state of topology change machine")
             .with_hash_version()
             .build();
@@ -288,6 +304,8 @@ schema_ptr system_keyspace::topology_requests() {
             .with_column("error", utf8_type)
             .with_column("end_time", timestamp_type)
             .with_column("truncate_table_id", uuid_type)
+            .with_column("new_keyspace_rf_change_ks_name", utf8_type)
+            .with_column("new_keyspace_rf_change_data", map_type_impl::get_instance(utf8_type, utf8_type, false))
             .set_comment("Topology request tracking")
             .with_hash_version()
             .build();
@@ -333,6 +351,37 @@ schema_ptr system_keyspace::cdc_generations_v3() {
     return schema;
 }
 
+schema_ptr system_keyspace::cdc_streams_state() {
+    thread_local auto schema = [] {
+        auto id = generate_legacy_id(NAME, CDC_STREAMS_STATE);
+        return schema_builder(NAME, CDC_STREAMS_STATE, {id})
+            .with_column("table_id", uuid_type, column_kind::partition_key)
+            .with_column("last_token", long_type, column_kind::clustering_key)
+            .with_column("stream_id", bytes_type)
+            .with_column("timestamp", timestamp_type, column_kind::static_column)
+            .set_comment("Oldest CDC stream set for tablets-based tables")
+            .with_hash_version()
+            .build();
+    }();
+    return schema;
+}
+
+schema_ptr system_keyspace::cdc_streams_history() {
+    thread_local auto schema = [] {
+        auto id = generate_legacy_id(NAME, CDC_STREAMS_HISTORY);
+        return schema_builder(NAME, CDC_STREAMS_HISTORY, {id})
+            .with_column("table_id", uuid_type, column_kind::partition_key)
+            .with_column("timestamp", timestamp_type, column_kind::clustering_key)
+            .with_column("stream_state", byte_type, column_kind::clustering_key)
+            .with_column("last_token", long_type, column_kind::clustering_key)
+            .with_column("stream_id", bytes_type)
+            .set_comment("CDC stream sets for tablets-based tables described as differences from the previous state")
+            .with_hash_version()
+            .build();
+    }();
+    return schema;
+}
+
 schema_ptr system_keyspace::raft() {
     static thread_local auto schema = [] {
         auto id = generate_legacy_id(NAME, RAFT);
@@ -351,6 +400,7 @@ schema_ptr system_keyspace::raft() {
 
             .set_comment("Persisted RAFT log, votes and snapshot info")
             .with_hash_version()
+            .set_caching_options(caching_options::get_disabled_caching_options())
             .build();
     }();
     return schema;
@@ -609,9 +659,17 @@ schema_ptr system_keyspace::built_indexes() {
             {"bytes_in", long_type},
             {"bytes_out", long_type},
             {"columnfamily_name", utf8_type},
+            {"started_at", timestamp_type},
             {"compacted_at", timestamp_type},
+            {"compaction_type", utf8_type},
             {"keyspace_name", utf8_type},
             {"rows_merged", map_type_impl::get_instance(int32_type, long_type, true)},
+            {"shard_id", int32_type},
+            {"sstables_in", list_type_impl::get_instance(sstableinfo_type, false)},
+            {"sstables_out", list_type_impl::get_instance(sstableinfo_type, false)},
+            {"total_tombstone_purge_attempt", long_type},
+            {"total_tombstone_purge_failure_due_to_overlapping_with_memtable", long_type},
+            {"total_tombstone_purge_failure_due_to_overlapping_with_uncompacting_sstable", long_type},
         },
         // static columns
         {},
@@ -763,6 +821,35 @@ schema_ptr system_keyspace::large_cells() {
     return large_cells;
 }
 
+schema_ptr system_keyspace::corrupt_data() {
+    static thread_local auto corrupt_data = [] {
+        auto id = generate_legacy_id(NAME, CORRUPT_DATA);
+        return schema_builder(NAME, CORRUPT_DATA, id)
+                // partition key
+                .with_column("keyspace_name", utf8_type, column_kind::partition_key)
+                .with_column("table_name", utf8_type, column_kind::partition_key)
+                // clustering key
+                .with_column("id", timeuuid_type, column_kind::clustering_key)
+                // regular rows
+                // Storing keys as bytes: having a corrupt key might be the reason
+                // to record the row as corrupt, so we just dump what we have and
+                // leave interpreting to the lucky person investigating the disaster.
+                .with_column("partition_key", bytes_type)
+                .with_column("clustering_key", bytes_type)
+                // Note: mutation-fragment v2
+                .with_column("mutation_fragment_kind", utf8_type)
+                .with_column("frozen_mutation_fragment", bytes_type)
+                .with_column("origin", utf8_type)
+                .with_column("sstable_name", utf8_type)
+                // options
+                .set_comment("mutation-fragments found to be corrupted")
+                .set_gc_grace_seconds(0)
+                .with_hash_version()
+                .build();
+    }();
+    return corrupt_data;
+}
+
 static constexpr auto schema_gc_grace = std::chrono::duration_cast<std::chrono::seconds>(days(7)).count();
 
 /*static*/ schema_ptr system_keyspace::scylla_local() {
@@ -809,7 +896,7 @@ schema_ptr system_keyspace::v3::batches() {
        // FIXME: the original Java code also had:
        //.copy(new LocalPartitioner(TimeUUIDType.instance))
        builder.set_gc_grace_seconds(0);
-       builder.set_compaction_strategy(sstables::compaction_strategy_type::incremental);
+       builder.set_compaction_strategy(compaction::compaction_strategy_type::incremental);
        builder.set_compaction_strategy_options({{"min_threshold", "2"}});
        builder.with_hash_version();
        return builder.build(schema_builder::compact_storage::no);
@@ -1293,7 +1380,7 @@ schema_ptr system_keyspace::legacy::hints() {
         "*DEPRECATED* hints awaiting delivery"
        );
        builder.set_gc_grace_seconds(0);
-       builder.set_compaction_strategy(sstables::compaction_strategy_type::incremental);
+       builder.set_compaction_strategy(compaction::compaction_strategy_type::incremental);
        builder.set_compaction_strategy_options({{"enabled", "false"}});
        builder.with(schema_builder::compact_storage::yes);
        builder.with_hash_version();
@@ -1319,7 +1406,7 @@ schema_ptr system_keyspace::legacy::batchlog() {
         "*DEPRECATED* batchlog entries"
        );
        builder.set_gc_grace_seconds(0);
-       builder.set_compaction_strategy(sstables::compaction_strategy_type::incremental);
+       builder.set_compaction_strategy(compaction::compaction_strategy_type::incremental);
        builder.set_compaction_strategy_options({{"min_threshold", "2"}});
        builder.with(schema_builder::compact_storage::no);
        builder.with_hash_version();
@@ -1573,8 +1660,27 @@ schema_ptr system_keyspace::dicts() {
     return schema;
 }
 
+schema_ptr system_keyspace::view_building_tasks() {
+    static thread_local auto schema = [] {
+        auto id = generate_legacy_id(NAME, VIEW_BUILDING_TASKS);
+        return schema_builder(NAME, VIEW_BUILDING_TASKS, std::make_optional(id))
+                .with_column("key", utf8_type, column_kind::partition_key)
+                .with_column("id", timeuuid_type, column_kind::clustering_key)
+                .with_column("type", utf8_type)
+                .with_column("state", utf8_type)
+                .with_column("base_id", uuid_type)
+                .with_column("view_id", uuid_type)
+                .with_column("last_token", long_type)
+                .with_column("host_id", uuid_type)
+                .with_column("shard", int32_type)
+                .with_hash_version()
+                .build();
+    }();
+    return schema;
+}
+
 future<system_keyspace::local_info> system_keyspace::load_local_info() {
-    auto msg = co_await execute_cql(format("SELECT host_id, cluster_name FROM system.{} WHERE key=?", LOCAL), sstring(LOCAL));
+    auto msg = co_await execute_cql(format("SELECT host_id, cluster_name, data_center, rack FROM system.{} WHERE key=?", LOCAL), sstring(LOCAL));
 
     local_info ret;
     if (!msg->empty()) {
@@ -1585,12 +1691,18 @@ future<system_keyspace::local_info> system_keyspace::load_local_info() {
         if (row.has("cluster_name")) {
             ret.cluster_name = row.get_as<sstring>("cluster_name");
         }
+        if (row.has("data_center")) {
+            ret.dc = row.get_as<sstring>("data_center");
+        }
+        if (row.has("rack")) {
+            ret.rack = row.get_as<sstring>("rack");
+        }
     }
 
     co_return ret;
 }
 
-future<> system_keyspace::save_local_info(local_info sysinfo, locator::endpoint_dc_rack location, gms::inet_address broadcast_address, gms::inet_address broadcast_rpc_address) {
+future<> system_keyspace::save_local_info(local_info sysinfo, gms::inet_address broadcast_address, gms::inet_address broadcast_rpc_address) {
     auto& cfg = _db.get_config();
     sstring req = fmt::format("INSERT INTO system.{} (key, host_id, cluster_name, release_version, cql_version, native_protocol_version, data_center, rack, partitioner, rpc_address, broadcast_address, listen_address) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                     , db::system_keyspace::LOCAL);
@@ -1601,8 +1713,8 @@ future<> system_keyspace::save_local_info(local_info sysinfo, locator::endpoint_
                             version::release(),
                             cql3::query_processor::CQL_VERSION,
                             to_sstring(unsigned(cql_serialization_format::latest().protocol_version())),
-                            location.dc,
-                            location.rack,
+                            sysinfo.dc,
+                            sysinfo.rack,
                             sstring(cfg.partitioner()),
                             broadcast_rpc_address,
                             broadcast_address,
@@ -1643,6 +1755,12 @@ future<> system_keyspace::peers_table_read_fixup() {
             continue;
         }
         const auto host_id = row.get_as<utils::UUID>("host_id");
+        if (!host_id) {
+            slogger.error("Peer {} has null host_id in system.{}, the record is broken, removing it",
+                peer, system_keyspace::PEERS);
+            co_await remove_endpoint(gms::inet_address{peer});
+            continue;
+        }
         const auto ts = row.get_as<int64_t>("ts");
         const auto it = map.find(host_id);
         if (it == map.end()) {
@@ -1706,8 +1824,15 @@ future<> system_keyspace::drop_truncation_rp_records() {
     auto rs = co_await execute_cql(req);
 
     bool any = false;
-    co_await coroutine::parallel_for_each(*rs, [&] (const cql3::untyped_result_set_row& row) -> future<> {
+    std::unordered_set<table_id> to_delete;
+    auto db = _qp.db();
+    auto max_concurrency = std::min(1024u, smp::count * 8);
+    co_await seastar::max_concurrent_for_each(*rs, max_concurrency, [&] (const cql3::untyped_result_set_row& row) -> future<> {
         auto table_uuid = table_id(row.get_as<utils::UUID>("table_uuid"));
+        if (!db.try_find_table(table_uuid)) {
+            to_delete.emplace(table_uuid);
+            co_return;
+        }
         auto shard = row.get_as<int32_t>("shard");
         auto segment_id = row.get_as<int64_t>("segment_id");
 
@@ -1717,9 +1842,24 @@ future<> system_keyspace::drop_truncation_rp_records() {
             co_await execute_cql(req);
         }
     });
+    if (!to_delete.empty()) {
+        // IN has a limit to how many values we can put into it.
+        for (auto&& chunk : to_delete | std::views::transform(&table_id::to_sstring) | std::views::chunk(100)) {
+            auto str = std::ranges::to<std::string>(chunk | std::views::join_with(','));
+            auto req = format("DELETE FROM system.{} WHERE table_uuid IN ({})", TRUNCATED, str);
+            co_await execute_cql(req);
+        }
+        any = true;
+    }
     if (any) {
         co_await force_blocking_flush(TRUNCATED);
     }
+}
+
+future<> system_keyspace::remove_truncation_records(table_id id) {
+    auto req = format("DELETE FROM system.{} WHERE table_uuid = {}", TRUNCATED, id);
+    co_await execute_cql(req);
+    co_await force_blocking_flush(TRUNCATED);
 }
 
 future<> system_keyspace::save_truncation_record(const replica::column_family& cf, db_clock::time_point truncated_at, db::replay_position rp) {
@@ -1866,7 +2006,7 @@ future<system_keyspace::commitlog_cleanup_map> system_keyspace::get_commitlog_cl
 }
 
 static set_type_impl::native_type deserialize_set_column(const schema& s, const cql3::untyped_result_set_row& row, const char* name) {
-    auto blob = row.get_blob(name);
+    auto blob = row.get_blob_unfragmented(name);
     auto cdef = s.get_column_definition(name);
     auto deserialized = cdef->type->deserialize(blob);
     return value_cast<set_type_impl::native_type>(deserialized);
@@ -2022,15 +2162,15 @@ future<std::vector<locator::host_id>> system_keyspace::load_peers_ids() {
     co_return ret;
 }
 
-future<std::unordered_map<gms::inet_address, sstring>> system_keyspace::load_peer_features() {
+future<std::unordered_map<locator::host_id, sstring>> system_keyspace::load_peer_features() {
     co_await peers_table_read_fixup();
 
-    const sstring req = format("SELECT peer, supported_features FROM system.{}", PEERS);
-    std::unordered_map<gms::inet_address, sstring> ret;
+    const sstring req = format("SELECT host_id, supported_features FROM system.{}", PEERS);
+    std::unordered_map<locator::host_id, sstring> ret;
     const auto cql_result = co_await execute_cql(req);
     for (const auto& row : *cql_result) {
         if (row.has("supported_features")) {
-            ret.emplace(row.get_as<net::inet_address>("peer"),
+            ret.emplace(locator::host_id(row.get_as<utils::UUID>("host_id")),
                     row.get_as<sstring>("supported_features"));
         }
     }
@@ -2104,7 +2244,59 @@ future<> system_keyspace::update_peer_info(gms::inet_address ep, locator::host_i
 
     slogger.debug("{}: values={}", query, values);
 
-    co_await _qp.execute_internal(query, db::consistency_level::ONE, values, cql3::query_processor::cache_internal::yes);
+    const auto guard = co_await get_units(_peers_cache_lock, 1);
+    try {
+        co_await _qp.execute_internal(query, db::consistency_level::ONE, values, cql3::query_processor::cache_internal::yes);
+        if (auto* cache = get_peers_cache()) {
+            cache->host_id_to_inet_ip[hid] = ep;
+            cache->inet_ip_to_host_id[ep] = hid;
+        }
+    } catch (...) {
+        _peers_cache = nullptr;
+        throw;
+    }
+}
+
+system_keyspace::peers_cache* system_keyspace::get_peers_cache() {
+    auto* cache = _peers_cache.get();
+    if (cache && (lowres_clock::now() > cache->expiration_time)) {
+        _peers_cache = nullptr;
+        return nullptr;
+    }
+    return cache;
+}
+
+future<lw_shared_ptr<const system_keyspace::peers_cache>> system_keyspace::get_or_load_peers_cache() {
+    const auto guard = co_await get_units(_peers_cache_lock, 1);
+    if (auto* cache = get_peers_cache()) {
+        co_return cache->shared_from_this();
+    }
+    auto cache = make_lw_shared<peers_cache>();
+    cache->inet_ip_to_host_id = co_await load_host_ids();
+    cache->host_id_to_inet_ip.reserve(cache->inet_ip_to_host_id.size());
+    for (const auto [ip, id]: cache->inet_ip_to_host_id) {
+        const auto [it, inserted] = cache->host_id_to_inet_ip.insert({id, ip});
+        if (!inserted) {
+            on_internal_error(slogger, ::format("duplicate IP for host_id {}, first IP {}, second IP {}",
+                id, it->second, ip));
+        }
+    }
+    cache->expiration_time = lowres_clock::now() + std::chrono::milliseconds(200);
+    _peers_cache = cache;
+    co_return std::move(cache);
+}
+
+future<std::optional<gms::inet_address>> system_keyspace::get_ip_from_peers_table(locator::host_id id) {
+    const auto cache = co_await get_or_load_peers_cache();
+    if (const auto it = cache->host_id_to_inet_ip.find(id); it != cache->host_id_to_inet_ip.end()) {
+        co_return it->second;
+    }
+    co_return std::nullopt;
+}
+
+future<system_keyspace::host_id_to_ip_map_t> system_keyspace::get_host_id_to_ip_map() {
+    const auto cache = co_await get_or_load_peers_cache();
+    co_return cache->host_id_to_inet_ip;
 }
 
 template <typename T>
@@ -2154,7 +2346,22 @@ future<> system_keyspace::update_schema_version(table_schema_version version) {
 future<> system_keyspace::remove_endpoint(gms::inet_address ep) {
     const sstring req = format("DELETE FROM system.{} WHERE peer = ?", PEERS);
     slogger.debug("DELETE FROM system.{} WHERE peer = {}", PEERS, ep);
-    co_await execute_cql(req, ep.addr()).discard_result();
+
+    const auto guard = co_await get_units(_peers_cache_lock, 1);
+    try {
+        co_await execute_cql(req, ep.addr()).discard_result();
+        if (auto* cache = get_peers_cache()) {
+            const auto it = cache->inet_ip_to_host_id.find(ep);
+            if (it != cache->inet_ip_to_host_id.end()) {
+                const auto id = it->second;
+                cache->inet_ip_to_host_id.erase(it);
+                cache->host_id_to_inet_ip.erase(id);
+            }
+        }
+    } catch (...) {
+        _peers_cache = nullptr;
+        throw;
+    }
 }
 
 future<> system_keyspace::update_tokens(const std::unordered_set<dht::token>& tokens) {
@@ -2255,6 +2462,89 @@ future<bool> system_keyspace::cdc_is_rewritten() {
     });
 }
 
+future<> system_keyspace::read_cdc_streams_state(std::optional<table_id> table,
+        noncopyable_function<future<>(table_id, db_clock::time_point, utils::chunked_vector<cdc::stream_id>)> f) {
+    static const sstring all_tables_query = format("SELECT table_id, timestamp, stream_id FROM {}.{}", NAME, CDC_STREAMS_STATE);
+    static const sstring single_table_query = format("SELECT table_id, timestamp, stream_id FROM {}.{} WHERE table_id = ?", NAME, CDC_STREAMS_STATE);
+
+    struct cur_t {
+        table_id tid;
+        db_clock::time_point ts;
+        utils::chunked_vector<cdc::stream_id> streams;
+    };
+    std::optional<cur_t> cur;
+
+    co_await _qp.query_internal(table ? single_table_query : all_tables_query,
+                db::consistency_level::ONE,
+                table ? data_value_list{table->uuid()} : data_value_list{},
+                1000,
+                [&] (const cql3::untyped_result_set_row& row) -> future<stop_iteration> {
+        auto tid = table_id(row.get_as<utils::UUID>("table_id"));
+        auto ts = row.get_as<db_clock::time_point>("timestamp");
+        auto stream_id = cdc::stream_id(row.get_as<bytes>("stream_id"));
+
+        if (!cur || tid != cur->tid || ts != cur->ts) {
+            if (cur) {
+                co_await f(cur->tid, cur->ts, std::move(cur->streams));
+            }
+            cur = { tid, ts, utils::chunked_vector<cdc::stream_id>() };
+        }
+        cur->streams.push_back(std::move(stream_id));
+
+        co_return stop_iteration::no;
+    });
+
+    if (cur) {
+        co_await f(cur->tid, cur->ts, std::move(cur->streams));
+    }
+}
+
+future<> system_keyspace::read_cdc_streams_history(table_id table, std::optional<db_clock::time_point> from,
+        noncopyable_function<future<>(table_id, db_clock::time_point, cdc::cdc_stream_diff)> f) {
+    static const sstring query_all = format("SELECT table_id, timestamp, stream_state, stream_id FROM {}.{} WHERE table_id = ?", NAME, CDC_STREAMS_HISTORY);
+    static const sstring query_from = format("SELECT table_id, timestamp, stream_state, stream_id FROM {}.{} WHERE table_id = ? AND timestamp > ?", NAME, CDC_STREAMS_HISTORY);
+
+    struct cur_t {
+        table_id tid;
+        db_clock::time_point ts;
+        cdc::cdc_stream_diff diff;
+    };
+    std::optional<cur_t> cur;
+
+    co_await _qp.query_internal(from ? query_from : query_all,
+            db::consistency_level::ONE,
+            from ? data_value_list{table.uuid(), *from} : data_value_list{table.uuid()},
+            1000,
+            [&] (const cql3::untyped_result_set_row& row) -> future<stop_iteration> {
+        auto tid = table_id(row.get_as<utils::UUID>("table_id"));
+        auto ts = row.get_as<db_clock::time_point>("timestamp");
+        auto stream_state = cdc::read_stream_state(row.get_as<int8_t>("stream_state"));
+        auto stream_id = cdc::stream_id(row.get_as<bytes>("stream_id"));
+
+        if (!cur || tid != cur->tid || ts != cur->ts) {
+            if (cur) {
+                co_await f(cur->tid, cur->ts, std::move(cur->diff));
+            }
+            cur = { tid, ts, cdc::cdc_stream_diff() };
+        }
+
+        if (stream_state == cdc::stream_state::closed) {
+            cur->diff.closed_streams.push_back(std::move(stream_id));
+        } else if (stream_state == cdc::stream_state::opened) {
+            cur->diff.opened_streams.push_back(std::move(stream_id));
+        } else {
+            on_internal_error(slogger, fmt::format("unexpected CDC stream state {} in {}.{} for table {}",
+                    std::to_underlying(stream_state), NAME, CDC_STREAMS_HISTORY, table));
+        }
+
+        co_return stop_iteration::no;
+    });
+
+    if (cur) {
+        co_await f(cur->tid, cur->ts, std::move(cur->diff));
+    }
+}
+
 bool system_keyspace::bootstrap_needed() const {
     return get_bootstrap_state() == bootstrap_state::NEEDS_BOOTSTRAP;
 }
@@ -2306,6 +2596,7 @@ std::vector<schema_ptr> system_keyspace::all_tables(const db::config& cfg) {
                     peers(), peer_events(), range_xfers(),
                     compactions_in_progress(), compaction_history(),
                     sstable_activity(), size_estimates(), large_partitions(), large_rows(), large_cells(),
+                    corrupt_data(),
                     scylla_local(), db::schema_tables::scylla_table_schema_history(),
                     repair_history(),
                     v3::views_builds_in_progress(), v3::built_views(),
@@ -2315,7 +2606,7 @@ std::vector<schema_ptr> system_keyspace::all_tables(const db::config& cfg) {
                     v3::cdc_local(),
                     raft(), raft_snapshots(), raft_snapshot_config(), group0_history(), discovery(),
                     topology(), cdc_generations_v3(), topology_requests(), service_levels_v2(), view_build_status_v2(),
-                    dicts(),
+                    dicts(), view_building_tasks(), cdc_streams_state(), cdc_streams_history()
     });
 
     if (cfg.check_experimental(db::experimental_features_t::feature::BROADCAST_TABLES)) {
@@ -2350,7 +2641,9 @@ future<> system_keyspace::make(
         co_await db.create_local_system_table(table, maybe_write_in_user_memory(table), erm_factory);
         co_await db.find_column_family(table).init_storage();
     }
+
     replica::tablet_add_repair_scheduler_user_types(NAME, db);
+    db.find_keyspace(NAME).add_user_type(sstableinfo_type);
 }
 
 void system_keyspace::mark_writable() {
@@ -2359,19 +2652,47 @@ void system_keyspace::mark_writable() {
     }
 }
 
+static service::query_state& internal_system_query_state() {
+    using namespace std::chrono_literals;
+    const auto t = 10s;
+    static timeout_config tc{ t, t, t, t, t, t, t };
+    static thread_local service::client_state cs(service::client_state::internal_tag{}, tc);
+    static thread_local service::query_state qs(cs, empty_service_permit());
+    return qs;
+};
+
+static future<std::optional<mutation>> get_scylla_local_mutation(replica::database& db, std::string_view key) {
+    auto s = db.find_schema(db::system_keyspace::NAME, db::system_keyspace::SCYLLA_LOCAL);
+
+    partition_key pk = partition_key::from_singular(*s, key);
+    dht::partition_range pr = dht::partition_range::make_singular(dht::decorate_key(*s, pk));
+
+    auto rs = co_await replica::query_mutations(db.container(), s, pr, s->full_slice(), db::no_timeout);
+    if (!rs) {
+        on_internal_error(slogger, "get_scylla_local_mutation(): no result from querying mutations");
+    }
+    auto& ps = rs->partitions();
+    for (auto& p: ps) {
+        auto mut = p.mut().unfreeze(s);
+        co_return std::move(mut);
+    }
+
+    co_return std::nullopt;
+}
+
 future<foreign_ptr<lw_shared_ptr<reconcilable_result>>>
-system_keyspace::query_mutations(distributed<replica::database>& db, schema_ptr schema) {
+system_keyspace::query_mutations(sharded<replica::database>& db, schema_ptr schema) {
     return replica::query_mutations(db, schema, query::full_partition_range, schema->full_slice(), db::no_timeout);
 }
 
 future<foreign_ptr<lw_shared_ptr<reconcilable_result>>>
-system_keyspace::query_mutations(distributed<replica::database>& db, const sstring& ks_name, const sstring& cf_name) {
+system_keyspace::query_mutations(sharded<replica::database>& db, const sstring& ks_name, const sstring& cf_name) {
     schema_ptr schema = db.local().find_schema(ks_name, cf_name);
     return query_mutations(db, schema);
 }
 
 future<foreign_ptr<lw_shared_ptr<reconcilable_result>>>
-system_keyspace::query_mutations(distributed<replica::database>& db, const sstring& ks_name, const sstring& cf_name, const dht::partition_range& partition_range, query::clustering_range row_range) {
+system_keyspace::query_mutations(sharded<replica::database>& db, const sstring& ks_name, const sstring& cf_name, const dht::partition_range& partition_range, query::clustering_range row_range) {
     auto schema = db.local().find_schema(ks_name, cf_name);
     auto slice_ptr = std::make_unique<query::partition_slice>(partition_slice_builder(*schema)
         .with_range(std::move(row_range))
@@ -2380,7 +2701,7 @@ system_keyspace::query_mutations(distributed<replica::database>& db, const sstri
 }
 
 future<lw_shared_ptr<query::result_set>>
-system_keyspace::query(distributed<replica::database>& db, const sstring& ks_name, const sstring& cf_name) {
+system_keyspace::query(sharded<replica::database>& db, const sstring& ks_name, const sstring& cf_name) {
     schema_ptr schema = db.local().find_schema(ks_name, cf_name);
     return replica::query_data(db, schema, query::full_partition_range, schema->full_slice(), db::no_timeout).then([schema] (auto&& qr) {
         return make_lw_shared<query::result_set>(query::result_set::from_raw_result(schema, schema->full_slice(), *qr));
@@ -2388,7 +2709,7 @@ system_keyspace::query(distributed<replica::database>& db, const sstring& ks_nam
 }
 
 future<lw_shared_ptr<query::result_set>>
-system_keyspace::query(distributed<replica::database>& db, const sstring& ks_name, const sstring& cf_name, const dht::decorated_key& key, query::clustering_range row_range)
+system_keyspace::query(sharded<replica::database>& db, const sstring& ks_name, const sstring& cf_name, const dht::decorated_key& key, query::clustering_range row_range)
 {
     auto schema = db.local().find_schema(ks_name, cf_name);
     auto pr_ptr = std::make_unique<dht::partition_range>(dht::partition_range::make_singular(key));
@@ -2399,6 +2720,26 @@ system_keyspace::query(distributed<replica::database>& db, const sstring& ks_nam
             [schema, pr_ptr = std::move(pr_ptr), slice_ptr = std::move(slice_ptr)] (auto&& qr) {
         return make_lw_shared<query::result_set>(query::result_set::from_raw_result(schema, schema->full_slice(), *qr));
     });
+}
+
+static list_type_impl::native_type prepare_sstables(const std::vector<sstables::basic_info>& sstables) {
+    list_type_impl::native_type tmp;
+    for (auto& info : sstables) {
+        auto element = make_user_value(sstableinfo_type, {data_value(info.generation), data_value(info.origin), data_value(info.size)});
+        tmp.push_back(std::move(element));
+    }
+    return tmp;
+}
+
+static std::vector<sstables::basic_info> restore_sstables(const std::vector<user_type_impl::native_type>& sstables) {
+    std::vector<sstables::basic_info> tmp;
+    tmp.reserve(sstables.size());
+
+    for (auto& data : sstables) {
+        tmp.emplace_back(sstables::generation_type(value_cast<utils::UUID>(data[0])), value_cast<sstring>(data[1]), value_cast<int64_t>(data[2]));
+    }
+
+    return tmp;
 }
 
 static map_type_impl::native_type prepare_rows_merged(std::unordered_map<int32_t, int64_t>& rows_merged) {
@@ -2412,22 +2753,44 @@ static map_type_impl::native_type prepare_rows_merged(std::unordered_map<int32_t
     return tmp;
 }
 
-future<> system_keyspace::update_compaction_history(utils::UUID uuid, sstring ksname, sstring cfname, int64_t compacted_at, int64_t bytes_in, int64_t bytes_out,
-                                   std::unordered_map<int32_t, int64_t> rows_merged)
+future<> system_keyspace::update_compaction_history(compaction_history_entry entry)
 {
     // don't write anything when the history table itself is compacted, since that would in turn cause new compactions
-    if (ksname == "system" && cfname == COMPACTION_HISTORY) {
+    if (entry.ks == "system" && entry.cf == COMPACTION_HISTORY) {
         return make_ready_future<>();
     }
 
     auto map_type = map_type_impl::get_instance(int32_type, long_type, true);
+    auto list_type = list_type_impl::get_instance(sstableinfo_type, false);
+    db_clock::time_point compacted_at{db_clock::duration{entry.compacted_at}};
+    db_clock::time_point started_at{db_clock::duration{entry.started_at}};
 
-    sstring req = format("INSERT INTO system.{} (id, keyspace_name, columnfamily_name, compacted_at, bytes_in, bytes_out, rows_merged) VALUES (?, ?, ?, ?, ?, ?, ?)"
-                    , COMPACTION_HISTORY);
+    std::function<future<::shared_ptr<cql3::untyped_result_set>>()> execute;
+    if (local_db().features().compaction_history_upgrade) {
+        static constexpr auto reqest_template = "INSERT INTO system.{} ( \
+                id, shard_id, keyspace_name, columnfamily_name, started_at, compacted_at, compaction_type, bytes_in, bytes_out, rows_merged, \
+                sstables_in, sstables_out, total_tombstone_purge_attempt, total_tombstone_purge_failure_due_to_overlapping_with_memtable, \
+                total_tombstone_purge_failure_due_to_overlapping_with_uncompacting_sstable \
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        sstring request = format(reqest_template, COMPACTION_HISTORY);
+        execute = [&, request=std::move(request)]() {
+            return execute_cql(request, entry.id, int32_t(entry.shard_id), entry.ks, entry.cf, started_at, compacted_at, entry.compaction_type,
+                        entry.bytes_in, entry.bytes_out, make_map_value(map_type, prepare_rows_merged(entry.rows_merged)),
+                        make_list_value(list_type, prepare_sstables(entry.sstables_in)), make_list_value(list_type, prepare_sstables(entry.sstables_out)),
+                        entry.total_tombstone_purge_attempt, entry.total_tombstone_purge_failure_due_to_overlapping_with_memtable,
+                        entry.total_tombstone_purge_failure_due_to_overlapping_with_uncompacting_sstable);
+        };
+    } else {
+        static constexpr auto reqest_template = "INSERT INTO system.{} ( \
+                id, keyspace_name, columnfamily_name, compacted_at, bytes_in, bytes_out, rows_merged) VALUES (?, ?, ?, ?, ?, ?, ?)";
+        sstring request = format(reqest_template, COMPACTION_HISTORY);
+        execute = [&, request=std::move(request)]() {
+            return execute_cql(request, entry.id, entry.ks, entry.cf, compacted_at, entry.bytes_in, entry.bytes_out,
+                        make_map_value(map_type, prepare_rows_merged(entry.rows_merged)));
+        };
+    }
 
-    db_clock::time_point tp{db_clock::duration{compacted_at}};
-    return execute_cql(req, uuid, ksname, cfname, tp, bytes_in, bytes_out,
-                       make_map_value(map_type, prepare_rows_merged(rows_merged))).discard_result().handle_exception([] (auto ep) {
+    return execute().discard_result().handle_exception([] (auto ep) {
         slogger.error("update compaction history failed: {}: ignored", ep);
     });
 }
@@ -2437,14 +2800,27 @@ future<> system_keyspace::get_compaction_history(compaction_history_consumer con
     co_await _qp.query_internal(req, [&consumer] (const cql3::untyped_result_set::row& row) mutable -> future<stop_iteration> {
         compaction_history_entry entry;
         entry.id = row.get_as<utils::UUID>("id");
+        entry.shard_id = row.get_or<int32_t>("shard_id", 0);
         entry.ks = row.get_as<sstring>("keyspace_name");
         entry.cf = row.get_as<sstring>("columnfamily_name");
+        entry.compaction_type = row.get_or<sstring>("compaction_type", "");
+        entry.started_at = row.get_or<int64_t>("started_at", 0);
         entry.compacted_at = row.get_as<int64_t>("compacted_at");
         entry.bytes_in = row.get_as<int64_t>("bytes_in");
         entry.bytes_out = row.get_as<int64_t>("bytes_out");
         if (row.has("rows_merged")) {
             entry.rows_merged = row.get_map<int32_t, int64_t>("rows_merged");
         }
+        if (row.has("sstables_in")) {
+            entry.sstables_in = restore_sstables(row.get_list<user_type_impl::native_type>("sstables_in", sstableinfo_type));
+        }
+        if (row.has("sstables_out")) {
+            entry.sstables_out = restore_sstables(row.get_list<user_type_impl::native_type>("sstables_out", sstableinfo_type));
+        }
+        entry.total_tombstone_purge_attempt = row.get_or<int64_t>("total_tombstone_purge_attempt", 0);
+        entry.total_tombstone_purge_failure_due_to_overlapping_with_memtable = row.get_or<int64_t>("total_tombstone_purge_failure_due_to_overlapping_with_memtable", 0);
+        entry.total_tombstone_purge_failure_due_to_overlapping_with_uncompacting_sstable = row.get_or<int64_t>("total_tombstone_purge_failure_due_to_overlapping_with_uncompacting_sstable", 0);
+
         co_await consumer(std::move(entry));
         co_return stop_iteration::no;
     });
@@ -2525,6 +2901,28 @@ future<> system_keyspace::register_view_for_building(sstring ks_name, sstring vi
             token.to_sstring()).discard_result();
 }
 
+future<> system_keyspace::register_view_for_building_for_all_shards(sstring ks_name, sstring view_name, const dht::token& token) {
+    // registers this_shard_id() with the given token and inserts an empty status for all other shards.
+    // this is used to register all shards atomically and ensure all shards have a status, even if we crash
+    // before all shards are registered.
+    // if another shard has already registered, this won't overwrite its status. if it hasn't registered, we insert
+    // a status with first_token=null and next_token=null, indicating it hasn't made progress.
+    auto&& schema = db::system_keyspace::v3::scylla_views_builds_in_progress();
+    auto timestamp = api::new_timestamp();
+    mutation m{schema, partition_key::from_single_value(*schema, utf8_type->decompose(ks_name))};
+
+    for (size_t s = 0; s < smp::count; s++) {
+        auto ck = clustering_key_prefix(std::vector<bytes>{
+                utf8_type->decompose(view_name),
+                int32_type->decompose(int32_t(s))});
+        m.set_clustered_cell(ck, "generation_number", int32_t(0), timestamp);
+        if (s == this_shard_id()) {
+            m.set_clustered_cell(ck, "first_token", token.to_sstring(), timestamp);
+        }
+    }
+    return apply_mutation(std::move(m));
+}
+
 future<> system_keyspace::update_view_build_progress(sstring ks_name, sstring view_name, const dht::token& token) {
     sstring req = format("INSERT INTO system.{} (keyspace_name, view_name, next_token, cpu_id) VALUES (?, ?, ?, ?)",
             v3::SCYLLA_VIEWS_BUILDS_IN_PROGRESS);
@@ -2583,7 +2981,8 @@ future<std::vector<system_keyspace::view_build_progress>> system_keyspace::load_
         for (auto& row : *cql_result) {
             auto ks_name = row.get_as<sstring>("keyspace_name");
             auto cf_name = row.get_as<sstring>("view_name");
-            auto first_token = dht::token::from_sstring(row.get_as<sstring>("first_token"));
+            auto first_token_opt = row.get_opt<sstring>("first_token").transform(dht::token::from_sstring);
+
             auto next_token_sstring = row.get_opt<sstring>("next_token");
             std::optional<dht::token> next_token;
             if (next_token_sstring) {
@@ -2592,7 +2991,7 @@ future<std::vector<system_keyspace::view_build_progress>> system_keyspace::load_
             auto cpu_id = row.get_as<int32_t>("cpu_id");
             progress.emplace_back(view_build_progress{
                     view_name(std::move(ks_name), std::move(cf_name)),
-                    std::move(first_token),
+                    std::move(first_token_opt),
                     std::move(next_token),
                     static_cast<shard_id>(cpu_id)});
         }
@@ -2603,137 +3002,177 @@ future<std::vector<system_keyspace::view_build_progress>> system_keyspace::load_
     });
 }
 
+future<system_keyspace::view_build_status_map> system_keyspace::get_view_build_status_map() {
+    static const sstring query = format("SELECT * FROM {}.{}", NAME, VIEW_BUILD_STATUS_V2);
 
-template <typename... Args>
-future<::shared_ptr<cql3::untyped_result_set>> system_keyspace::execute_cql_with_timeout(sstring req,
-        db::timeout_clock::time_point timeout,
-        Args&&... args) {
-    const db::timeout_clock::time_point now = db::timeout_clock::now();
-    const db::timeout_clock::duration d =
-        now < timeout ?
-            timeout - now :
-            // let the `storage_proxy` time out the query down the call chain
-            db::timeout_clock::duration::zero();
+    view_build_status_map map;
+    co_await _qp.query_internal(query, [&] (const cql3::untyped_result_set_row& row) -> future<stop_iteration> {
+        auto ks_name = row.get_as<sstring>("keyspace_name");
+        auto view_name = row.get_as<sstring>("view_name");
+        auto host_id = locator::host_id(row.get_as<utils::UUID>("host_id"));
+        auto status = view::build_status_from_string(row.get_as<sstring>("status"));
 
-    struct timeout_context {
-        std::unique_ptr<service::client_state> client_state;
-        service::query_state query_state;
-        timeout_context(db::timeout_clock::duration d)
-                : client_state(std::make_unique<service::client_state>(service::client_state::internal_tag{}, timeout_config{d, d, d, d, d, d, d}))
-                , query_state(*client_state, empty_service_permit())
-        {}
-    };
-    return do_with(timeout_context(d), [this, req = std::move(req), &args...] (auto& tctx) {
-        return _qp.execute_internal(req,
-            cql3::query_options::DEFAULT.get_consistency(),
-            tctx.query_state,
-            { data_value(std::forward<Args>(args))... },
-            cql3::query_processor::cache_internal::yes);
+        auto view = std::make_pair(std::move(ks_name), std::move(view_name));
+        map[view][host_id] = status;
+        co_return stop_iteration::no;
+    });
+    co_return map;
+}
+
+future<mutation> system_keyspace::make_view_build_status_mutation(api::timestamp_type ts, system_keyspace_view_name view_name, locator::host_id host_id, view::build_status status) {
+    static const sstring stmt = format("INSERT INTO {}.{} (keyspace_name, view_name, host_id, status) VALUES (?, ?, ?, ?)", NAME, VIEW_BUILD_STATUS_V2);
+
+    auto muts = co_await _qp.get_mutations_internal(stmt, internal_system_query_state(), ts, {view_name.first, view_name.second, host_id.uuid(), view::build_status_to_sstring(status)});
+    if (muts.size() != 1) {
+        on_internal_error(slogger, fmt::format("expected 1 mutation got {}", muts.size()));
+    }
+    co_return std::move(muts[0]);
+}
+
+future<mutation> system_keyspace::make_view_build_status_update_mutation(api::timestamp_type ts, system_keyspace_view_name view_name, locator::host_id host_id, view::build_status status) {
+    static const sstring stmt = format("UPDATE {}.{} SET status = ? WHERE keyspace_name = ? AND view_name = ? AND host_id = ?", NAME, VIEW_BUILD_STATUS_V2);
+
+    auto muts = co_await _qp.get_mutations_internal(stmt, internal_system_query_state(), ts, {view::build_status_to_sstring(status), view_name.first, view_name.second, host_id.uuid()});
+    if (muts.size() != 1) {
+        on_internal_error(slogger, fmt::format("expected 1 mutation got {}", muts.size()));
+    }
+    co_return std::move(muts[0]);
+}
+
+future<mutation> system_keyspace::make_remove_view_build_status_mutation(api::timestamp_type ts, system_keyspace_view_name view_name) {
+    static const sstring stmt = format("DELETE FROM {}.{} WHERE keyspace_name = ? AND view_name = ?", NAME, VIEW_BUILD_STATUS_V2);
+
+    auto muts = co_await _qp.get_mutations_internal(stmt, internal_system_query_state(), ts, {view_name.first, view_name.second});
+    if (muts.size() != 1) {
+        on_internal_error(slogger, fmt::format("expected 1 mutation got {}", muts.size()));
+    }
+    co_return std::move(muts[0]);
+}
+
+future<mutation> system_keyspace::make_remove_view_build_status_on_host_mutation(api::timestamp_type ts, system_keyspace_view_name view_name, locator::host_id host_id) {
+    static const sstring stmt = format("DELETE FROM {}.{} WHERE keyspace_name = ? AND view_name = ? AND host_id = ?", NAME, VIEW_BUILD_STATUS_V2);
+
+    auto muts = co_await _qp.get_mutations_internal(stmt, internal_system_query_state(), ts, {view_name.first, view_name.second, host_id.uuid()});
+    if (muts.size() != 1) {
+        on_internal_error(slogger, fmt::format("expected 1 mutation got {}", muts.size()));
+    }
+    co_return std::move(muts[0]);
+}
+
+static constexpr auto VIEW_BUILDING_KEY = "view_building";
+
+future<db::view::building_tasks> system_keyspace::get_view_building_tasks() {
+    static const sstring query = format("SELECT id, type, state, base_id, view_id, last_token, host_id, shard FROM {}.{} WHERE key = '{}'", NAME, VIEW_BUILDING_TASKS, VIEW_BUILDING_KEY);
+    using namespace db::view;
+
+    building_tasks tasks;
+    co_await _qp.query_internal(query, [&] (const cql3::untyped_result_set_row& row) -> future<stop_iteration> {
+        auto id = row.get_as<utils::UUID>("id");
+        auto type = task_type_from_string(row.get_as<sstring>("type"));
+        auto state = task_state_from_string(row.get_as<sstring>("state"));
+        auto base_id = table_id(row.get_as<utils::UUID>("base_id"));
+        auto view_id = row.get_opt<utils::UUID>("view_id").transform([] (const utils::UUID& uuid) { return table_id(uuid); });
+        auto last_token = dht::token::from_int64(row.get_as<int64_t>("last_token"));
+        auto host_id = locator::host_id(row.get_as<utils::UUID>("host_id"));
+        auto shard = unsigned(row.get_as<int32_t>("shard"));
+
+        locator::tablet_replica replica{host_id, shard};
+        view_building_task task{id, type, state, base_id, view_id, replica, last_token};
+
+        switch (type) {
+        case db::view::view_building_task::task_type::build_range:
+            if (!view_id) {
+                on_internal_error(slogger, fmt::format("view_id is not set for build_range task with id: {}", id));
+            }
+            tasks[base_id][replica].view_tasks[*view_id].insert({id, std::move(task)});
+            break;
+        case db::view::view_building_task::task_type::process_staging:
+            tasks[base_id][replica].staging_tasks.insert({id, std::move(task)});
+            break;
+        }
+        co_return stop_iteration::no;
+    });
+    co_return tasks;
+}
+
+future<mutation> system_keyspace::make_view_building_task_mutation(api::timestamp_type ts, const db::view::view_building_task& task) {
+    static const sstring stmt = format("INSERT INTO {}.{}(key, id, type, state, base_id, view_id, last_token, host_id, shard) VALUES ('{}', ?, ?, ?, ?, ?, ?, ?, ?)", NAME, VIEW_BUILDING_TASKS, VIEW_BUILDING_KEY);
+    using namespace db::view;
+
+    data_value_or_unset view_id = unset_value{};
+    if (task.type == db::view::view_building_task::task_type::build_range) {
+        if (!task.view_id) {
+            on_internal_error(slogger, fmt::format("view_id is not set for build_range task with id: {}", task.id));
+        }
+        view_id = data_value(task.view_id->uuid());
+    }
+    auto muts = co_await _qp.get_mutations_internal(stmt, internal_system_query_state(), ts, {
+            task.id, task_type_to_sstring(task.type), task_state_to_sstring(task.state),
+            task.base_id.uuid(), view_id, dht::token::to_int64(task.last_token),
+            task.replica.host.uuid(), int32_t(task.replica.shard)
+    });
+    if (muts.size() != 1) {
+        on_internal_error(slogger, fmt::format("expected 1 mutation got {}", muts.size()));
+    }
+    co_return std::move(muts[0]);
+}
+
+future<mutation> system_keyspace::make_update_view_building_task_state_mutation(api::timestamp_type ts, utils::UUID id, db::view::view_building_task::task_state state) {
+    static const sstring stmt = format("UPDATE {}.{} SET state = ? WHERE key = '{}' AND id = ?", NAME, VIEW_BUILDING_TASKS, VIEW_BUILDING_KEY);
+
+    auto muts = co_await _qp.get_mutations_internal(stmt, internal_system_query_state(), ts, {
+            task_state_to_sstring(state), id
+    });
+    if (muts.size() != 1) {
+        on_internal_error(slogger, fmt::format("expected 1 mutation got {}", muts.size()));
+    }
+    co_return std::move(muts[0]);
+}
+
+future<mutation> system_keyspace::make_remove_view_building_task_mutation(api::timestamp_type ts, utils::UUID id) {
+    static const sstring stmt = format("DELETE FROM {}.{} WHERE key = '{}' AND id = ?", NAME, VIEW_BUILDING_TASKS, VIEW_BUILDING_KEY);
+
+    auto muts = co_await _qp.get_mutations_internal(stmt, internal_system_query_state(), ts, {id});
+    if (muts.size() != 1) {
+        on_internal_error(slogger, fmt::format("expected 1 mutation got {}", muts.size()));
+    }
+    co_return std::move(muts[0]);
+}
+
+static constexpr auto VIEW_BUILDING_PROCESSING_BASE_ID_KEY = "view_building_processing_base_id";
+
+future<std::optional<table_id>> system_keyspace::get_view_building_processing_base_id() {
+    auto value = co_await get_scylla_local_param(VIEW_BUILDING_PROCESSING_BASE_ID_KEY);
+    co_return value.transform([] (sstring uuid) {
+        return table_id(utils::UUID(uuid));
     });
 }
 
-future<service::paxos::paxos_state> system_keyspace::load_paxos_state(partition_key_view key, schema_ptr s, gc_clock::time_point now,
-        db::timeout_clock::time_point timeout) {
-    static auto cql = format("SELECT * FROM system.{} WHERE row_key = ? AND cf_id = ?", PAXOS);
-    // FIXME: we need execute_cql_with_now()
-    (void)now;
-    auto f = execute_cql_with_timeout(cql, timeout, to_legacy(*key.get_compound_type(*s), key.representation()), s->id().uuid());
-    return f.then([s, key = std::move(key)] (shared_ptr<cql3::untyped_result_set> results) mutable {
-        if (results->empty()) {
-            return service::paxos::paxos_state();
-        }
-        auto& row = results->one();
-        auto promised = row.has("promise")
-                        ? row.get_as<utils::UUID>("promise") : utils::UUID_gen::min_time_UUID();
-
-        std::optional<service::paxos::proposal> accepted;
-        if (row.has("proposal")) {
-            accepted = service::paxos::proposal(row.get_as<utils::UUID>("proposal_ballot"),
-                    ser::deserialize_from_buffer<>(row.get_blob("proposal"),  std::type_identity<frozen_mutation>(), 0));
-        }
-
-        std::optional<service::paxos::proposal> most_recent;
-        if (row.has("most_recent_commit_at")) {
-            // the value can be missing if it was pruned, supply empty one since
-            // it will not going to be used anyway
-            auto fm = row.has("most_recent_commit") ?
-                     ser::deserialize_from_buffer<>(row.get_blob("most_recent_commit"), std::type_identity<frozen_mutation>(), 0) :
-                     freeze(mutation(s, key));
-            most_recent = service::paxos::proposal(row.get_as<utils::UUID>("most_recent_commit_at"),
-                    std::move(fm));
-        }
-
-        return service::paxos::paxos_state(promised, std::move(accepted), std::move(most_recent));
-    });
+future<std::optional<mutation>> system_keyspace::get_view_building_processing_base_id_mutation() {
+    return get_scylla_local_mutation(_db, VIEW_BUILDING_PROCESSING_BASE_ID_KEY);
 }
 
-static int32_t paxos_ttl_sec(const schema& s) {
-    // Keep paxos state around for paxos_grace_seconds. If one of the Paxos participants
-    // is down for longer than paxos_grace_seconds it is considered to be dead and must rebootstrap.
-    // Otherwise its Paxos table state will be repaired by nodetool repair or Paxos repair.
-    return std::chrono::duration_cast<std::chrono::seconds>(s.paxos_grace_seconds()).count();
+
+future<mutation> system_keyspace::make_view_building_processing_base_id_mutation(api::timestamp_type ts, table_id base_id) {
+    static sstring query = format("INSERT INTO {}.{} (key, value) VALUES (?, ?);", db::system_keyspace::NAME, db::system_keyspace::SCYLLA_LOCAL);
+
+    auto muts = co_await _qp.get_mutations_internal(
+            query, internal_system_query_state(), 
+            ts, {VIEW_BUILDING_PROCESSING_BASE_ID_KEY, base_id.to_sstring()});
+    if (muts.size() != 1) {
+        on_internal_error(slogger, fmt::format("expected 1 mutation got {}", muts.size()));
+    }
+    co_return std::move(muts[0]);
 }
 
-future<> system_keyspace::save_paxos_promise(const schema& s, const partition_key& key, const utils::UUID& ballot, db::timeout_clock::time_point timeout) {
-    static auto cql = format("UPDATE system.{} USING TIMESTAMP ? AND TTL ? SET promise = ? WHERE row_key = ? AND cf_id = ?", PAXOS);
-    return execute_cql_with_timeout(cql,
-            timeout,
-            utils::UUID_gen::micros_timestamp(ballot),
-            paxos_ttl_sec(s),
-            ballot,
-            to_legacy(*key.get_compound_type(s), key.representation()),
-            s.id().uuid()
-        ).discard_result();
-}
+future<mutation> system_keyspace::make_remove_view_building_processing_base_id_mutation(api::timestamp_type ts) {
+    static sstring query = format("DELETE FROM {}.{} WHERE key = ?", db::system_keyspace::NAME, db::system_keyspace::SCYLLA_LOCAL);
 
-future<> system_keyspace::save_paxos_proposal(const schema& s, const service::paxos::proposal& proposal, db::timeout_clock::time_point timeout) {
-    static auto cql = format("UPDATE system.{} USING TIMESTAMP ? AND TTL ? SET promise = ?, proposal_ballot = ?, proposal = ? WHERE row_key = ? AND cf_id = ?", PAXOS);
-    partition_key_view key = proposal.update.key();
-    return execute_cql_with_timeout(cql,
-            timeout,
-            utils::UUID_gen::micros_timestamp(proposal.ballot),
-            paxos_ttl_sec(s),
-            proposal.ballot,
-            proposal.ballot,
-            ser::serialize_to_buffer<bytes>(proposal.update),
-            to_legacy(*key.get_compound_type(s), key.representation()),
-            s.id().uuid()
-        ).discard_result();
-}
-
-future<> system_keyspace::save_paxos_decision(const schema& s, const service::paxos::proposal& decision, db::timeout_clock::time_point timeout) {
-    // We always erase the last proposal when we learn about a new Paxos decision. The ballot
-    // timestamp of the decision is used for entire mutation, so if the "erased" proposal is more
-    // recent it will naturally stay on top.
-    // Erasing the last proposal is just an optimization and does not affect correctness:
-    // sp::begin_and_repair_paxos will exclude an accepted proposal if it is older than the most
-    // recent commit.
-    static auto cql = format("UPDATE system.{} USING TIMESTAMP ? AND TTL ? SET proposal_ballot = null, proposal = null,"
-            " most_recent_commit_at = ?, most_recent_commit = ? WHERE row_key = ? AND cf_id = ?", PAXOS);
-    partition_key_view key = decision.update.key();
-    return execute_cql_with_timeout(cql,
-            timeout,
-            utils::UUID_gen::micros_timestamp(decision.ballot),
-            paxos_ttl_sec(s),
-            decision.ballot,
-            ser::serialize_to_buffer<bytes>(decision.update),
-            to_legacy(*key.get_compound_type(s), key.representation()),
-            s.id().uuid()
-        ).discard_result();
-}
-
-future<> system_keyspace::delete_paxos_decision(const schema& s, const partition_key& key, const utils::UUID& ballot, db::timeout_clock::time_point timeout) {
-    // This should be called only if a learn stage succeeded on all replicas.
-    // In this case we can remove learned paxos value using ballot's timestamp which
-    // guarantees that if there is more recent round it will not be affected.
-    static auto cql = format("DELETE most_recent_commit FROM system.{} USING TIMESTAMP ?  WHERE row_key = ? AND cf_id = ?", PAXOS);
-
-    return execute_cql_with_timeout(cql,
-            timeout,
-            utils::UUID_gen::micros_timestamp(ballot),
-            to_legacy(*key.get_compound_type(s), key.representation()),
-            s.id().uuid()
-        ).discard_result();
+    auto muts = co_await _qp.get_mutations_internal(query, internal_system_query_state(), ts, {VIEW_BUILDING_PROCESSING_BASE_ID_KEY});
+    if (muts.size() != 1) {
+        on_internal_error(slogger, fmt::format("expected 1 mutation got {}", muts.size()));
+    }
+    co_return std::move(muts[0]);
 }
 
 future<std::set<sstring>> system_keyspace::load_local_enabled_features() {
@@ -2815,7 +3254,7 @@ mutation system_keyspace::make_group0_history_state_id_mutation(
     return m;
 }
 
-future<mutation> system_keyspace::get_group0_history(distributed<replica::database>& db) {
+future<mutation> system_keyspace::get_group0_history(sharded<replica::database>& db) {
     auto s = group0_history();
     auto rs = co_await db::system_keyspace::query_mutations(db, db::system_keyspace::NAME, db::system_keyspace::GROUP0_HISTORY);
     SCYLLA_ASSERT(rs);
@@ -2831,23 +3270,6 @@ future<mutation> system_keyspace::get_group0_history(distributed<replica::databa
 
     slogger.warn("get_group0_history: '{}' partition not found", GROUP0_HISTORY_KEY);
     co_return mutation(s, partition_key::from_singular(*s, GROUP0_HISTORY_KEY));
-}
-
-static future<std::optional<mutation>> get_scylla_local_mutation(replica::database& db, std::string_view key) {
-    auto s = db.find_schema(db::system_keyspace::NAME, db::system_keyspace::SCYLLA_LOCAL);
-
-    partition_key pk = partition_key::from_singular(*s, key);
-    dht::partition_range pr = dht::partition_range::make_singular(dht::decorate_key(*s, pk));
-
-    auto rs = co_await replica::query_mutations(db.container(), s, pr, s->full_slice(), db::no_timeout);
-    SCYLLA_ASSERT(rs);
-    auto& ps = rs->partitions();
-    for (auto& p: ps) {
-        auto mut = p.mut().unfreeze(s);
-        co_return std::move(mut);
-    }
-
-    co_return std::nullopt;
 }
 
 future<std::optional<mutation>> system_keyspace::get_group0_schema_version() {
@@ -2874,15 +3296,6 @@ future<system_keyspace::auth_version_t> system_keyspace::get_auth_version() {
 future<std::optional<mutation>> system_keyspace::get_auth_version_mutation() {
     return get_scylla_local_mutation(_db, AUTH_VERSION_KEY);
 }
-
-static service::query_state& internal_system_query_state() {
-    using namespace std::chrono_literals;
-    const auto t = 10s;
-    static timeout_config tc{ t, t, t, t, t, t, t };
-    static thread_local service::client_state cs(service::client_state::internal_tag{}, tc);
-    static thread_local service::query_state qs(cs, empty_service_permit());
-    return qs;
-};
 
 future<mutation> system_keyspace::make_auth_version_mutation(api::timestamp_type ts, db::system_keyspace::auth_version_t version) {
     static sstring query = format("INSERT INTO {}.{} (key, value) VALUES (?, ?);", db::system_keyspace::NAME, db::system_keyspace::SCYLLA_LOCAL);
@@ -2924,6 +3337,26 @@ future<mutation> system_keyspace::make_view_builder_version_mutation(api::timest
          on_internal_error(slogger, fmt::format("expected 1 view_builder_version mutation got {}", muts.size()));
     }
     co_return std::move(muts[0]);
+}
+
+static constexpr auto SERVICE_LEVEL_DRIVER_CREATED_KEY = "service_level_driver_created";
+
+future<std::optional<mutation>> system_keyspace::get_service_level_driver_created_mutation() {
+    return get_scylla_local_mutation(_db, SERVICE_LEVEL_DRIVER_CREATED_KEY);
+}
+
+future<mutation> system_keyspace::make_service_level_driver_created_mutation(bool is_created, api::timestamp_type timestamp) {
+    static const sstring query = format("INSERT INTO {}.{} (key, value) VALUES (?, ?);", db::system_keyspace::NAME, db::system_keyspace::SCYLLA_LOCAL);
+    auto muts = co_await _qp.get_mutations_internal(query, internal_system_query_state(), timestamp, {SERVICE_LEVEL_DRIVER_CREATED_KEY, data_type_for<bool>()->to_string_impl(data_value(is_created))});
+
+    if (muts.size() != 1) {
+        on_internal_error(slogger, format("expecting single insert mutation, got {}", muts.size()));
+    }
+    co_return std::move(muts[0]);
+}
+
+future<std::optional<bool>> system_keyspace::get_service_level_driver_created() {
+    return get_scylla_local_param_as<bool>(SERVICE_LEVEL_DRIVER_CREATED_KEY);
 }
 
 static constexpr auto SERVICE_LEVELS_VERSION_KEY = "service_level_version";
@@ -3219,6 +3652,12 @@ future<service::topology> system_keyspace::load_topology_state(const std::unorde
             ret.global_request_id = some_row.get_as<utils::UUID>("global_topology_request_id");
         }
 
+        if (some_row.has("global_requests")) {
+            for (auto&& v : deserialize_set_column(*topology(), some_row, "global_requests")) {
+                ret.global_requests_queue.push_back(value_cast<utils::UUID>(v));
+            }
+        }
+
         if (some_row.has("enabled_features")) {
             ret.enabled_features = decode_features(deserialize_set_column(*topology(), some_row, "enabled_features"));
         }
@@ -3394,7 +3833,13 @@ system_keyspace::topology_requests_entry system_keyspace::topology_request_row_t
         entry.initiating_host = row.get_as<utils::UUID>("initiating_host");
     }
     if (row.has("request_type")) {
-        entry.request_type = service::topology_request_from_string(row.get_as<sstring>("request_type"));
+        auto rts = row.get_as<sstring>("request_type");
+        auto rt = service::try_topology_request_from_string(rts);
+        if (rt) {
+            entry.request_type = *rt;
+        } else {
+            entry.request_type = service::global_topology_request_from_string(rts);
+        }
     }
     if (row.has("start_time")) {
         entry.start_time = row.get_as<db_clock::time_point>("start_time");
@@ -3411,6 +3856,11 @@ system_keyspace::topology_requests_entry system_keyspace::topology_request_row_t
     if (row.has("truncate_table_id")) {
         entry.truncate_table_id = table_id(row.get_as<utils::UUID>("truncate_table_id"));
     }
+    if (row.has("new_keyspace_rf_change_data")) {
+        entry.new_keyspace_rf_change_ks_name = row.get_as<sstring>("new_keyspace_rf_change_ks_name");
+        entry.new_keyspace_rf_change_data = row.get_map<sstring,sstring>("new_keyspace_rf_change_data");
+    }
+
     return entry;
 }
 
@@ -3461,17 +3911,17 @@ future<system_keyspace::topology_requests_entries> system_keyspace::get_node_ops
 }
 
 future<mutation> system_keyspace::get_insert_dict_mutation(
+    std::string_view name,
     bytes data,
     locator::host_id host_id,
     db_clock::time_point dict_ts,
     api::timestamp_type write_ts
 ) const {
-    const char* dict_name = "general";
-    slogger.debug("Publishing new compression dictionary: {} {} {}", dict_name, dict_ts, host_id);
+    slogger.debug("Publishing new compression dictionary: {} {} {}", name, dict_ts, host_id);
 
     static sstring insert_new = format("INSERT INTO {}.{} (name, timestamp, origin, data) VALUES (?, ?, ?, ?);", NAME, DICTS);
     auto muts = co_await _qp.get_mutations_internal(insert_new, internal_system_query_state(), write_ts, {
-        data_value(dict_name),
+        data_value(name),
         data_value(dict_ts),
         data_value(host_id.uuid()),
         data_value(std::move(data)),
@@ -3482,24 +3932,57 @@ future<mutation> system_keyspace::get_insert_dict_mutation(
     co_return std::move(muts[0]);
 }
 
-future<utils::shared_dict> system_keyspace::query_dict() const {
+mutation system_keyspace::get_delete_dict_mutation(std::string_view name, api::timestamp_type write_ts) {
+    auto s = db::system_keyspace::dicts();
+    mutation m(s, partition_key::from_single_value(*s,
+        data_value(name).serialize_nonnull()
+    ));
+    m.partition().apply(tombstone(write_ts, gc_clock::now()));
+    return m;
+}
+
+future<std::vector<sstring>> system_keyspace::query_all_dict_names() const {
+    std::vector<sstring> result;
+    sstring query = format("SELECT name from {}.{}", NAME, DICTS);
+    auto rs = co_await _qp.execute_internal(
+        query, db::consistency_level::ONE, internal_system_query_state(), {}, cql3::query_processor::cache_internal::yes);
+    for (const auto& row : *rs) {
+        result.push_back(row.get_as<sstring>("name"));
+    }
+    co_return result;
+}
+
+future<netw::shared_dict> system_keyspace::query_dict(std::string_view name) const {
     static sstring query = format("SELECT * FROM {}.{} WHERE name = ?;", NAME, DICTS);
     auto result_set = co_await _qp.execute_internal(
-        query, db::consistency_level::ONE, internal_system_query_state(), {"general"}, cql3::query_processor::cache_internal::yes);
+        query, db::consistency_level::ONE, internal_system_query_state(), {name}, cql3::query_processor::cache_internal::yes);
     if (!result_set->empty()) {
         auto &&row = result_set->one();
         auto content = row.get_as<bytes>("data");
         auto timestamp = row.get_as<db_clock::time_point>("timestamp").time_since_epoch().count();
         auto origin = row.get_as<utils::UUID>("origin");
         const int zstd_compression_level = 1;
-        co_return utils::shared_dict(
+        co_return netw::shared_dict(
             std::as_bytes(std::span(content)),
             timestamp,
             origin,
             zstd_compression_level
         );
     } else {
-        co_return utils::shared_dict();
+        co_return netw::shared_dict();
+    }
+}
+
+future<std::optional<db_clock::time_point>> system_keyspace::query_dict_timestamp(std::string_view name) const {
+    static sstring query = format("SELECT timestamp FROM {}.{} WHERE name = ?;", NAME, DICTS);
+    auto result_set = co_await _qp.execute_internal(
+        query, db::consistency_level::ONE, internal_system_query_state(), {name}, cql3::query_processor::cache_internal::yes);
+    if (!result_set->empty()) {
+        auto &&row = result_set->one();
+        auto timestamp = row.get_as<db_clock::time_point>("timestamp");
+        co_return timestamp;
+    } else {
+        co_return std::nullopt;
     }
 }
 
@@ -3532,6 +4015,14 @@ future<> system_keyspace::stop() {
 
 future<::shared_ptr<cql3::untyped_result_set>> system_keyspace::execute_cql(const sstring& query_string, const data_value_list& values) {
     return _qp.execute_internal(query_string, values, cql3::query_processor::cache_internal::yes);
+}
+
+future<> system_keyspace::apply_mutation(mutation m) {
+    if (m.schema()->ks_name() != NAME) {
+        on_internal_error(slogger, fmt::format("system_keyspace::apply_mutation(): attempted to apply mutation belonging to table {}.{}", m.schema()->cf_name(), m.schema()->ks_name()));
+    }
+
+    return _qp.proxy().mutate_locally(m, {}, db::commitlog::force_sync(m.schema()->static_props().wait_for_sync_to_commitlog), db::no_timeout);
 }
 
 } // namespace db

@@ -9,7 +9,7 @@
 
 #pragma once
 
-#include "keys.hh"
+#include "keys/keys.hh"
 #include "dht/token.hh"
 #include "dht/decorated_key.hh"
 
@@ -251,6 +251,7 @@ public:
 
     const dht::token& token() const noexcept { return *_token; }
     const partition_key* key() const { return _key; }
+    int weight() const { return _weight; }
 
     // Only when key() == nullptr
     token_bound get_token_bound() const { return token_bound(_weight); }

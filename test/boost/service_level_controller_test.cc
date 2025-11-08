@@ -14,7 +14,9 @@
 #include <fmt/std.h>
 
 #include <seastar/core/future.hh>
+#include <seastar/util/closeable.hh>
 #include "seastarx.hh"
+
 #include "service/qos/qos_common.hh"
 #include "test/lib/scylla_test_case.hh"
 #include "test/lib/test_utils.hh"
@@ -107,6 +109,7 @@ SEASTAR_THREAD_TEST_CASE(subscriber_simple) {
     sl_options.shares.emplace<int32_t>(1000);
     scheduling_group default_scheduling_group = create_scheduling_group("sl_default_sg", 1.0).get();
     locator::shared_token_metadata tm({}, {locator::topology::config{ .local_dc_rack = locator::endpoint_dc_rack::default_location }});
+    auto stop_tm = deferred_stop(tm);
     sharded<abort_source> as;
     as.start().get();
     auto stop_as = defer([&as] { as.stop().get(); });
@@ -163,6 +166,9 @@ SEASTAR_THREAD_TEST_CASE(too_many_service_levels) {
         virtual bool is_v2() const override {
             return true;
         }
+        virtual bool can_use_effective_service_level_cache() const override {
+            return true;
+        }
         virtual ::shared_ptr<service_level_distributed_data_accessor> upgrade_to_v2(cql3::query_processor& qp, service::raft_group0_client& group0_client) const override {
             return make_shared<data_accessor>();
         }
@@ -180,6 +186,7 @@ SEASTAR_THREAD_TEST_CASE(too_many_service_levels) {
     sl_options.workload = service_level_options::workload_type::interactive;
     scheduling_group default_scheduling_group = create_scheduling_group("sl_default_sg1", 1.0).get();
     locator::shared_token_metadata tm({}, {locator::topology::config{ .local_dc_rack = locator::endpoint_dc_rack::default_location }});
+    auto stop_tm = deferred_stop(tm);
     sharded<abort_source> as;
     as.start().get();
     auto stop_as = defer([&as] { as.stop().get(); });
@@ -256,6 +263,7 @@ SEASTAR_THREAD_TEST_CASE(add_remove_bad_sequence) {
     sl_options.shares.emplace<int32_t>(1000);
     scheduling_group default_scheduling_group = create_scheduling_group("sl_default_sg3", 1.0).get();
     locator::shared_token_metadata tm({}, {locator::topology::config{ .local_dc_rack = locator::endpoint_dc_rack::default_location }});
+    auto stop_tm = deferred_stop(tm);
     sharded<abort_source> as;
     as.start().get();
     auto stop_as = defer([&as] { as.stop().get(); });
@@ -282,6 +290,7 @@ SEASTAR_THREAD_TEST_CASE(verify_unset_shares_in_cache_when_service_level_created
     sl_options.shares.emplace<int32_t>(1000);
     scheduling_group default_scheduling_group = create_scheduling_group("sl_default_sg", 1.0).get();
     locator::shared_token_metadata tm({}, {locator::topology::config{ .local_dc_rack = locator::endpoint_dc_rack::default_location }});
+    auto stop_tm = deferred_stop(tm);
     sharded<abort_source> as;
 
     as.start().get();

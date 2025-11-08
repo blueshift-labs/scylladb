@@ -6,7 +6,7 @@
  * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0)
  */
 
-#include "multishard_mutation_query.hh"
+#include "multishard_query.hh"
 #include "mutation/json.hh"
 #include "mutation_query.hh"
 #include "partition_slice_builder.hh"
@@ -61,6 +61,10 @@ private:
     std::map<sstring, mutation_source> create_all_mutation_sources() {
         std::map<sstring, mutation_source> all_mutation_sources;
         auto& tbl = _db.find_column_family(_underlying_schema);
+        if (tbl.is_virtual()) {
+            all_mutation_sources.emplace("virtual-table", tbl.as_mutation_source());
+            return all_mutation_sources;
+        }
         {
             auto mss = tbl.select_memtables_as_mutation_sources(_dk.token());
             for (size_t i = 0; i < mss.size(); ++i) {
@@ -291,7 +295,12 @@ private:
             auto& cdef = _underlying_schema->column_at(kind, id);
             writer.writer().Key(cdef.name_as_text());
             if (cdef.is_atomic()) {
-                writer.write_atomic_cell_value(cell.as_atomic_cell(cdef), cdef.type);
+                auto acv = cell.as_atomic_cell(cdef);
+                if (acv.is_live()) {
+                    writer.write_atomic_cell_value(acv, cdef.type);
+                } else {
+                    writer.writer().Null();
+                }
             } else if (cdef.type->is_collection() || cdef.type->is_user_type()) {
                 cell.as_collection_mutation().with_deserialized(*cdef.type, [&] (collection_mutation_view_description mv) {
                     writer.write_collection_value(mv, cdef.type);
@@ -341,7 +350,7 @@ private:
             auto ms_begin = _underlying_mutation_sources.begin();
 
             if (!_underlying_reader) {
-                _underlying_reader = ms_begin->second.ms.make_reader_v2(_underlying_schema, _permit, _underlying_pr, ms_begin->second.slice,
+                _underlying_reader = ms_begin->second.ms.make_mutation_reader(_underlying_schema, _permit, _underlying_pr, ms_begin->second.slice,
                         _ts, streamed_mutation::forwarding::no, mutation_reader::forwarding::no);
             }
 
@@ -399,7 +408,7 @@ future<mutation_reader> make_partition_mutation_dump_reader(
         schema_ptr output_schema,
         schema_ptr underlying_schema,
         reader_permit permit,
-        distributed<replica::database>& db,
+        sharded<replica::database>& db,
         const dht::decorated_key& dk,
         const query::partition_slice& ps,
         tracing::trace_state_ptr ts,
@@ -415,7 +424,7 @@ future<mutation_reader> make_partition_mutation_dump_reader(
         auto& topo = erm->get_topology();
         const auto endpoints = erm->get_replicas_for_reading(dk.token());
         if (std::ranges::find(endpoints, topo.this_node()->host_id()) == endpoints.end()) {
-            co_return make_empty_flat_reader_v2(output_schema, std::move(permit));
+            co_return make_empty_mutation_reader(output_schema, std::move(permit));
         }
     }
 
@@ -441,7 +450,7 @@ future<mutation_reader> make_partition_mutation_dump_reader(
 }
 
 class multi_range_partition_generator {
-    distributed<replica::database>& _db;
+    sharded<replica::database>& _db;
     schema_ptr _schema;
     circular_buffer<dht::partition_range> _prs;
     tracing::trace_state_ptr _ts;
@@ -463,7 +472,7 @@ private:
 
     future<> read_next_page() {
         const dht::partition_range_vector prs{_prs.front()};
-        auto res = co_await query_mutations_on_all_shards(_db, _schema, _cmd, prs, _ts, _timeout);
+        auto res = co_await query_mutations_on_all_shards(_db, _schema, _cmd, prs, _ts, _timeout, false);
         const auto& rr = std::get<0>(res);
         for (const auto& p : rr->partitions()) {
             auto mut = p.mut().unfreeze(_schema);
@@ -495,7 +504,7 @@ private:
         co_await read_next_page();
     }
 public:
-    multi_range_partition_generator(distributed<replica::database>& db, schema_ptr schema, const dht::partition_range_vector& prs,
+    multi_range_partition_generator(sharded<replica::database>& db, schema_ptr schema, const dht::partition_range_vector& prs,
             tracing::trace_state_ptr ts, db::timeout_clock::time_point timeout)
         : _db(db)
         , _schema(std::move(schema))
@@ -531,7 +540,7 @@ public:
 };
 
 noncopyable_function<future<std::optional<dht::decorated_key>>()>
-make_partition_key_generator(distributed<replica::database>& db, schema_ptr schema, const dht::partition_range_vector& prs,
+make_partition_key_generator(sharded<replica::database>& db, schema_ptr schema, const dht::partition_range_vector& prs,
         tracing::trace_state_ptr ts, db::timeout_clock::time_point timeout) {
     if (prs.size() == 1 && prs.front().is_singular()) {
         auto dk_opt = std::optional(prs.front().start()->value().as_decorated_key());
@@ -600,12 +609,12 @@ future<foreign_ptr<lw_shared_ptr<query::result>>> dump_mutations(
     auto accounter = co_await db.local().get_result_memory_limiter().new_data_read(permit.max_result_size(), short_read_allowed);
     query_state qs(output_schema, cmd, opts, prs, std::move(accounter));
 
-    auto compaction_state = make_lw_shared<compact_for_query_state_v2>(*output_schema, qs.cmd.timestamp, qs.cmd.slice, qs.remaining_rows(), qs.remaining_partitions());
+    auto compaction_state = make_lw_shared<compact_for_query_state>(*output_schema, qs.cmd.timestamp, qs.cmd.slice, qs.remaining_rows(), qs.remaining_partitions(), tombstone_gc_state(nullptr));
     auto partition_key_generator = make_partition_key_generator(db, underlying_schema, prs, ts, timeout);
 
     auto dk_opt = co_await partition_key_generator();
     while (dk_opt) {
-        auto reader_consumer = compact_for_query_v2<query_result_builder>(compaction_state, query_result_builder(*output_schema, qs.builder));
+        auto reader_consumer = compact_for_query<query_result_builder>(compaction_state, query_result_builder(*output_schema, qs.builder));
         auto reader = co_await make_partition_mutation_dump_reader(output_schema, underlying_schema, permit, db, *dk_opt, cmd.slice, ts, timeout);
 
         std::exception_ptr ex;

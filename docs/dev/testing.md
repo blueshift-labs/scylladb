@@ -10,14 +10,70 @@ This is a manual for `test.py`.
 
 ## Installation
 
-To run `test.py`, Python 3.7 or higher is required.
+To run `test.py`, Python 3.11 or higher is required.
 `./install-dependencies.sh` should install all the required Python
 modules. If `install-dependencies.sh` does not support your distribution,
 please manually install all Python modules it lists with `pip`.
 
-Additionally, `toolchain/dbuid` could be used to run `test.py`. In this
+Additionally, `toolchain/dbuild` could be used to run `test.py`. In this
 case you don't need to run `./install-dependencies.sh`
 
+By default `test.py` has `--gather-metrics` parameter, that is used to gather
+CPU/RAM usage during tests from the cgroup.
+This means that before execute `test.py` current terminal process should be located in
+the correct cgroup where the **current user** have RW access to the group.
+Some desktop environments (DE) handle this automatically by putting the process
+to the user-owned scope or slice.
+Some DE don't do this.
+To check if the terminal has the correct cgroup, do next:
+1. Check current cgroup
+    ```shell
+    $ cat /proc/self/cgroup
+    ```
+    The output will be a string with a cgroup something like this:
+    ```
+    0::/user.slice/user-1000.slice/user@1000.service/app.slice/
+    ```
+2. Check the permission of the cgroup. Get the path after `::` from the previous
+command and add at the beginning `/sys/fs/cgroup` and check the permissions:
+   ```shell
+   $ ls -la /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/
+   ```
+   All items should have the owner set to the current user
+
+If this requirement is satisfied you're good to go to run `test.py` with metrics.
+
+If the requirement isn't satisfied, here is how you can do to run `test.py`.
+1. Switch off the metric gathering.
+   1. Use toolchain to run `test.py`
+   2. Add `--no-gather-metrics` to the `test.py` during the run.
+      To make it persistent, it's possible to create an alias
+      ```shell
+      $ echo 'alias testpy="./test.py --no-gather-metrics"' > ~/.profile
+      $ source ~/.profile 
+      ```
+      Now it's possible to invoke `testpy` alias that will switch off 
+      gathering metrics.
+   3. Run the `test.py` with `systemd-run`
+      ```shell
+      $ systemd-run --user --scope ./test.py
+      ```
+      This can be created as an alias as well.
+   4. Create a cgroup manually and put the current terminal process to it
+      ```shell
+      $ mkdir /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/test_py.slice 
+      $ echo $! | sudo tee /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/test_py.slice/cgroup.procs
+      ```
+      This solution requires `sudo` permissions, because, to change a process' cgroup 
+      user needs RW permissions to both cgroups: the old one and the new one.
+      ***NOTE:*** This operation needs to be executed each time the terminal is opened
+
+Some tests utilize (nested) docker images to provide mock/test services against which to 
+run scylla features. In general, these images will be pulled on first usage by the test.
+Some images used:
+    
+    * docker.io/fsouza/fake-gcs-server:1.52.3
+    * (add as needed)
 
 ## Usage
 
@@ -55,6 +111,19 @@ shed more light on this.
 Build artefacts, such as test output and harness output is stored
 in `./testlog`. Scylla data files are stored in `/tmp`.
 
+There are several test directories that are excluded from orchestration by `test.py`:
+
+- test/boost
+- test/raft
+- test/ldap
+- test/unit
+
+This means that `test.py` will not run tests directly, but will delegate all work to `pytest`.
+That's why all these directories do not have `suite.yaml` files.
+Additionally, these directories do not follow abstract naming suite/testname
+convention, and instead use the `pytest` naming convention, i.e. to run a test you need to provide the path to the file
+and optionally the test name, e.g. `test/boost/aggregate_fcts_test.cc::test_aggregate_avg`.
+
 ## How it works
 
 On start, `test.py` invokes `ninja` to find out configured build modes. Then
@@ -90,17 +159,13 @@ must be of course performed by the author of the test. This approach
 is sometimes called "approval testing" and discussion
 about pros and cons of this methodology is widely available online.
 
-To run CQL tests, `test.py` uses an auxiliary program,
-`test/pylib/cql_repl/cql_repl.py`.
-This program reads CQL input file, evaluates it against a pre-started
-Scylla using CQL database connection, and prints output in tabular format to
-stdout. A default keyspace is created automatically.
-
-`test.py` invokes `cql_repl.py` as a pytest providing the test file
-and redirecting its output to a temporary file in `testlog` directory.
-
-After `cql_repl.py` finishes, `test.py` compares the output stored in the
-temporary file with a pre-recorded output stored in
+To run CQL tests, `test.py` uses the custom pytest file collector implemented
+in `test/pylib/cql_repl.py` file.  More specifically, the test execution done
+in `CqlTest.runtest()` method: read CQL input file, evaluate it against a
+pre-started Scylla using CQL database connection, and print output in tabular
+format to a temporary output file in `testlog` directory.  A default keyspace
+is created automatically.  At the end, the test compares the output stored in
+the temporary file with a pre-recorded output stored in
 `test/suitename/testname_test.result`.
 
 The test is considered failed if executing any CQL statement produced an
@@ -129,11 +194,11 @@ Scylla (possibly started in debugger) using `cqlsh`.
 
 The same unit test can be run in different seastar configurations, i.e. with
 different command line arguments. The custom arguments can be set in
-`custom_args` key of the `suite.yaml` file.
+`custom_args` key of the `test_config.yaml` file.
 
 Tests from boost suite are divided into test-cases. These are top-level
 functions wrapped by `BOOST_AUTO_TEST_CASE`, `SEASTAR_TEST_CASE` or alike.
-Boost tests support `suitename/testname::casename` selection described above.
+Boost tests support `path/to/file_name.cc::casename` selection described above.
 
 ### Debugging unit tests
 
@@ -280,6 +345,19 @@ started or stopped, even if it ended up in the same state
 as it was at the beginning of the test, is considered "dirty".
 Such clusters are not returned to the pool, but destroyed, and
 the pool is replenished with a new cluster instead.
+
+## Test metrics
+
+The parameter `--gather-metrics` is used to gather CPU/RAM usage during tests from the cgroup and system overall CPU/RAM
+usage.
+For that, SQLite database is used to store the metrics in `testlog/sqlite.db`.
+The database is created in the `testlog` directory and contains the following tables:
+
+- `tests` - contains the list of tests that were executed with information about the test name, directory, architecture,
+  and mode
+- `test_metrics` - contains the metrics for each test, such as memory peak usage, CPU usage, and duration
+- `system_resource_metrics` - contains system CPU and memory utilization in percents during the whole run
+- `cgroup_memory_metrics` - contains cgroup memory usage during the test run
 
 ## Automation, CI, and Jenkins
 
